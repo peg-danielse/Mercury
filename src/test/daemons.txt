@@ -1,0 +1,7 @@
+# One executable per line, submitted in this order.
+# A relative path is resolved next to this file, then under ~/benchmarks/stress-ng
+# and ~/Benchmarks/stress-ng.
+wrappers/cpu
+wrappers/matrix
+wrappers/qsort
+wrappers/intmath
