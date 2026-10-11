@@ -11,4 +11,4 @@ if [ -z "${found}" ]; then
   echo "stress-ng binary not found" >&2
   exit 127
 fi
-exec "${found}" --qsort 1 --timeout 0 --quiet
+exec "${found}" --qsort 1 --qsort-size 4194304 --timeout 0 --quiet

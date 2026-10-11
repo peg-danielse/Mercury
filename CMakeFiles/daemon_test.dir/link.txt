@@ -1,0 +1,1 @@
+/usr/bin/c++ -Wl,--dependency-file=CMakeFiles/daemon_test.dir/link.d CMakeFiles/daemon_test.dir/src/test/main.cpp.o -o build/test/daemon_test

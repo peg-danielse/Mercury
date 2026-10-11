@@ -1,0 +1,14 @@
+#!/bin/sh
+set -eu
+found=
+for dir in "${HOME}/benchmarks/stress-ng" "${HOME}/Benchmarks/stress-ng"; do
+  if [ -x "${dir}/stress-ng" ]; then
+    found=${dir}/stress-ng
+    break
+  fi
+done
+if [ -z "${found}" ]; then
+  echo "stress-ng binary not found" >&2
+  exit 127
+fi
+exec "${found}" --cache 1 --timeout 0 --quiet

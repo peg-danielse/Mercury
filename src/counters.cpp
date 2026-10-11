@@ -247,6 +247,9 @@ void CounterGroup::sample(const std::string& daemon_id, pid_t pid, const std::sh
   } catch (const std::exception& error) {
     std::cerr << "counters daemon_id=" << daemon_id << " " << error.what() << std::endl;
   }
+  if (ring) {
+    ring->flush();
+  }
   std::cout << "counters daemon_id=" << daemon_id << " samples=" << samples << " enabled_ns=" << enabled
             << std::endl;
 }

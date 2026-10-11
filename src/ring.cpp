@@ -30,9 +30,12 @@ void Ring::push(const Sample& sample) {
     if (size_ < slots_.size()) {
       ++size_;
     }
+    ++pushed_;
     const std::size_t third = slots_.size() / 3;
     if (archive_ && third > 0 && size_ == slots_.size() && head_ % third == 0) {
       settled = settled_third();
+      archived_lo_ = third;
+      archived_hi_ = pushed_ - third;
     }
   }
   if (settled.empty()) {
@@ -43,6 +46,39 @@ void Ring::push(const Sample& sample) {
   } catch (const std::exception& error) {
     std::cerr << "ring archive: " << error.what() << std::endl;
   }
+}
+
+void Ring::flush() {
+  std::vector<Sample> pending;
+  std::size_t oldest = 0;
+  std::size_t end = 0;
+  {
+    std::lock_guard lock(mu_);
+    if (!archive_ || size_ == 0 || pushed_ == 0) {
+      return;
+    }
+    oldest = pushed_ - size_;
+    end = pushed_;
+    pending.reserve(size_);
+    for (std::size_t index = oldest; index < end; ++index) {
+      if (archived_hi_ > archived_lo_ && index >= archived_lo_ && index < archived_hi_) {
+        continue;
+      }
+      pending.push_back(slots_[index % slots_.size()]);
+    }
+  }
+  if (pending.empty()) {
+    return;
+  }
+  try {
+    archive_->append(pending);
+  } catch (const std::exception& error) {
+    std::cerr << "ring archive: " << error.what() << std::endl;
+    return;
+  }
+  std::lock_guard lock(mu_);
+  archived_lo_ = oldest;
+  archived_hi_ = end;
 }
 
 std::size_t Ring::size() const {

@@ -30,6 +30,8 @@ class Ring {
   ~Ring();
 
   void push(const Sample& sample);
+  // Write samples still only in memory. A clean stop keeps the tail the ring has not committed yet.
+  void flush();
   std::size_t size() const;
   const std::vector<std::string>& names() const { return names_; }
 
@@ -40,6 +42,9 @@ class Ring {
   std::vector<Sample> slots_;
   std::size_t head_ = 0;
   std::size_t size_ = 0;
+  std::size_t pushed_ = 0;
+  std::size_t archived_lo_ = 0;
+  std::size_t archived_hi_ = 0;
   std::vector<std::string> names_;
   std::shared_ptr<RingArchive> archive_;
 };

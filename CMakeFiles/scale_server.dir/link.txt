@@ -1,0 +1,1 @@
+/usr/bin/c++ -Wl,--dependency-file=CMakeFiles/scale_server.dir/link.d CMakeFiles/scale_server.dir/src/test/scale_server.cpp.o -o build/test/scale_server

@@ -1,1 +1,4 @@
 build/
+rings/
+mercury
+libmercury_http.a

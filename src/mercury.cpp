@@ -46,6 +46,12 @@ std::string route(const std::string& request) {
   if (auto response = start_route(request)) {
     return *response;
   }
+  if (auto response = migrate_route(request)) {
+    return *response;
+  }
+  if (auto response = cpus_route(request)) {
+    return *response;
+  }
   if (auto response = kill_route(request)) {
     return *response;
   }
@@ -81,6 +87,7 @@ int main(int argc, char** argv) {
       }
     }
     std::sort(daemon_cpus.begin(), daemon_cpus.end());
+    set_mercury_cpu(self);
     std::cout << "pinned to cpu " << self << ", daemons on";
     for (const int cpu : daemon_cpus) {
       std::cout << ' ' << cpu;

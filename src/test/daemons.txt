@@ -1,7 +1,19 @@
-# One executable per line, submitted in this order.
+# One workload per line, submitted in this order.
+# A line is `cpu <path>` or `memory <path>`. A bare path is classified from its name.
 # A relative path is resolved next to this file, then under ~/benchmarks/stress-ng
 # and ~/Benchmarks/stress-ng.
-wrappers/cpu
-wrappers/matrix
-wrappers/qsort
-wrappers/intmath
+# cpus takes numbers and ranges. The lowest CPU is Mercury; the rest run daemons.
+# SMT siblings are included so a memory stressor and a cpu stressor can share a core.
+# daemon_test places these round-robin and checks the pins.
+# daemon_test --place also runs them interleaved, all on one cpu, and one at a time.
+# Counter files are kept in rings/roundrobin and rings/individual
+# (also rings/interleave and rings/worst).
+cpus 0-7,32-39
+cpu wrappers/cpu
+cpu wrappers/intmath
+cpu wrappers/matrix
+cpu wrappers/bitops
+memory wrappers/stream
+memory wrappers/vm
+memory wrappers/cache
+memory wrappers/qsort

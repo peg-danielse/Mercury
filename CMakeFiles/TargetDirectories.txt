@@ -1,0 +1,14 @@
+/home/paul/Mercury/CMakeFiles/mercury_http.dir
+/home/paul/Mercury/CMakeFiles/ping.dir
+/home/paul/Mercury/CMakeFiles/hello_server.dir
+/home/paul/Mercury/CMakeFiles/mercury.dir
+/home/paul/Mercury/CMakeFiles/perfcount.dir
+/home/paul/Mercury/CMakeFiles/arrival_test.dir
+/home/paul/Mercury/CMakeFiles/daemon_test.dir
+/home/paul/Mercury/CMakeFiles/cpus_test.dir
+/home/paul/Mercury/CMakeFiles/cpus_many_test.dir
+/home/paul/Mercury/CMakeFiles/scale_server.dir
+/home/paul/Mercury/CMakeFiles/scale_client.dir
+/home/paul/Mercury/CMakeFiles/scale_test.dir
+/home/paul/Mercury/CMakeFiles/edit_cache.dir
+/home/paul/Mercury/CMakeFiles/rebuild_cache.dir

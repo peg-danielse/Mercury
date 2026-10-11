@@ -1,0 +1,2 @@
+/usr/bin/ar qc libmercury_http.a CMakeFiles/mercury_http.dir/src/http.cpp.o
+/usr/bin/ranlib libmercury_http.a

@@ -5,7 +5,10 @@
 #include <vector>
 
 void set_daemon_cpus(std::vector<int> cpus);
+void set_mercury_cpu(int cpu);
 
 std::optional<std::string> stat_route(const std::string& request);
 std::optional<std::string> start_route(const std::string& request);
+std::optional<std::string> migrate_route(const std::string& request);
+std::optional<std::string> cpus_route(const std::string& request);
 std::optional<std::string> kill_route(const std::string& request);
