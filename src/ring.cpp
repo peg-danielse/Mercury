@@ -81,6 +81,23 @@ void Ring::flush() {
   archived_hi_ = end;
 }
 
+std::vector<Sample> Ring::recent(std::size_t count) const {
+  std::lock_guard lock(mu_);
+  if (count > size_) {
+    count = size_;
+  }
+  std::vector<Sample> out;
+  if (count == 0 || slots_.empty()) {
+    return out;
+  }
+  out.reserve(count);
+  const std::size_t start = (head_ + slots_.size() - count) % slots_.size();
+  for (std::size_t i = 0; i < count; ++i) {
+    out.push_back(slots_[(start + i) % slots_.size()]);
+  }
+  return out;
+}
+
 std::size_t Ring::size() const {
   std::lock_guard lock(mu_);
   return size_;

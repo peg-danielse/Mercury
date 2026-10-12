@@ -183,6 +183,21 @@ std::optional<std::uint64_t> group_value(const GroupData& data, std::uint64_t id
   return std::nullopt;
 }
 
+constexpr Spec kTaskClock{"task-clock", PERF_TYPE_SOFTWARE, PERF_COUNT_SW_TASK_CLOCK};
+
+std::uint64_t read_task_clock(int fd) {
+  // open_event asks for a group record even when this event is alone.
+  std::uint64_t data[5]{};
+  ssize_t n = 0;
+  do {
+    n = ::read(fd, data, sizeof(data));
+  } while (n < 0 && errno == EINTR);
+  if (n < static_cast<ssize_t>(sizeof(data)) || data[0] < 1) {
+    throw std::runtime_error(std::string("task-clock read failed: ") + std::strerror(errno));
+  }
+  return data[3];
+}
+
 Sample make_delta(const std::vector<Opened>& counters, const GroupData& previous, const GroupData& now) {
   Sample sample;
   sample.timestamp_ns = monotonic_ns();
@@ -202,6 +217,10 @@ Sample make_delta(const std::vector<Opened>& counters, const GroupData& previous
 
 struct CounterGroup::Impl {
   std::vector<Opened> events;
+  std::optional<Opened> task_clock;
+  bool armed = false;
+  GroupData previous{};
+  std::uint64_t previous_task = 0;
 };
 
 CounterGroup::CounterGroup() = default;
@@ -218,11 +237,53 @@ std::vector<std::string> CounterGroup::names() const {
   if (!impl_) {
     return names;
   }
-  names.reserve(impl_->events.size());
+  names.reserve(impl_->events.size() + (impl_->task_clock ? 1 : 0));
   for (const auto& event : impl_->events) {
     names.emplace_back(event.name);
   }
+  if (impl_->task_clock) {
+    names.emplace_back(impl_->task_clock->name);
+  }
   return names;
+}
+
+void CounterGroup::arm() {
+  if (!impl_ || impl_->events.empty()) {
+    throw std::runtime_error("no counters");
+  }
+  const int leader = impl_->events.front().fd.get();
+  ioctl_group(leader, PERF_EVENT_IOC_RESET, "reset failed");
+  ioctl_group(leader, PERF_EVENT_IOC_ENABLE, "enable failed");
+  impl_->previous = read_group(leader);
+  if (impl_->task_clock) {
+    const int fd = impl_->task_clock->fd.get();
+    if (::ioctl(fd, PERF_EVENT_IOC_RESET, 0) < 0 || ::ioctl(fd, PERF_EVENT_IOC_ENABLE, 0) < 0) {
+      throw std::runtime_error(std::string("task-clock enable failed: ") + std::strerror(errno));
+    }
+    impl_->previous_task = read_task_clock(fd);
+  }
+  impl_->armed = true;
+}
+
+bool CounterGroup::pull(Sample& sample) {
+  if (!impl_ || !impl_->armed || impl_->events.empty()) {
+    return false;
+  }
+  try {
+    const int leader = impl_->events.front().fd.get();
+    const auto now = read_group(leader);
+    sample = make_delta(impl_->events, impl_->previous, now);
+    impl_->previous = now;
+    if (impl_->task_clock && sample.nvalues < kMaxCounters) {
+      const auto current = read_task_clock(impl_->task_clock->fd.get());
+      sample.value[sample.nvalues] = current - impl_->previous_task;
+      impl_->previous_task = current;
+      ++sample.nvalues;
+    }
+    return true;
+  } catch (const std::exception&) {
+    return false;
+  }
 }
 
 void CounterGroup::sample(const std::string& daemon_id, pid_t pid, const std::shared_ptr<Ring>& ring,
@@ -230,20 +291,18 @@ void CounterGroup::sample(const std::string& daemon_id, pid_t pid, const std::sh
   std::uint64_t enabled = 0;
   std::size_t samples = 0;
   try {
-    const int leader = impl_->events.front().fd.get();
-    ioctl_group(leader, PERF_EVENT_IOC_RESET, "reset failed");
-    ioctl_group(leader, PERF_EVENT_IOC_ENABLE, "enable failed");
-    auto previous = read_group(leader);
+    arm();
     while (running(daemon_id, pid)) {
       sleep_ms(kSampleMs);
-      const auto now = read_group(leader);
-      const auto sample = make_delta(impl_->events, previous, now);
+      Sample sample;
+      if (!pull(sample)) {
+        break;
+      }
       ring->push(sample);
       enabled += sample.time_enabled;
       ++samples;
-      previous = now;
     }
-    ioctl_group(leader, PERF_EVENT_IOC_DISABLE, "disable failed");
+    ioctl_group(impl_->events.front().fd.get(), PERF_EVENT_IOC_DISABLE, "disable failed");
   } catch (const std::exception& error) {
     std::cerr << "counters daemon_id=" << daemon_id << " " << error.what() << std::endl;
   }
@@ -261,5 +320,27 @@ CounterGroup open_counters(pid_t pid) {
   } catch (const std::runtime_error&) {
     impl->events = open_group(pid, kSoftware, std::size(kSoftware));
   }
+  bool has_task = false;
+  for (const auto& event : impl->events) {
+    if (std::strcmp(event.name, "task-clock") == 0) {
+      has_task = true;
+    }
+  }
+  if (!has_task && impl->events.size() < static_cast<std::size_t>(kMaxCounters)) {
+    const int fd = open_event(kTaskClock, pid, -1, 0);
+    if (fd >= 0) {
+      Fd owned{fd};
+      const auto id = event_id(owned.get());
+      impl->task_clock.emplace(std::move(owned), kTaskClock.name, id);
+    } else {
+      std::cerr << "task-clock unavailable pid=" << pid << std::endl;
+    }
+  }
+  return CounterGroup(std::move(impl));
+}
+
+CounterGroup open_clock(pid_t pid) {
+  auto impl = std::make_unique<CounterGroup::Impl>();
+  impl->events = open_group(pid, &kTaskClock, 1);
   return CounterGroup(std::move(impl));
 }

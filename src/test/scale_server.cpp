@@ -1,21 +1,30 @@
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
-#include <pthread.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <atomic>
 #include <cerrno>
+#include <condition_variable>
 #include <cstdint>
 #include <cstring>
 #include <iostream>
+#include <mutex>
 #include <stdexcept>
 #include <string>
+#include <thread>
+#include <vector>
 
 namespace {
 
 constexpr int kBurn = 80000;
 constexpr int kBacklog = 256;
+// The scale test grants up to 32 cores. One long-lived worker can fill one
+// core. A thread per connection is a perf group each and exhausts the
+// process file limit.
+constexpr int kWorkers = 32;
 
 volatile std::uint64_t g_sink = 0;
 
@@ -41,41 +50,107 @@ void send_all(int fd, const char* data, std::size_t size) {
   }
 }
 
-void serve_connection(int fd) {
-  const int nodelay = 1;
-  ::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
+struct Conn {
+  int fd = -1;
   std::string pending;
+};
+
+struct Worker {
+  std::mutex mu;
+  std::condition_variable cv;
+  std::vector<int> incoming;
+};
+
+Worker g_workers[kWorkers];
+
+void take_new(Worker& worker, std::vector<Conn>& conns) {
+  std::vector<int> fresh;
+  {
+    std::lock_guard lock(worker.mu);
+    fresh.swap(worker.incoming);
+  }
+  for (const int fd : fresh) {
+    const int nodelay = 1;
+    ::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
+    conns.push_back(Conn{fd, {}});
+  }
+}
+
+// False when the peer is gone. Reads whatever is already queued.
+bool pump(Conn& conn) {
   char buffer[1024];
   while (true) {
-    const auto n = ::recv(fd, buffer, sizeof(buffer), 0);
+    const auto n = ::recv(conn.fd, buffer, sizeof(buffer), MSG_DONTWAIT);
     if (n == 0) {
-      break;
+      return false;
     }
     if (n < 0) {
       if (errno == EINTR) {
         continue;
       }
-      break;
-    }
-    pending.append(buffer, static_cast<std::size_t>(n));
-    for (;;) {
-      const auto nl = pending.find('\n');
-      if (nl == std::string::npos) {
+      if (errno == EAGAIN || errno == EWOULDBLOCK) {
         break;
       }
-      pending.erase(0, nl + 1);
-      burn();
-      const char reply[] = "ok\n";
-      send_all(fd, reply, sizeof(reply) - 1);
+      return false;
     }
+    conn.pending.append(buffer, static_cast<std::size_t>(n));
   }
-  ::close(fd);
+  for (;;) {
+    const auto nl = conn.pending.find('\n');
+    if (nl == std::string::npos) {
+      break;
+    }
+    conn.pending.erase(0, nl + 1);
+    burn();
+    const char reply[] = "ok\n";
+    send_all(conn.fd, reply, sizeof(reply) - 1);
+  }
+  return true;
 }
 
-void* connection_main(void* arg) {
-  const int fd = static_cast<int>(reinterpret_cast<std::uintptr_t>(arg));
-  serve_connection(fd);
-  return nullptr;
+void worker_main(Worker* worker) {
+  std::vector<Conn> conns;
+  while (true) {
+    take_new(*worker, conns);
+    if (conns.empty()) {
+      std::unique_lock lock(worker->mu);
+      worker->cv.wait(lock, [&] { return !worker->incoming.empty(); });
+      continue;
+    }
+    std::vector<pollfd> pfds(conns.size());
+    for (std::size_t i = 0; i < conns.size(); ++i) {
+      pfds[i].fd = conns[i].fd;
+      pfds[i].events = POLLIN;
+    }
+    const int ready = ::poll(pfds.data(), static_cast<nfds_t>(pfds.size()), 50);
+    if (ready <= 0) {
+      continue;
+    }
+    std::vector<Conn> kept;
+    kept.reserve(conns.size());
+    for (std::size_t i = 0; i < conns.size(); ++i) {
+      if (pfds[i].revents == 0) {
+        kept.push_back(std::move(conns[i]));
+        continue;
+      }
+      if (!pump(conns[i])) {
+        ::close(conns[i].fd);
+        continue;
+      }
+      kept.push_back(std::move(conns[i]));
+    }
+    conns.swap(kept);
+  }
+}
+
+void assign(int fd) {
+  static std::atomic<unsigned> next{0};
+  Worker& worker = g_workers[next.fetch_add(1, std::memory_order_relaxed) % static_cast<unsigned>(kWorkers)];
+  {
+    std::lock_guard lock(worker.mu);
+    worker.incoming.push_back(fd);
+  }
+  worker.cv.notify_one();
 }
 
 int listen_on(std::uint16_t port) {
@@ -97,6 +172,9 @@ int listen_on(std::uint16_t port) {
 }
 
 void accept_loop(int listen_fd) {
+  for (auto& worker : g_workers) {
+    std::thread(worker_main, &worker).detach();
+  }
   while (true) {
     const int accepted = ::accept(listen_fd, nullptr, nullptr);
     if (accepted < 0) {
@@ -105,19 +183,7 @@ void accept_loop(int listen_fd) {
       }
       throw std::runtime_error("accept failed");
     }
-    pthread_attr_t attr;
-    if (pthread_attr_init(&attr) != 0) {
-      serve_connection(accepted);
-      continue;
-    }
-    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
-    pthread_t thread;
-    const int created =
-        pthread_create(&thread, &attr, connection_main, reinterpret_cast<void*>(static_cast<std::uintptr_t>(accepted)));
-    pthread_attr_destroy(&attr);
-    if (created != 0) {
-      serve_connection(accepted);
-    }
+    assign(accepted);
   }
 }
 

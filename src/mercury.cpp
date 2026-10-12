@@ -52,6 +52,9 @@ std::string route(const std::string& request) {
   if (auto response = cpus_route(request)) {
     return *response;
   }
+  if (auto response = scale_route(request)) {
+    return *response;
+  }
   if (auto response = kill_route(request)) {
     return *response;
   }

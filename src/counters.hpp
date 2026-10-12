@@ -17,6 +17,10 @@ class CounterGroup {
 
   bool empty() const;
   std::vector<std::string> names() const;
+  // Reset and enable. The next pull is the delta since this call.
+  void arm();
+  // One delta since arm or the previous pull. False when the thread is gone.
+  bool pull(Sample& sample);
   void sample(const std::string& daemon_id, pid_t pid, const std::shared_ptr<Ring>& ring,
               bool (*running)(const std::string&, pid_t));
 
@@ -26,6 +30,9 @@ class CounterGroup {
   std::unique_ptr<Impl> impl_;
 
   friend CounterGroup open_counters(pid_t pid);
+  friend CounterGroup open_clock(pid_t pid);
 };
 
 CounterGroup open_counters(pid_t pid);
+// task-clock alone. One perf fd, for threads past the full-counter budget.
+CounterGroup open_clock(pid_t pid);

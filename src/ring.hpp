@@ -10,7 +10,7 @@
 class RingArchive;
 
 inline constexpr int kMaxCounters = 8;
-inline constexpr int kSampleMs = 100;
+inline constexpr int kSampleMs = 10;
 inline constexpr int kHistorySeconds = 60;
 inline constexpr std::size_t kRingSlots =
     static_cast<std::size_t>(kHistorySeconds) * 1000 / static_cast<std::size_t>(kSampleMs);
@@ -32,6 +32,8 @@ class Ring {
   void push(const Sample& sample);
   // Write samples still only in memory. A clean stop keeps the tail the ring has not committed yet.
   void flush();
+  // Newest count samples, oldest first. Fewer when the ring is not that full.
+  std::vector<Sample> recent(std::size_t count) const;
   std::size_t size() const;
   const std::vector<std::string>& names() const { return names_; }
 
