@@ -3,6 +3,7 @@
 #include "counters.hpp"
 #include "http.hpp"
 #include "policy.hpp"
+#include "resources.hpp"
 #include "ring.hpp"
 #include "ring_archive.hpp"
 
@@ -12,6 +13,7 @@
 #include <netinet/in.h>
 #include <poll.h>
 #include <sched.h>
+#include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
@@ -28,6 +30,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
 #include <memory>
 #include <mutex>
@@ -37,7 +40,25 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <unordered_map>
+#include <utility>
 #include <vector>
+
+void raise_nofile() {
+  rlimit limit{};
+  if (::getrlimit(RLIMIT_NOFILE, &limit) != 0) {
+    return;
+  }
+  auto target = limit.rlim_max;
+  if (target == RLIM_INFINITY) {
+    target = 65536;
+  }
+  if (limit.rlim_cur >= target) {
+    return;
+  }
+  limit.rlim_cur = target;
+  ::setrlimit(RLIMIT_NOFILE, &limit);
+}
 
 namespace {
 
@@ -72,6 +93,8 @@ struct Daemon {
   int cpu = 0;
   int listen_fd = -1;
   bool counters_done = false;
+  // Extra environment for the exec'd process. Empty keeps the inherited environment.
+  std::vector<std::pair<std::string, std::string>> env;
 };
 
 std::mutex daemons_mu;
@@ -112,33 +135,95 @@ std::string request_body(const std::string& request) {
   return request.substr(header_end + 4);
 }
 
+bool read_json_string(const std::string& json, std::size_t open, std::string& out, std::size_t& close) {
+  if (open >= json.size() || json[open] != '"') {
+    return false;
+  }
+  out.clear();
+  for (std::size_t i = open + 1; i < json.size(); ++i) {
+    if (json[i] == '\\') {
+      if (i + 1 >= json.size()) {
+        return false;
+      }
+      const char next = json[++i];
+      switch (next) {
+        case '"':
+        case '\\':
+        case '/':
+          out.push_back(next);
+          break;
+        case 'b':
+          out.push_back('\b');
+          break;
+        case 'f':
+          out.push_back('\f');
+          break;
+        case 'n':
+          out.push_back('\n');
+          break;
+        case 'r':
+          out.push_back('\r');
+          break;
+        case 't':
+          out.push_back('\t');
+          break;
+        default:
+          return false;
+      }
+      continue;
+    }
+    if (json[i] == '"') {
+      close = i;
+      return true;
+    }
+    if (static_cast<unsigned char>(json[i]) < 0x20) {
+      return false;
+    }
+    out.push_back(json[i]);
+  }
+  return false;
+}
+
+// Index of the colon for a key on the outermost object. Keys inside nested objects are ignored.
+std::optional<std::size_t> top_level_colon(const std::string& json, std::string_view key) {
+  int depth = 0;
+  for (std::size_t i = 0; i < json.size();) {
+    const char c = json[i];
+    if (c == '"') {
+      std::string text;
+      std::size_t close = 0;
+      if (!read_json_string(json, i, text, close)) {
+        return std::nullopt;
+      }
+      std::size_t after = close + 1;
+      while (after < json.size() && std::isspace(static_cast<unsigned char>(json[after])) != 0) {
+        ++after;
+      }
+      if (depth == 1 && text == key && after < json.size() && json[after] == ':') {
+        return after;
+      }
+      i = close + 1;
+      continue;
+    }
+    if (c == '{' || c == '[') {
+      ++depth;
+    } else if (c == '}' || c == ']') {
+      if (depth == 0) {
+        return std::nullopt;
+      }
+      --depth;
+    }
+    ++i;
+  }
+  return std::nullopt;
+}
+
 std::optional<std::string> json_value(const std::string& json, std::string_view key) {
-  const std::string pattern = std::string("\"") + std::string(key) + "\"";
-  std::size_t from = 0;
-  std::size_t key_at = std::string::npos;
-  while (from < json.size()) {
-    const auto found = json.find(pattern, from);
-    if (found == std::string::npos) {
-      return std::nullopt;
-    }
-    auto after = found + pattern.size();
-    while (after < json.size() && std::isspace(static_cast<unsigned char>(json[after])) != 0) {
-      ++after;
-    }
-    if (after < json.size() && json[after] == ':') {
-      key_at = found;
-      break;
-    }
-    from = found + 1;
-  }
-  if (key_at == std::string::npos) {
+  const auto colon = top_level_colon(json, key);
+  if (!colon) {
     return std::nullopt;
   }
-  auto at = json.find(':', key_at + pattern.size());
-  if (at == std::string::npos) {
-    return std::nullopt;
-  }
-  ++at;
+  auto at = *colon + 1;
   while (at < json.size() && std::isspace(static_cast<unsigned char>(json[at])) != 0) {
     ++at;
   }
@@ -147,17 +232,11 @@ std::optional<std::string> json_value(const std::string& json, std::string_view 
   }
   if (json[at] == '"') {
     std::string value;
-    for (std::size_t i = at + 1; i < json.size(); ++i) {
-      if (json[i] == '\\' && i + 1 < json.size()) {
-        value.push_back(json[++i]);
-        continue;
-      }
-      if (json[i] == '"') {
-        return value;
-      }
-      value.push_back(json[i]);
+    std::size_t close = 0;
+    if (!read_json_string(json, at, value, close)) {
+      return std::nullopt;
     }
-    return std::nullopt;
+    return value;
   }
   const auto end = json.find_first_of(",}", at);
   auto token = json.substr(at, end == std::string::npos ? std::string::npos : end - at);
@@ -165,6 +244,98 @@ std::optional<std::string> json_value(const std::string& json, std::string_view 
     token.pop_back();
   }
   return token;
+}
+
+bool valid_env_name(const std::string& name) {
+  if (name.empty() || (std::isalpha(static_cast<unsigned char>(name.front())) == 0 && name.front() != '_')) {
+    return false;
+  }
+  for (const unsigned char c : name) {
+    if (std::isalnum(c) == 0 && c != '_') {
+      return false;
+    }
+  }
+  return true;
+}
+
+struct EnvRequest {
+  bool present = false;
+  bool ok = true;
+  std::vector<std::pair<std::string, std::string>> vars;
+};
+
+// "env" is an object of string values. Absent means the daemon inherits Mercury's environment unchanged.
+EnvRequest parse_env(const std::string& json) {
+  EnvRequest result;
+  const auto colon = top_level_colon(json, "env");
+  if (!colon) {
+    return result;
+  }
+  result.present = true;
+  std::size_t i = *colon + 1;
+  while (i < json.size() && std::isspace(static_cast<unsigned char>(json[i])) != 0) {
+    ++i;
+  }
+  if (i >= json.size() || json[i] != '{') {
+    result.ok = false;
+    return result;
+  }
+  ++i;
+  while (true) {
+    while (i < json.size() && std::isspace(static_cast<unsigned char>(json[i])) != 0) {
+      ++i;
+    }
+    if (i < json.size() && json[i] == '}') {
+      return result;
+    }
+    std::string name;
+    std::size_t close = 0;
+    if (!read_json_string(json, i, name, close) || !valid_env_name(name)) {
+      result.ok = false;
+      return result;
+    }
+    i = close + 1;
+    while (i < json.size() && std::isspace(static_cast<unsigned char>(json[i])) != 0) {
+      ++i;
+    }
+    if (i >= json.size() || json[i] != ':') {
+      result.ok = false;
+      return result;
+    }
+    ++i;
+    while (i < json.size() && std::isspace(static_cast<unsigned char>(json[i])) != 0) {
+      ++i;
+    }
+    std::string value;
+    if (!read_json_string(json, i, value, close)) {
+      result.ok = false;
+      return result;
+    }
+    i = close + 1;
+    bool replaced = false;
+    for (auto& entry : result.vars) {
+      if (entry.first == name) {
+        entry.second = std::move(value);
+        replaced = true;
+        break;
+      }
+    }
+    if (!replaced) {
+      result.vars.emplace_back(std::move(name), std::move(value));
+    }
+    while (i < json.size() && std::isspace(static_cast<unsigned char>(json[i])) != 0) {
+      ++i;
+    }
+    if (i < json.size() && json[i] == ',') {
+      ++i;
+      continue;
+    }
+    if (i < json.size() && json[i] == '}') {
+      return result;
+    }
+    result.ok = false;
+    return result;
+  }
 }
 
 std::string read_pipes(int out_fd, int err_fd) {
@@ -566,7 +737,50 @@ struct Launched {
   int err_fd = -1;
 };
 
-std::optional<Launched> launch(const std::string& daemon_id, const std::string& exec_path, int cpu, int listen_fd) {
+[[noreturn]] void exec_daemon(const std::string& exec_path, int listen_fd,
+                            const std::vector<std::pair<std::string, std::string>>& env) {
+  std::vector<char> arg0(exec_path.begin(), exec_path.end());
+  arg0.push_back('\0');
+  char flag[] = "--listen-fd";
+  char fd_text[] = "3";
+  char* with_socket[] = {arg0.data(), flag, fd_text, nullptr};
+  char* plain[] = {arg0.data(), nullptr};
+  char** argv = listen_fd >= 0 ? with_socket : plain;
+  if (env.empty()) {
+    ::execv(exec_path.c_str(), argv);
+    _exit(127);
+  }
+  extern char** environ;
+  std::vector<std::string> owned;
+  for (char** it = environ; it != nullptr && *it != nullptr; ++it) {
+    owned.emplace_back(*it);
+  }
+  for (const auto& [name, value] : env) {
+    const auto prefix = name + "=";
+    bool replaced = false;
+    for (auto& entry : owned) {
+      if (entry.compare(0, prefix.size(), prefix) == 0) {
+        entry = prefix + value;
+        replaced = true;
+        break;
+      }
+    }
+    if (!replaced) {
+      owned.push_back(prefix + value);
+    }
+  }
+  std::vector<char*> envp;
+  envp.reserve(owned.size() + 1);
+  for (auto& entry : owned) {
+    envp.push_back(entry.data());
+  }
+  envp.push_back(nullptr);
+  ::execve(exec_path.c_str(), argv, envp.data());
+  _exit(127);
+}
+
+std::optional<Launched> launch(const std::string& daemon_id, const std::string& exec_path, int cpu, int listen_fd,
+                               const std::vector<std::pair<std::string, std::string>>& env) {
   const int linux_cpu = cpu - 1;
   const auto placement = prepare_placement(daemon_id, linux_cpu);
   int out_pipe[2] = {-1, -1};
@@ -642,14 +856,8 @@ std::optional<Launched> launch(const std::string& daemon_id, const std::string& 
         _exit(127);
       }
     }
-    std::vector<char> arg0(exec_path.begin(), exec_path.end());
-    arg0.push_back('\0');
-    char flag[] = "--listen-fd";
-    char fd_text[] = "3";
-    char* with_socket[] = {arg0.data(), flag, fd_text, nullptr};
-    char* plain[] = {arg0.data(), nullptr};
-    ::execv(exec_path.c_str(), listen_fd >= 0 ? with_socket : plain);
-    _exit(127);
+    raise_nofile();
+    exec_daemon(exec_path, listen_fd, env);
   }
 
   ::close(out_pipe[1]);
@@ -711,6 +919,95 @@ static std::int64_t monotonic_ns() {
   return static_cast<std::int64_t>(now.tv_sec) * 1000000000LL + now.tv_nsec;
 }
 
+std::uint64_t cpu_ticks(pid_t tid) {
+  std::ifstream in("/proc/" + std::to_string(tid) + "/stat");
+  std::string line;
+  if (!in || !std::getline(in, line)) {
+    return 0;
+  }
+  const auto paren = line.rfind(')');
+  if (paren == std::string::npos) {
+    return 0;
+  }
+  std::istringstream rest(line.substr(paren + 1));
+  std::string state;
+  unsigned long skip = 0;
+  unsigned long utime = 0;
+  unsigned long stime = 0;
+  rest >> state;
+  for (int i = 0; i < 10; ++i) {
+    rest >> skip;
+  }
+  rest >> utime >> stime;
+  if (!rest) {
+    return 0;
+  }
+  return static_cast<std::uint64_t>(utime) + static_cast<std::uint64_t>(stime);
+}
+
+std::vector<pid_t> busiest_threads(const std::vector<pid_t>& want, const std::vector<pid_t>& already,
+                                   std::unordered_map<pid_t, std::uint64_t>& seen, std::size_t cap) {
+  struct Rank {
+    pid_t tid = -1;
+    std::uint64_t delta = 0;
+  };
+  std::vector<Rank> ranked;
+  ranked.reserve(want.size());
+  for (const auto tid : want) {
+    const auto now = cpu_ticks(tid);
+    const auto previous = seen.find(tid);
+    const auto delta = previous == seen.end() ? 0 : now - previous->second;
+    seen[tid] = now;
+    ranked.push_back(Rank{tid, delta});
+  }
+  for (auto it = seen.begin(); it != seen.end();) {
+    if (std::find(want.begin(), want.end(), it->first) == want.end()) {
+      it = seen.erase(it);
+    } else {
+      ++it;
+    }
+  }
+  const auto by_delta = [](const Rank& a, const Rank& b) {
+    if (a.delta != b.delta) {
+      return a.delta > b.delta;
+    }
+    return a.tid < b.tid;
+  };
+  std::sort(ranked.begin(), ranked.end(), by_delta);
+  std::vector<Rank> members;
+  std::vector<Rank> outsiders;
+  members.reserve(std::min(already.size(), cap));
+  for (const auto& rank : ranked) {
+    if (std::find(already.begin(), already.end(), rank.tid) != already.end()) {
+      members.push_back(rank);
+    } else {
+      outsiders.push_back(rank);
+    }
+  }
+  if (members.size() > cap) {
+    members.resize(cap);
+  }
+  for (const auto& outsider : outsiders) {
+    if (members.size() < cap) {
+      members.push_back(outsider);
+      continue;
+    }
+    // Equal CPU time keeps the thread already open, so the boundary does not flap.
+    if (outsider.delta <= members.back().delta) {
+      break;
+    }
+    members.back() = outsider;
+    std::sort(members.begin(), members.end(), by_delta);
+  }
+  std::vector<pid_t> keep;
+  keep.reserve(members.size());
+  for (const auto& member : members) {
+    keep.push_back(member.tid);
+  }
+  std::sort(keep.begin(), keep.end());
+  return keep;
+}
+
 std::vector<pid_t> task_ids(pid_t pid) {
   std::vector<pid_t> ids;
   const auto path = "/proc/" + std::to_string(pid) + "/task";
@@ -764,15 +1061,39 @@ std::string format_cpuset(const std::vector<int>& cpus) {
   return out;
 }
 
-std::vector<int> daemon_linux_pool() {
-  std::vector<int> pool;
-  for (const int cpu : daemon_cpus) {
-    const int linux_cpu = cpu - 1;
-    if (linux_cpu >= 0 && linux_cpu != mercury_linux_cpu) {
-      pool.push_back(linux_cpu);
-    }
+// CPUs granted to some other live daemon. An empty cgroup left from an earlier
+// run does not count: nothing is scheduled there.
+std::vector<int> cpus_held_by_others(const std::string& daemon_id) {
+  std::vector<int> held;
+  const std::string root = "/sys/fs/cgroup/mercury";
+  DIR* dir = ::opendir(root.c_str());
+  if (dir == nullptr) {
+    return held;
   }
-  return pool;
+  while (const auto* entry = ::readdir(dir)) {
+    const std::string name = entry->d_name;
+    if (name == "." || name == ".." || name == daemon_id) {
+      continue;
+    }
+    const auto path = root + "/" + name;
+    struct stat info {};
+    if (::stat(path.c_str(), &info) != 0 || !S_ISDIR(info.st_mode)) {
+      continue;
+    }
+    const auto procs = trimmed(read_file(path + "/cgroup.procs"));
+    if (procs.empty()) {
+      continue;
+    }
+    const auto cpus = parse_cpuset(trimmed(read_file(path + "/cpuset.cpus")));
+    if (!cpus) {
+      continue;
+    }
+    held.insert(held.end(), cpus->begin(), cpus->end());
+  }
+  ::closedir(dir);
+  std::sort(held.begin(), held.end());
+  held.erase(std::unique(held.begin(), held.end()), held.end());
+  return held;
 }
 
 int cpuset_cores(const std::string& daemon_id) {
@@ -792,17 +1113,19 @@ bool add_core(const std::string& daemon_id, int max_cores, int& cores_after, std
   if (!have || have->empty() || static_cast<int>(have->size()) >= max_cores) {
     return false;
   }
-  int next = -1;
-  for (const int cpu : daemon_linux_pool()) {
-    if (std::find(have->begin(), have->end(), cpu) == have->end()) {
-      next = cpu;
-      break;
-    }
+  // Sharing a CPU divides occupancy by a core this daemon only partly gets.
+  // Skip CPUs another live daemon holds until the allocatable pool has nothing else.
+  std::vector<int> exclude = *have;
+  const auto held = cpus_held_by_others(daemon_id);
+  exclude.insert(exclude.end(), held.begin(), held.end());
+  auto next = request_cpu(exclude);
+  if (!next) {
+    next = request_cpu(*have);
   }
-  if (next < 0) {
+  if (!next) {
     return false;
   }
-  have->push_back(next);
+  have->push_back(*next);
   std::sort(have->begin(), have->end());
   const auto spec = format_cpuset(*have);
   if (!write_sysfs(*dir + "/cpuset.cpus", spec)) {
@@ -865,17 +1188,87 @@ void forget_thread(const std::string& daemon_id, pid_t root, pid_t tid) {
 }
 
 // A full group is several perf fds plus an archive file. Further threads keep
-// task-clock only, which is what core scaling reads, so a wide daemon stays
-// inside the process file limit.
+// task-clock only. Past the cap we open nothing: one fd per thread is what
+// exhausts the process file limit.
 constexpr std::size_t kFullCounterThreads = 16;
+constexpr std::size_t kMaxMonitoredThreads = 64;
+
+// cpu.stat is the kernel total for every task in the daemon cgroup, including
+// threads that never get their own ring.
+struct CgroupCpu {
+  std::uint64_t usage_usec = 0;
+  std::uint64_t user_usec = 0;
+  std::uint64_t system_usec = 0;
+};
+
+std::optional<CgroupCpu> read_cgroup_cpu(const std::string& daemon_id) {
+  const auto text = read_file("/sys/fs/cgroup/mercury/" + daemon_id + "/cpu.stat");
+  if (text.empty()) {
+    return std::nullopt;
+  }
+  CgroupCpu cpu;
+  bool saw = false;
+  std::istringstream in(text);
+  std::string key;
+  std::uint64_t value = 0;
+  while (in >> key >> value) {
+    if (key == "usage_usec") {
+      cpu.usage_usec = value;
+      saw = true;
+    } else if (key == "user_usec") {
+      cpu.user_usec = value;
+    } else if (key == "system_usec") {
+      cpu.system_usec = value;
+    }
+  }
+  if (!saw) {
+    return std::nullopt;
+  }
+  return cpu;
+}
+
+std::uint64_t usec_delta_ns(std::uint64_t after, std::uint64_t before) {
+  if (after < before) {
+    return 0;
+  }
+  return (after - before) * 1000ULL;
+}
 
 void monitor_daemon(const std::string& daemon_id, pid_t root) {
   std::vector<LiveThread> live;
+  std::unordered_map<pid_t, std::uint64_t> cpu_seen;
+  bool reported_cap = false;
+  bool reported_open = false;
+  const std::vector<std::string> daemon_names{"task-clock", "user", "system"};
+  std::shared_ptr<Ring> daemon_ring;
+  try {
+    auto archive = std::make_shared<RingArchive>(rings_dir() + "/" + archive_name(daemon_id) + ".mring", daemon_names);
+    daemon_ring = std::make_shared<Ring>(kRingSlots, daemon_names, archive);
+    std::cout << "counters daemon_id=" << daemon_id << " cgroup" << std::endl;
+  } catch (const std::exception& error) {
+    std::cerr << "ring archive daemon_id=" << daemon_id << " " << error.what() << std::endl;
+  }
+  auto previous_cpu = read_cgroup_cpu(daemon_id);
   try {
     while (daemon_running(daemon_id, root)) {
       const auto want = daemon_tasks(root);
+      std::vector<pid_t> keep = want;
+      if (want.size() > kMaxMonitoredThreads) {
+        if (!reported_cap) {
+          std::cerr << "counters daemon_id=" << daemon_id << " thread cap " << kMaxMonitoredThreads << std::endl;
+          reported_cap = true;
+        }
+        std::vector<pid_t> already;
+        already.reserve(live.size());
+        for (const auto& thread : live) {
+          already.push_back(thread.tid);
+        }
+        keep = busiest_threads(want, already, cpu_seen, kMaxMonitoredThreads);
+      } else {
+        cpu_seen.clear();
+      }
       for (auto it = live.begin(); it != live.end();) {
-        if (std::find(want.begin(), want.end(), it->tid) == want.end()) {
+        if (std::find(keep.begin(), keep.end(), it->tid) == keep.end()) {
           it->ring->flush();
           forget_thread(daemon_id, root, it->tid);
           it = live.erase(it);
@@ -883,7 +1276,8 @@ void monitor_daemon(const std::string& daemon_id, pid_t root) {
           ++it;
         }
       }
-      for (const auto tid : want) {
+      bool unmonitored = false;
+      for (const auto tid : keep) {
         if (std::any_of(live.begin(), live.end(), [&](const LiveThread& thread) { return thread.tid == tid; })) {
           continue;
         }
@@ -905,7 +1299,14 @@ void monitor_daemon(const std::string& daemon_id, pid_t root) {
           std::cout << "counters daemon_id=" << daemon_id << " tid=" << tid << std::endl;
           live.push_back(LiveThread{tid, std::move(counters), std::move(ring)});
         } catch (const std::exception& error) {
-          std::cerr << "counters daemon_id=" << daemon_id << " tid=" << tid << " " << error.what() << std::endl;
+          // One failure is enough. Retrying every thread in this tick just spends
+          // the remaining descriptors and repeats the same error.
+          if (!reported_open) {
+            std::cerr << "counters daemon_id=" << daemon_id << " tid=" << tid << " " << error.what() << std::endl;
+            reported_open = true;
+          }
+          unmonitored = true;
+          break;
         }
       }
 
@@ -923,6 +1324,21 @@ void monitor_daemon(const std::string& daemon_id, pid_t root) {
         }
         it->ring->push(sample);
         ++it;
+      }
+      if (daemon_ring) {
+        const auto current_cpu = read_cgroup_cpu(daemon_id);
+        if (previous_cpu && current_cpu && current_cpu->usage_usec >= previous_cpu->usage_usec) {
+          Sample total;
+          total.timestamp_ns = monotonic_ns();
+          total.nvalues = 3;
+          total.value[0] = usec_delta_ns(current_cpu->usage_usec, previous_cpu->usage_usec);
+          total.value[1] = usec_delta_ns(current_cpu->user_usec, previous_cpu->user_usec);
+          total.value[2] = usec_delta_ns(current_cpu->system_usec, previous_cpu->system_usec);
+          daemon_ring->push(total);
+        }
+        if (current_cpu) {
+          previous_cpu = current_cpu;
+        }
       }
 
       ScaleState scale;
@@ -962,7 +1378,9 @@ void monitor_daemon(const std::string& daemon_id, pid_t root) {
       }
       const int before = window.cores;
       const auto decision = scale.policy->decide(window);
-      if (decision == Decision::Hold) {
+      // A thread we could not open is invisible. Removing a core from that
+      // partial view would drop capacity the daemon is still using.
+      if (decision == Decision::Hold || (unmonitored && decision == Decision::RemoveCore)) {
         continue;
       }
       int after = 0;
@@ -992,11 +1410,14 @@ void monitor_daemon(const std::string& daemon_id, pid_t root) {
     }
     forget_thread(daemon_id, root, thread.tid);
   }
+  if (daemon_ring) {
+    daemon_ring->flush();
+  }
   mark_counters_done(daemon_id, root);
 }
 
 void arm_daemon(const std::string& daemon_id, const std::string& exec_path, int cpu, int listen_fd, pid_t pid,
-                int out_fd, int err_fd) {
+                int out_fd, int err_fd, std::vector<std::pair<std::string, std::string>> env) {
   {
     std::lock_guard lock(daemons_mu);
     Daemon created;
@@ -1006,6 +1427,7 @@ void arm_daemon(const std::string& daemon_id, const std::string& exec_path, int 
     created.running = true;
     created.cpu = cpu;
     created.listen_fd = listen_fd;
+    created.env = std::move(env);
     if (auto* daemon = find_daemon(daemon_id)) {
       if (daemon->listen_fd >= 0 && daemon->listen_fd != listen_fd) {
         ::close(daemon->listen_fd);
@@ -1049,6 +1471,10 @@ std::optional<std::string> start_route(const std::string& request) {
       ::access(exec_path->c_str(), X_OK) != 0) {
     return http_response(400, "Bad Request", R"({"pid":0})", kJson);
   }
+  const auto env = parse_env(body);
+  if (!env.ok) {
+    return http_response(400, "Bad Request", R"({"pid":0})", kJson);
+  }
   {
     std::lock_guard lock(daemons_mu);
     if (const auto* daemon = find_daemon(*daemon_id); daemon != nullptr && daemon->running) {
@@ -1073,14 +1499,14 @@ std::optional<std::string> start_route(const std::string& request) {
     }
   }
 
-  const auto launched = launch(*daemon_id, *exec_path, cpu, listen_fd);
+  const auto launched = launch(*daemon_id, *exec_path, cpu, listen_fd, env.vars);
   if (!launched) {
     if (listen_fd >= 0) {
       ::close(listen_fd);
     }
     return http_response(500, "Internal Server Error", R"({"pid":0})", kJson);
   }
-  arm_daemon(*daemon_id, *exec_path, cpu, listen_fd, launched->pid, launched->out_fd, launched->err_fd);
+  arm_daemon(*daemon_id, *exec_path, cpu, listen_fd, launched->pid, launched->out_fd, launched->err_fd, env.vars);
   return http_response(200, "OK", "{\"pid\":" + std::to_string(launched->pid) + "}", kJson);
 }
 
@@ -1108,6 +1534,7 @@ std::optional<std::string> migrate_route(const std::string& request) {
   int listen_fd = -1;
   pid_t old_pid = -1;
   int old_cpu = 0;
+  std::vector<std::pair<std::string, std::string>> env;
   {
     std::lock_guard lock(daemons_mu);
     const auto* daemon = find_daemon(*daemon_id);
@@ -1118,9 +1545,10 @@ std::optional<std::string> migrate_route(const std::string& request) {
     listen_fd = daemon->listen_fd;
     old_pid = daemon->pid;
     old_cpu = daemon->cpu;
+    env = daemon->env;
   }
 
-  const auto launched = launch(*daemon_id, exec_path, cpu, listen_fd);
+  const auto launched = launch(*daemon_id, exec_path, cpu, listen_fd, env);
   if (!launched || !wait_until_image(launched->pid, exec_path)) {
     if (launched) {
       discard_launch(*launched);
@@ -1128,7 +1556,7 @@ std::optional<std::string> migrate_route(const std::string& request) {
     return http_response(500, "Internal Server Error", R"({"pid":0})", kJson);
   }
 
-  arm_daemon(*daemon_id, exec_path, cpu, listen_fd, launched->pid, launched->out_fd, launched->err_fd);
+  arm_daemon(*daemon_id, exec_path, cpu, listen_fd, launched->pid, launched->out_fd, launched->err_fd, std::move(env));
   ::kill(old_pid, SIGTERM);
   for (int attempt = 0; attempt < 20; ++attempt) {
     if (::kill(old_pid, 0) < 0 && errno == ESRCH) {
@@ -1142,6 +1570,15 @@ std::optional<std::string> migrate_route(const std::string& request) {
   std::cout << "migrated daemon_id=" << *daemon_id << " pid " << old_pid << " cpu " << old_cpu << " -> pid "
             << launched->pid << " cpu " << cpu << std::endl;
   return http_response(200, "OK", "{\"pid\":" + std::to_string(launched->pid) + "}", kJson);
+}
+
+static std::string resource_choice(const std::optional<ResourceGroupState>& state) {
+  if (!state) {
+    return "none";
+  }
+  std::ostringstream out;
+  out << std::fixed << std::setprecision(2) << state->name << "=" << state->load;
+  return out.str();
 }
 
 std::optional<std::string> cpus_route(const std::string& request) {
@@ -1159,6 +1596,10 @@ std::optional<std::string> cpus_route(const std::string& request) {
                 std::find(want->begin(), want->end(), mercury_linux_cpu) != want->end())) {
     return http_response(400, "Bad Request", ok_json(false), kJson);
   }
+  if (!resource_groups_see(*want)) {
+    std::cerr << "cpus daemon_id=" << *daemon_id << " cpus are not in a resource group" << std::endl;
+    return http_response(400, "Bad Request", ok_json(false), kJson);
+  }
 
   const auto dir = ensure_daemon_cpuset(*daemon_id);
   if (!dir) {
@@ -1172,7 +1613,11 @@ std::optional<std::string> cpus_route(const std::string& request) {
   }
   for (int attempt = 0; attempt < 50; ++attempt) {
     if (cpuset_applied(*dir, *want)) {
-      std::cout << "cpus daemon_id=" << *daemon_id << " cpus=" << trimmed(*cpus_text) << std::endl;
+      std::cout << "cpus daemon_id=" << *daemon_id << " cpus=" << trimmed(*cpus_text) << " socket "
+                << resource_choice(least_loaded_touching(ResourceLevel::Socket, *want)) << " node "
+                << resource_choice(least_loaded_touching(ResourceLevel::Node, *want)) << " l3 "
+                << resource_choice(least_loaded_touching(ResourceLevel::L3, *want)) << " core "
+                << resource_choice(least_loaded_touching(ResourceLevel::Core, *want)) << std::endl;
       return http_response(200, "OK", ok_json(true), kJson);
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(10));
@@ -1226,6 +1671,10 @@ std::optional<std::string> scale_route(const std::string& request) {
   if (!policy) {
     return http_response(400, "Bad Request", ok_json(false), kJson);
   }
+  if (!resources_ready() || !least_loaded(ResourceLevel::Core)) {
+    std::cerr << "scale daemon_id=" << *daemon_id << " resource groups are not available" << std::endl;
+    return http_response(500, "Internal Server Error", ok_json(false), kJson);
+  }
 
   int threads = 0;
   {
@@ -1244,6 +1693,11 @@ std::optional<std::string> scale_route(const std::string& request) {
     }
     threads = static_cast<int>(daemon->threads.size());
   }
+  std::cout << "scale daemon_id=" << *daemon_id << " least socket "
+            << resource_choice(least_loaded(ResourceLevel::Socket)) << " node "
+            << resource_choice(least_loaded(ResourceLevel::Node)) << " l3 "
+            << resource_choice(least_loaded(ResourceLevel::L3)) << " core "
+            << resource_choice(least_loaded(ResourceLevel::Core)) << std::endl;
   return http_response(200, "OK", scale_json(min_cores, max_cores, cpuset_cores(*daemon_id), threads), kJson);
 }
 

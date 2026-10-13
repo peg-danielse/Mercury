@@ -3,30 +3,36 @@
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
-#include <pthread.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
 #include <cctype>
 #include <cerrno>
+#include <condition_variable>
 #include <cstdint>
 #include <cstring>
 #include <ctime>
 #include <iostream>
-#include <memory>
 #include <mutex>
 #include <sstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
+#include <vector>
 
 namespace {
 
 volatile std::uint64_t g_sink = 0;
 
-struct Request {
-  int fd = -1;
-  Arrivals* arrivals = nullptr;
+// A thread per connection is a perf event each, and that exhausts the process
+// file limit. A fixed pool keeps one long-lived thread per worker.
+constexpr int kWorkers = 32;
+
+struct Worker {
+  std::mutex mu;
+  std::condition_variable cv;
+  std::vector<int> incoming;
 };
 
 std::int64_t monotonic_ns() {
@@ -194,11 +200,18 @@ void serve_connection(int fd, Arrivals* arrivals) {
   }
 }
 
-void* run_request(void* arg) {
-  const std::unique_ptr<Request> request(static_cast<Request*>(arg));
-  serve_connection(request->fd, request->arrivals);
-  ::close(request->fd);
-  return nullptr;
+void worker_main(Worker* worker, Arrivals* arrivals) {
+  while (true) {
+    int fd = -1;
+    {
+      std::unique_lock lock(worker->mu);
+      worker->cv.wait(lock, [&] { return !worker->incoming.empty(); });
+      fd = worker->incoming.back();
+      worker->incoming.pop_back();
+    }
+    serve_connection(fd, arrivals);
+    ::close(fd);
+  }
 }
 
 void announce(int fd) {
@@ -211,34 +224,29 @@ void announce(int fd) {
   std::cout << "hello_server listening on 127.0.0.1:" << port << std::endl;
 }
 
-// Each accepted connection is its own thread. /cpu burns on that thread, /sleep pauses it.
+// /cpu burns on the worker that owns the connection, and /sleep pauses that same worker.
 void accept_loop(int listen_fd) {
   Arrivals arrivals;
+  Worker workers[kWorkers];
+  for (auto& worker : workers) {
+    std::thread(worker_main, &worker, &arrivals).detach();
+  }
+  unsigned next = 0;
   while (true) {
     const int accepted = ::accept(listen_fd, nullptr, nullptr);
     if (accepted < 0) {
+      if (errno == EINTR) {
+        continue;
+      }
       throw std::runtime_error("accept failed");
     }
-    auto request = std::make_unique<Request>();
-    request->fd = accepted;
-    request->arrivals = &arrivals;
-
-    pthread_attr_t attr;
-    if (pthread_attr_init(&attr) != 0) {
-      serve_connection(accepted, &arrivals);
-      ::close(accepted);
-      continue;
+    Worker& worker = workers[next % static_cast<unsigned>(kWorkers)];
+    ++next;
+    {
+      std::lock_guard lock(worker.mu);
+      worker.incoming.push_back(accepted);
     }
-    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
-    pthread_t thread;
-    const int created = pthread_create(&thread, &attr, run_request, request.get());
-    pthread_attr_destroy(&attr);
-    if (created != 0) {
-      serve_connection(accepted, &arrivals);
-      ::close(accepted);
-      continue;
-    }
-    request.release();
+    worker.cv.notify_one();
   }
 }
 

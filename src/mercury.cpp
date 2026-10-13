@@ -1,5 +1,6 @@
 #include "http.hpp"
 #include "daemons.hpp"
+#include "resources.hpp"
 
 #include <sched.h>
 
@@ -90,13 +91,20 @@ int main(int argc, char** argv) {
       }
     }
     std::sort(daemon_cpus.begin(), daemon_cpus.end());
+    raise_nofile();
     set_mercury_cpu(self);
     std::cout << "pinned to cpu " << self << ", daemons on";
     for (const int cpu : daemon_cpus) {
       std::cout << ' ' << cpu;
     }
     std::cout << std::endl;
+    std::vector<int> allocatable;
+    allocatable.reserve(daemon_cpus.size());
+    for (const int cpu : daemon_cpus) {
+      allocatable.push_back(cpu - 1);
+    }
     set_daemon_cpus(std::move(daemon_cpus));
+    init_resources(std::move(allocatable));
     serve(static_cast<std::uint16_t>(port_number), "mercury", route);
   } catch (const std::exception& error) {
     std::cerr << error.what() << std::endl;
