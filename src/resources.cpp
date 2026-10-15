@@ -13,7 +13,6 @@
 #include <ctime>
 #include <fstream>
 #include <iostream>
-#include <mutex>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -52,7 +51,6 @@ struct Group {
   std::vector<int> linux_cpus;
   int parent = -1;
   std::vector<int> children;
-  int cursor = 0;
   std::shared_ptr<Ring> ring;
 };
 
@@ -61,12 +59,8 @@ struct MetricTarget {
   std::shared_ptr<Ring> ring;
 };
 
-std::mutex mu;
 bool ready = false;
 std::vector<Group> groups;
-std::vector<int> sockets;
-std::vector<int> order;
-int order_cursor = 0;
 std::vector<char> known;
 std::vector<char> allocatable;
 
@@ -282,12 +276,6 @@ void finish_groups() {
   for (auto& group : groups) {
     std::sort(group.children.begin(), group.children.end(), by_cpu);
   }
-  for (int i = 0; i < static_cast<int>(groups.size()); ++i) {
-    if (groups[static_cast<std::size_t>(i)].level == ResourceLevel::Socket) {
-      sockets.push_back(i);
-    }
-  }
-  std::sort(sockets.begin(), sockets.end(), by_cpu);
 
   for (const auto level : {ResourceLevel::L3, ResourceLevel::Core}) {
     std::vector<int> ids;
@@ -301,72 +289,6 @@ void finish_groups() {
     for (int n = 0; n < static_cast<int>(ids.size()); ++n) {
       groups[static_cast<std::size_t>(ids[static_cast<std::size_t>(n)])].name =
           std::string(prefix) + "." + std::to_string(n);
-    }
-  }
-}
-
-int pick_child(Group& group) {
-  if (group.children.empty()) {
-    return -1;
-  }
-  const int child = group.children[static_cast<std::size_t>(group.cursor)];
-  group.cursor = (group.cursor + 1) % static_cast<int>(group.children.size());
-  return child;
-}
-
-int socket_cursor = 0;
-
-int step_cpu_walk() {
-  if (sockets.empty()) {
-    return -1;
-  }
-  const int socket_index = sockets[static_cast<std::size_t>(socket_cursor)];
-  socket_cursor = (socket_cursor + 1) % static_cast<int>(sockets.size());
-  const int node_index = pick_child(groups[static_cast<std::size_t>(socket_index)]);
-  if (node_index < 0) {
-    return -1;
-  }
-  const int l3_index = pick_child(groups[static_cast<std::size_t>(node_index)]);
-  if (l3_index < 0) {
-    return -1;
-  }
-  const int core_index = pick_child(groups[static_cast<std::size_t>(l3_index)]);
-  if (core_index < 0) {
-    return -1;
-  }
-  auto& core = groups[static_cast<std::size_t>(core_index)];
-  if (core.linux_cpus.empty()) {
-    return -1;
-  }
-  const int cpu = core.linux_cpus[static_cast<std::size_t>(core.cursor)];
-  core.cursor = (core.cursor + 1) % static_cast<int>(core.linux_cpus.size());
-  return cpu;
-}
-
-void build_order() {
-  const int limit = std::max(static_cast<int>(known.size()) * static_cast<int>(known.size()), 1);
-  std::vector<char> seen(known.size(), 0);
-  int allocatable_count = 0;
-  for (const char bit : allocatable) {
-    allocatable_count += bit != 0 ? 1 : 0;
-  }
-  for (int attempt = 0; attempt < limit && static_cast<int>(order.size()) < allocatable_count; ++attempt) {
-    const int cpu = step_cpu_walk();
-    if (cpu < 0) {
-      break;
-    }
-    if (cpu >= static_cast<int>(allocatable.size()) || allocatable[static_cast<std::size_t>(cpu)] == 0) {
-      continue;
-    }
-    if (seen[static_cast<std::size_t>(cpu)] != 0) {
-      continue;
-    }
-    seen[static_cast<std::size_t>(cpu)] = 1;
-    order.push_back(cpu);
-  }
-  for (int cpu = 0; cpu < static_cast<int>(allocatable.size()); ++cpu) {
-    if (allocatable[static_cast<std::size_t>(cpu)] != 0 && seen[static_cast<std::size_t>(cpu)] == 0) {
-      order.push_back(cpu);
     }
   }
 }
@@ -424,22 +346,45 @@ bool intersects(const std::vector<int>& group_cpus, const std::vector<int>& want
   return false;
 }
 
-// Load of the physical core that contains this Linux CPU. No group is treated as full
-// so a CPU we cannot place is not offered.
-double core_load(int cpu) {
+bool is_allocatable(int cpu) {
+  return cpu >= 0 && cpu < static_cast<int>(allocatable.size()) && allocatable[static_cast<std::size_t>(cpu)] != 0;
+}
+
+// Lowest allocatable Linux CPU on this core that the caller does not already hold.
+std::optional<int> lowest_free(const Group& group, const std::vector<int>& skip) {
+  for (const int cpu : group.linux_cpus) {
+    if (!is_allocatable(cpu) || std::binary_search(skip.begin(), skip.end(), cpu)) {
+      continue;
+    }
+    return cpu;
+  }
+  return std::nullopt;
+}
+
+std::optional<int> least_core_cpu(const std::vector<int>& skip) {
+  if (!ready) {
+    return std::nullopt;
+  }
+  std::optional<ResourceGroupState> best;
+  int chosen = -1;
   for (const auto& group : groups) {
     if (group.level != ResourceLevel::Core) {
       continue;
     }
-    if (!std::binary_search(group.linux_cpus.begin(), group.linux_cpus.end(), cpu)) {
+    const auto cpu = lowest_free(group, skip);
+    if (!cpu) {
       continue;
     }
-    if (!group.ring) {
-      return 0;
+    auto state = state_of(group);
+    if (!best || less_loaded(state, *best)) {
+      best = std::move(state);
+      chosen = *cpu;
     }
-    return load_of(*group.ring);
   }
-  return 1;
+  if (!best) {
+    return std::nullopt;
+  }
+  return chosen;
 }
 
 std::optional<ResourceGroupState> least_among(ResourceLevel level, const std::vector<int>* touching) {
@@ -622,8 +567,6 @@ void init_resources(std::vector<int> allocatable_linux_cpus) {
       allocatable[static_cast<std::size_t>(cpu)] = 1;
     }
   }
-  build_order();
-
   std::vector<MetricTarget> targets;
   targets.reserve(groups.size());
   for (auto& group : groups) {
@@ -638,13 +581,6 @@ void init_resources(std::vector<int> allocatable_linux_cpus) {
   std::cout << "resources sockets=" << count_level(ResourceLevel::Socket) << " nodes=" << count_level(ResourceLevel::Node)
             << " l3=" << count_level(ResourceLevel::L3) << " cores=" << count_level(ResourceLevel::Core)
             << " cpus=" << online.size() << " allocatable=" << allocatable_count << std::endl;
-  if (!order.empty()) {
-    std::cout << "resources order linux";
-    for (const int cpu : order) {
-      std::cout << ' ' << cpu;
-    }
-    std::cout << std::endl;
-  }
   ready = !groups.empty();
   if (ready) {
     std::thread(sample_loop, std::move(targets)).detach();
@@ -695,21 +631,66 @@ std::optional<int> request_cpu(const std::vector<int>& exclude) {
   std::vector<int> skip = exclude;
   std::sort(skip.begin(), skip.end());
   skip.erase(std::unique(skip.begin(), skip.end()), skip.end());
-  std::lock_guard lock(mu);
-  if (!ready || order.empty()) {
-    return std::nullopt;
+  return least_core_cpu(skip);
+}
+
+std::vector<ResourceGroupInfo> resource_groups() {
+  std::vector<ResourceGroupInfo> infos;
+  if (!ready) {
+    return infos;
   }
-  for (int attempt = 0; attempt < static_cast<int>(order.size()); ++attempt) {
-    const int cpu = order[static_cast<std::size_t>(order_cursor)];
-    order_cursor = (order_cursor + 1) % static_cast<int>(order.size());
-    if (std::binary_search(skip.begin(), skip.end(), cpu)) {
-      continue;
+  infos.reserve(groups.size());
+  for (const auto& group : groups) {
+    ResourceGroupInfo info;
+    info.level = group.level;
+    info.name = group.name;
+    if (group.parent >= 0 && group.parent < static_cast<int>(groups.size())) {
+      info.parent = groups[static_cast<std::size_t>(group.parent)].name;
     }
-    // Another daemon may already run here. A core under the line can take it.
-    if (core_load(cpu) >= kCoreFull) {
-      continue;
+    info.children.reserve(group.children.size());
+    for (const int child : group.children) {
+      if (child < 0 || child >= static_cast<int>(groups.size())) {
+        continue;
+      }
+      info.children.push_back(groups[static_cast<std::size_t>(child)].name);
     }
-    return cpu;
+    info.linux_cpus = group.linux_cpus;
+    if (group.ring) {
+      info.samples = group.ring->size();
+      info.load = load_of(*group.ring);
+    }
+    infos.push_back(std::move(info));
   }
-  return std::nullopt;
+  return infos;
+}
+
+std::vector<int> allocatable_cpus() {
+  std::vector<int> cpus;
+  for (int cpu = 0; cpu < static_cast<int>(allocatable.size()); ++cpu) {
+    if (allocatable[static_cast<std::size_t>(cpu)] != 0) {
+      cpus.push_back(cpu);
+    }
+  }
+  return cpus;
+}
+
+std::vector<ResourceRingView> resource_rings(std::size_t count) {
+  std::vector<ResourceRingView> views;
+  if (!ready) {
+    return views;
+  }
+  views.reserve(groups.size());
+  for (const auto& group : groups) {
+    ResourceRingView view;
+    view.level = group.level;
+    view.name = group.name;
+    if (group.ring) {
+      view.counters = group.ring->names();
+      view.stored = group.ring->size();
+      const auto n = count == 0 ? view.stored : std::min(count, view.stored);
+      view.samples = group.ring->recent(n);
+    }
+    views.push_back(std::move(view));
+  }
+  return views;
 }

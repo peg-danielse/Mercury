@@ -13,4 +13,6 @@ std::optional<std::string> start_route(const std::string& request);
 std::optional<std::string> migrate_route(const std::string& request);
 std::optional<std::string> cpus_route(const std::string& request);
 std::optional<std::string> scale_route(const std::string& request);
+std::optional<std::string> map_route(const std::string& request);
+std::optional<std::string> rings_route(const std::string& request);
 std::optional<std::string> kill_route(const std::string& request);

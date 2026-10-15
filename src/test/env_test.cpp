@@ -1,3 +1,4 @@
+#include <fcntl.h>
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/select.h>
@@ -8,7 +9,9 @@
 #include <cerrno>
 #include <chrono>
 #include <cstring>
+#include <chrono>
 #include <iostream>
+#include <thread>
 #include <stdexcept>
 #include <string>
 
@@ -119,6 +122,48 @@ int response_pid(const std::string& response) {
   return std::stoi(response.substr(response.find(':', key) + 1));
 }
 
+std::string status_field(pid_t pid, const std::string& key) {
+  const auto path = "/proc/" + std::to_string(pid) + "/status";
+  const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+  if (fd < 0) {
+    return {};
+  }
+  std::string text;
+  char buffer[4096];
+  while (true) {
+    const auto n = ::read(fd, buffer, sizeof(buffer));
+    if (n < 0) {
+      if (errno == EINTR) {
+        continue;
+      }
+      break;
+    }
+    if (n == 0) {
+      break;
+    }
+    text.append(buffer, static_cast<std::size_t>(n));
+  }
+  ::close(fd);
+  const std::string prefix = key + ":";
+  std::size_t at = 0;
+  while (at < text.size()) {
+    const auto end = text.find('\n', at);
+    const auto line = text.substr(at, end == std::string::npos ? std::string::npos : end - at);
+    if (line.compare(0, prefix.size(), prefix) == 0) {
+      std::size_t value = prefix.size();
+      while (value < line.size() && (line[value] == ' ' || line[value] == '\t')) {
+        ++value;
+      }
+      return line.substr(value);
+    }
+    if (end == std::string::npos) {
+      break;
+    }
+    at = end + 1;
+  }
+  return {};
+}
+
 std::string wait_for(int fd, const std::string& needle, int timeout_ms) {
   std::string log;
   const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
@@ -189,6 +234,7 @@ int main() {
     const std::string body = std::string("{\"daemon_id\":\"envprobe\",\"exec_path\":\"") + json_escape(probe) +
                              "\",\"cpu\":1,\"listen_port\":18112,\"env\":{\"MERCURY_TEST_ENV\":\"from-request\","
                              "\"PATH\":\"/only-this\"}}";
+    ::rmdir("/sys/fs/cgroup/mercury/envprobe");
     const auto started = http_post("/start", body);
     const int first = response_pid(started);
     if (response_status(started) != 200 || first <= 0) {
@@ -197,24 +243,32 @@ int main() {
 
     const auto migrated = http_post("/migrate", R"({"daemon_id":"envprobe","cpu":2})");
     const int second = response_pid(migrated);
-    if (response_status(migrated) != 200 || second <= 0 || second == first) {
+    if (response_status(migrated) != 200 || second != first) {
       throw std::runtime_error("migrate failed: " + migrated);
     }
-
-    const auto first_log = wait_for(log_fd, "MERCURY_TEST_ENV=from-request", 3000);
-    if (first_log.find("MERCURY_TEST_ENV=from-request") == std::string::npos ||
-        first_log.find("PATH=/only-this") == std::string::npos) {
-      throw std::runtime_error("started process did not receive env:\n" + first_log);
+    bool on_cpu = false;
+    for (int attempt = 0; attempt < 50; ++attempt) {
+      const auto state = status_field(first, "State");
+      if (status_field(first, "Name") == "env_probe" && !state.empty() && state.front() == 'S' &&
+          status_field(first, "Cpus_allowed_list") == "2") {
+        on_cpu = true;
+        break;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    if (!on_cpu) {
+      throw std::runtime_error("migrate left pid " + std::to_string(first) + " on cpus " +
+                               status_field(first, "Cpus_allowed_list"));
     }
 
     const auto killed = http_post("/kill", R"({"daemon_id":"envprobe"})");
     if (response_status(killed) != 200 || killed.find(R"("ok":true)") == std::string::npos) {
       throw std::runtime_error("kill failed: " + killed);
     }
-    const auto second_log = wait_for(log_fd, "MERCURY_TEST_ENV=from-request", 3000);
-    if (second_log.find("MERCURY_TEST_ENV=from-request") == std::string::npos ||
-        second_log.find("PATH=/only-this") == std::string::npos) {
-      throw std::runtime_error("migrated process did not keep env:\n" + second_log);
+    const auto first_log = wait_for(log_fd, "MERCURY_TEST_ENV=from-request", 3000);
+    if (first_log.find("MERCURY_TEST_ENV=from-request") == std::string::npos ||
+        first_log.find("PATH=/only-this") == std::string::npos) {
+      throw std::runtime_error("started process did not receive env:\n" + first_log);
     }
 
     ::kill(-mercury, SIGTERM);

@@ -51,13 +51,18 @@ Controller to worker, as HTTP JSON on the worker's listen port:
 - `POST /scale` — `{daemon_id, min?, max?, policy?}` returns `{ok, min, max, cores, threads}`
 - `POST /kill` — `{daemon_id}` returns `{ok, finished}`
 
+The worker also answers two reads for a page that draws where daemons sit:
+
+- `GET /map` — resource-group tree, and the running daemons whose cpuset intersects each group
+- `GET /rings` — recent samples from each resource-group ring. `?count=N` selects how many of the newest samples to return
+
 CPU numbers in `start` and `migrate` are Linux CPU numbers, the same numbers `cpus` writes into a cpuset. The worker's own CPU is the lowest number in its share and is never part of a daemon cpuset.
 
 On `start`, the worker places the daemon in a cgroup and sets that cgroup's cpuset to that Linux CPU. It pins the child, then the child widens its affinity to every online CPU except the worker. The cpuset is the limit. Later threads are not pinned one by one; they run on whatever the cpuset allows. The worker raises its own open-file soft limit to the hard limit before it listens, and each daemon does the same before `exec`. `exec_path` is run with no arguments unless `listen_port` is set. Then the worker binds `127.0.0.1` on that port, passes the socket as fd 3, and the arguments are `--listen-fd 3`. Stdout and stderr are read until the child exits, then `exited` is sent once. The exit code and log stay those of the process that was `exec`'d.
 
 `env`, when present, is an object of strings. Each name matches `[A-Za-z_][A-Za-z0-9_]*`. Those names are added to the environment the worker itself inherited, replacing an inherited value with the same name. Every other inherited variable stays. A missing `env` changes nothing. A bad name or a value that is not a string is rejected and the process is not started.
 
-`migrate` starts a new process with the same `exec_path`, the same listen socket, and the same `env`, then stops the old one. It requires a listen socket. The returned pid is the new process.
+`migrate` rewrites that daemon's `cpuset.cpus` to the requested Linux CPU and leaves the process running. The returned pid is the pid already running. Threads stay in the cgroup; the new cpuset is the limit, so each thread runs on that CPU once it is scheduled. A cpuset that had grown past one CPU is replaced by this single CPU.
 
 `cpus` writes the daemon cpuset. `cpus` is a Linux cpuset string, such as `1-4`. The set must not contain the worker's Linux CPU.
 
@@ -79,7 +84,7 @@ A thread counts as busy when its task-clock, divided by its own gap and capped a
 - Add one CPU when every sample in the window has occupancy of at least 0.90 and more busy threads than CPUs granted, and the cpuset is still under `max`. After an add, the next decision waits for a fresh window, so one saturated window cannot add every CPU.
 - Remove one CPU when every sample has fewer busy threads than CPUs granted and the occupancy shows that spare CPU idle: at or below `(cores - 1) / cores`, plus 0.02. A removal does not clear the window. While those samples still show spare CPUs, one CPU is dropped per sample until the cpuset matches the busy threads, and not below `min`.
 
-The CPU added comes from `request_cpu` (`src/resources.cpp`). That walk is round-robin across socket, NUMA node, L3, and core. It skips a CPU this daemon already holds, and it skips a CPU whose core load is at least `kCoreFull` (0.90). Below that line the same Linux CPU may be added to another daemon, so two daemons can run on one CPU while the core is not overloaded. When every remaining CPU is already in this cpuset or sits on an overloaded core, nothing is added. The CPU removed is the highest one in the cpuset.
+The CPU added comes from `request_cpu` (`src/resources.cpp`). That is the least-loaded core which still has an allocatable Linux CPU this daemon does not already hold, and the lowest such CPU on that core. The same comparison as `least_loaded` decides the core: lower load wins, and an equal load keeps the core whose lowest Linux CPU is smaller. A CPU another daemon already runs on is still offered, so two daemons can share one CPU while that core remains the least loaded. When every allocatable CPU is already in this cpuset, nothing is added. The CPU removed is the highest one in the cpuset.
 
 ## Round-robin
 
@@ -115,7 +120,7 @@ File: `src/mercury.cpp`.
 
 `daemon_cpus` and `mercury_linux_cpu` are written on this thread before any other thread starts. Later readers do not lock them. `main` passes `daemon_cpus` to `init_resources` (`src/resources.cpp`) before `serve`.
 
-`route` is the only dispatch. It tries `ping_route`, `stat_route`, `start_route`, `migrate_route`, `cpus_route`, `scale_route`, then `kill_route`. The first function that recognizes the target returns the response. Anything else is HTTP 404 from `http_response`.
+`route` is the only dispatch. It tries `ping_route`, `stat_route`, `start_route`, `migrate_route`, `cpus_route`, `scale_route`, `map_route`, `rings_route`, then `kill_route`. The first function that recognizes the target returns the response. Anything else is HTTP 404 from `http_response`.
 
 ### HTTP accept loop
 
@@ -123,7 +128,7 @@ Files: `src/http.cpp`, `src/http.hpp`.
 
 `serve` calls `listen_on`, which binds `127.0.0.1` with backlog 16, then `serve_fd`. `serve_fd` accepts one connection and calls `handle_client` on the same thread. `handle_client` calls `read_request`, then the `route` function, then `send_all`, then closes the socket. `read_request` stops at 64 KiB. `request_target` and `http_target` parse the request line.
 
-This accept thread is a control-flow section. `launch`, `migrate_route`, and `kill_route` run inside it, so a placement wait, an image wait, or a kill wait delays the next request. No second route runs until `handle_client` returns.
+This accept thread is a control-flow section. `launch`, `migrate_route`, and `kill_route` run inside it, so a placement wait, a cpuset wait, or a kill wait delays the next request. No second route runs until `handle_client` returns.
 
 `Arrivals` and `Arrivals::mu` count requests inside `handle_client`. `/arrivals` reads that count. Daemon routes do not take this lock. `ping_route` answers `ping` and `GET /ping`. `relay_route` and `ping_reply` belong to the hello-server relay and are not on the `mercury` route list.
 
@@ -142,7 +147,7 @@ Holders of `daemons_mu`:
 | `daemon_running` | True when this `daemon_id` still has this pid and `running` |
 | `stat_route` | `{ok:true}` when some running daemon was started with this `exec_path` |
 | `start_route` | Rejects the start when this `daemon_id` is already running |
-| `migrate_route` | Copies `exec_path`, `listen_fd`, `pid`, `cpu`, and `env` of a running daemon that has a listen socket and a different cpu |
+| `migrate_route` | Reads `pid` and `cpu` of a running daemon whose cpu differs, then stores the new cpu after `cpuset.cpus` is written |
 | `arm_daemon` | Inserts the record, or replaces it and closes a different previous `listen_fd` |
 | `watch_daemon` | Sets `running` false, `exit_code`, `log`, and `finished`, then `notify_all` |
 | `mark_counters_done` | Sets `counters_done` when the pid still matches, then `notify_all` |
@@ -153,7 +158,7 @@ Holders of `daemons_mu`:
 
 `kill_route` is the long critical section. It takes `daemons_mu`, sends `SIGTERM`, and `wait_for`s up to 2 seconds until `watch_daemon` sets `finished`. On timeout it sends `SIGKILL` and `wait`s until `finished` is set. It then `wait_for`s up to 2 seconds for `counters_done`. It closes `listen_fd` before releasing the lock. `watch_daemon` and `mark_counters_done` take the same mutex only to publish and notify, so this wait can complete.
 
-`arm_daemon` runs on the accept thread after `launch` returns. It publishes the record, then detaches the two threads. `watch_daemon` and `monitor_daemon` ignore the record when the pid no longer matches, so a migrate that replaces the record leaves the old threads to exit without writing the new daemon.
+`arm_daemon` runs on the accept thread after `launch` returns. It publishes the record, then detaches the two threads. `watch_daemon` and `monitor_daemon` ignore the record when the pid no longer matches.
 
 Work outside the lock: fork, cgroup writes, perf reads, `Ring::push`, `Ring::recent`, and `Policy::decide`. The monitor copies `shared_ptr<Ring>` under `daemons_mu`, drops the lock, then calls `recent`. It never takes `daemons_mu` while holding `Ring::mu_`.
 
@@ -171,7 +176,7 @@ Child, in order: read one byte from the sync pipe; `dup2` the log pipes onto std
 
 Parent, after the child is waiting on the sync pipe: `pin_pid` on the child, then `move_into_cgroup` via `cgroup.procs`, then write the byte `'1'`. The cgroup is in place before the child widens its mask. A failed pin, move, or write sends `SIGKILL`, `waitpid`, and `launch` returns empty.
 
-`migrate_route` copies the live record under `daemons_mu`, calls `launch` with the same `exec_path`, listen socket, and `env`, then `wait_until_image` (`image_is` reads `/proc/<pid>/exe`) for up to 2 seconds. Failure calls `discard_launch`. Success calls `arm_daemon` for the new pid, then `SIGTERM` on the old pid, polling for 2 seconds before `SIGKILL`.
+`migrate_route` reads the live pid and cpu under `daemons_mu`. The cpu must be in `daemon_cpus` and must differ from the recorded cpu. It does not fork. It writes `cpuset.cpus` through `ensure_daemon_cpuset`, `write_sysfs`, and `cpuset_applied`, polling for up to 50 times at 10 ms. On success it stores the new cpu on the same record and returns that pid.
 
 `cpus_route` parses a Linux cpuset with `parse_cpuset`, rejects a set that contains `mercury_linux_cpu`, and rejects a set `resource_groups_see` does not know. It writes the set through `ensure_daemon_cpuset`, `write_sysfs`, and `cpuset_applied`. On success it logs the least-loaded socket, node, L3, and core that contain one of those CPUs, from `least_loaded_touching`, formatted by `resource_choice`. `add_core` and `remove_core` write that same `cpuset.cpus` from the monitor thread. Those three functions do not take `daemons_mu`. The accept thread and the monitor thread can both write one daemon's cpuset.
 
@@ -230,11 +235,19 @@ Each group gets one `Ring` of `kRingSlots` and no archive file. The counter name
 
 `resources_ready` is true once at least one group exists. `resource_groups_see` is true when every given Linux CPU is online and landed in a group.
 
-`build_order` walks the tree with `step_cpu_walk` and records the first visit to each allocatable CPU. One step takes the next socket, then that socket's next node, then that node's next L3, then that L3's next core, then the next logical CPU on the core. `request_cpu` walks the recorded order under `mu`, skips any Linux CPU in `exclude`, and skips a CPU whose core group load from `core_load` is at least `kCoreFull` (0.90). `core_load` is `load_of` for the `Core` group that contains the CPU. No samples yet is load 0, so the CPU is offered. The CPU it stops on is returned even when another daemon already runs there. A full pass that offers nothing returns empty, and the cursor is back where the pass started. `mu` covers that cursor only. `core_load` takes `Ring::mu_` through `recent` while `mu` is held. `sample_loop` and `least_loaded` take `Ring::mu_` inside `push` and `recent`, and they do not take `mu`.
+`request_cpu` asks `least_core_cpu` for one Linux CPU. `least_core_cpu` keeps every `Core` group that has an allocatable CPU outside `exclude`, compares those groups with `less_loaded`, and returns `lowest_free` on the winner: the lowest allocatable Linux CPU on that core that is not in `exclude`. No samples yet is load 0, so the core with the lowest Linux CPU is chosen. The same CPU can be returned to another caller. When every allocatable CPU is in `exclude`, the result is empty. `sample_loop`, `least_loaded`, and `request_cpu` take `Ring::mu_` inside `push`, `recent`, and `load_of`. They do not share another lock.
 
 `scale_route` calls `resources_ready` and `least_loaded(Core)` before it attaches a policy. If either is empty it returns HTTP 500. After the attach it logs the least-loaded socket, node, L3, and core through `resource_choice`. Those numbers are the state of the groups. The CPU `add_core` actually appends is still the one `request_cpu` returns.
 
-`add_core` passes the daemon's current cpuset as `exclude` and appends the CPU `request_cpu` returns. A daemon does not keep a private pool. The same Linux CPU can be added to a second daemon when that core's load is under `kCoreFull`. `remove_core` still drops the highest CPU in the cpuset and does not ask `request_cpu`.
+`add_core` passes the daemon's current cpuset as `exclude` and appends the CPU `request_cpu` returns. A daemon does not keep a private pool. The same Linux CPU can be added to a second daemon when that core is still the least loaded. `remove_core` still drops the highest CPU in the cpuset and does not ask `request_cpu`.
+
+`resource_groups` returns one `ResourceGroupInfo` per group: `level`, `name`, `parent`, `children`, `linux_cpus`, `load`, and `samples`. `parent` is empty for a socket. `children` are the names `finish_groups` linked, in lowest-CPU order. `allocatable_cpus` is the daemon pool passed to `init_resources`.
+
+`resource_rings` copies each group's ring through `Ring::recent`. The count is how many of the newest samples to return, oldest first. Zero copies every sample currently stored. The counter names are the ring's names: `user`, `nice`, `system`, `idle`, `iowait`, `irq`, `softirq`, and `busy`.
+
+`map_route` answers `GET /map`. It copies running daemons under `daemons_mu`, drops that lock, then reads each daemon's `cpuset.cpus`. A cpuset that does not parse falls back to the daemon's stored `cpu`. A daemon is listed on a group when one of those CPUs is in the group's `linux_cpus`, so a daemon scaled across two cores appears on both cores and on the L3, node, and socket that contain them. The JSON is `mercury_cpu`, `allocatable`, `daemons` (`daemon_id`, `pid`, `cpus`), and `groups` (`level`, `name`, `parent`, `children`, `linux_cpus`, `load`, `samples`, `daemons`). `load` is `load_of`. The route returns HTTP 500 when `resources_ready` is false.
+
+`rings_route` answers `GET /rings` and `GET /rings?count=N`. A missing count means 100 samples, one second at `kSampleMs`. N is an integer from 0 through `kRingSlots`. Zero returns every sample the ring currently holds. Any other query is HTTP 400. The JSON is `sample_ms`, `capacity`, and one object per group with `level`, `name`, `counters`, `stored`, and `samples`. Each sample has `timestamp_ns` and one field per counter, in nanoseconds. The route returns HTTP 500 when resources are not ready. Both routes run on the accept thread. `map_route` does not hold `daemons_mu` while it reads a ring. A page should poll `/map` for the tree and `/rings?count=100` for the series, rather than ask for the full minute, because the accept thread builds the response before it takes the next request.
 
 ### Scaling
 
@@ -247,3 +260,5 @@ Each monitor pass, after the sample, copies `ScaleState` and the thread rings un
 `decide` returns `AddCore` when `cores < min_cores`. It returns `RemoveCore` when `cores > max_cores`. It returns `Hold` until the deepest thread has 11 samples. A thread shorter than the age being measured is skipped. A tick with no `task-clock` sample, or with no thread counted, returns `Hold` for the whole decision. Otherwise every one of the last 10 ticks must show occupancy at least 0.90 and more busy threads than cores to add, or fewer busy threads than cores and occupancy at or below `(cores - 1) / cores + 0.02` to remove. The add also requires `cores < max_cores`. The remove also requires `cores > min_cores`.
 
 Back in `monitor_daemon`, `Hold` does nothing. `RemoveCore` does nothing on a tick where a counter failed to open. `AddCore` calls `add_core`. `RemoveCore` calls `remove_core`. `add_core` asks `request_cpu` for the Linux CPU to append, then writes `cpuset.cpus`. `remove_core` drops the highest CPU. Both poll `cpuset_applied`. After an add that happened while `cores` was already at least `min_cores`, the monitor sets `added_at_ns` under `daemons_mu`, so the next decision waits for a new window. A removal leaves `added_at_ns` unchanged.
+
+Policies beyond `saturate` are specified in `policies.md`. That file is the contract for moving a running daemon off a hot NUMA node, for restricting a daemon to resource groups and adding groups, and for application degradation and tuning. `make_policy` still returns only `SaturatePolicy`.

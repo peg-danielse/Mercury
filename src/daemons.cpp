@@ -1078,8 +1078,7 @@ bool add_core(const std::string& daemon_id, int max_cores, int& cores_after, std
   if (!have || have->empty() || static_cast<int>(have->size()) >= max_cores) {
     return false;
   }
-  // The resource manager chooses the CPU. A core under kCoreFull may already
-  // belong to another daemon; an overloaded core is not offered.
+  // Least-loaded core. Another daemon may already run on the CPU it returns.
   auto next = request_cpu(*have);
   if (!next) {
     return false;
@@ -1476,7 +1475,7 @@ std::optional<std::string> migrate_route(const std::string& request) {
   const auto body = request_body(request);
   const auto daemon_id = json_value(body, "daemon_id");
   const auto cpu_text = json_value(body, "cpu");
-  if (!daemon_id || daemon_id->empty() || !cpu_text) {
+  if (!daemon_id || !safe_daemon_id(*daemon_id) || !cpu_text) {
     return http_response(400, "Bad Request", R"({"pid":0})", kJson);
   }
   int cpu = 0;
@@ -1489,46 +1488,53 @@ std::optional<std::string> migrate_route(const std::string& request) {
     return http_response(400, "Bad Request", R"({"pid":0})", kJson);
   }
 
-  std::string exec_path;
-  int listen_fd = -1;
-  pid_t old_pid = -1;
+  pid_t pid = -1;
   int old_cpu = 0;
-  std::vector<std::pair<std::string, std::string>> env;
   {
     std::lock_guard lock(daemons_mu);
     const auto* daemon = find_daemon(*daemon_id);
-    if (daemon == nullptr || !daemon->running || daemon->listen_fd < 0 || daemon->cpu == cpu) {
+    if (daemon == nullptr || !daemon->running || daemon->cpu == cpu) {
       return http_response(400, "Bad Request", R"({"pid":0})", kJson);
     }
-    exec_path = daemon->exec_path;
-    listen_fd = daemon->listen_fd;
-    old_pid = daemon->pid;
+    pid = daemon->pid;
     old_cpu = daemon->cpu;
-    env = daemon->env;
   }
 
-  const auto launched = launch(*daemon_id, exec_path, cpu, listen_fd, env);
-  if (!launched || !wait_until_image(launched->pid, exec_path)) {
-    if (launched) {
-      discard_launch(*launched);
+  const auto dir = ensure_daemon_cpuset(*daemon_id);
+  if (!dir) {
+    std::cerr << "migrate daemon_id=" << *daemon_id << " cgroup setup failed" << std::endl;
+    return http_response(500, "Internal Server Error", R"({"pid":0})", kJson);
+  }
+  const std::vector<int> want{cpu};
+  const auto path = *dir + "/cpuset.cpus";
+  if (!write_sysfs(path, std::to_string(cpu))) {
+    std::cerr << "migrate daemon_id=" << *daemon_id << " write " << path << " failed" << std::endl;
+    return http_response(500, "Internal Server Error", R"({"pid":0})", kJson);
+  }
+  bool applied = false;
+  for (int attempt = 0; attempt < 50; ++attempt) {
+    if (cpuset_applied(*dir, want)) {
+      applied = true;
+      break;
     }
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  if (!applied) {
+    std::cerr << "migrate daemon_id=" << *daemon_id << " cpuset did not take effect" << std::endl;
     return http_response(500, "Internal Server Error", R"({"pid":0})", kJson);
   }
 
-  arm_daemon(*daemon_id, exec_path, cpu, listen_fd, launched->pid, launched->out_fd, launched->err_fd, std::move(env));
-  ::kill(old_pid, SIGTERM);
-  for (int attempt = 0; attempt < 20; ++attempt) {
-    if (::kill(old_pid, 0) < 0 && errno == ESRCH) {
-      break;
+  {
+    std::lock_guard lock(daemons_mu);
+    auto* daemon = find_daemon(*daemon_id);
+    if (daemon == nullptr || !daemon->running || daemon->pid != pid) {
+      return http_response(500, "Internal Server Error", R"({"pid":0})", kJson);
     }
-    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    daemon->cpu = cpu;
   }
-  if (::kill(old_pid, 0) == 0) {
-    ::kill(old_pid, SIGKILL);
-  }
-  std::cout << "migrated daemon_id=" << *daemon_id << " pid " << old_pid << " cpu " << old_cpu << " -> pid "
-            << launched->pid << " cpu " << cpu << std::endl;
-  return http_response(200, "OK", "{\"pid\":" + std::to_string(launched->pid) + "}", kJson);
+  std::cout << "migrated daemon_id=" << *daemon_id << " pid " << pid << " cpu " << old_cpu << " -> " << cpu
+            << std::endl;
+  return http_response(200, "OK", "{\"pid\":" + std::to_string(pid) + "}", kJson);
 }
 
 static std::string resource_choice(const std::optional<ResourceGroupState>& state) {
@@ -1658,6 +1664,221 @@ std::optional<std::string> scale_route(const std::string& request) {
             << resource_choice(least_loaded(ResourceLevel::L3)) << " core "
             << resource_choice(least_loaded(ResourceLevel::Core)) << std::endl;
   return http_response(200, "OK", scale_json(min_cores, max_cores, cpuset_cores(*daemon_id), threads), kJson);
+}
+
+static bool cpus_hit(const std::vector<int>& group_cpus, const std::vector<int>& want) {
+  for (const int cpu : want) {
+    if (std::binary_search(group_cpus.begin(), group_cpus.end(), cpu)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+static void append_ints(std::ostringstream& out, const std::vector<int>& values) {
+  out << '[';
+  for (std::size_t i = 0; i < values.size(); ++i) {
+    if (i != 0) {
+      out << ',';
+    }
+    out << values[i];
+  }
+  out << ']';
+}
+
+static void append_quoted(std::ostringstream& out, const std::vector<std::string>& values) {
+  out << '[';
+  for (std::size_t i = 0; i < values.size(); ++i) {
+    if (i != 0) {
+      out << ',';
+    }
+    out << '"' << values[i] << '"';
+  }
+  out << ']';
+}
+
+static std::string json_load(double load) {
+  if (!(load >= 0)) {
+    return "0";
+  }
+  std::ostringstream out;
+  out << std::setprecision(6) << load;
+  const auto text = out.str();
+  if (text.find("nan") != std::string::npos || text.find("inf") != std::string::npos) {
+    return "0";
+  }
+  return text;
+}
+
+struct ScheduledDaemon {
+  std::string daemon_id;
+  pid_t pid = -1;
+  std::vector<int> cpus;
+};
+
+static std::vector<ScheduledDaemon> scheduled_daemons() {
+  struct Live {
+    std::string daemon_id;
+    pid_t pid = -1;
+    int cpu = -1;
+  };
+  std::vector<Live> live;
+  {
+    std::lock_guard lock(daemons_mu);
+    for (const auto& daemon : daemons) {
+      if (!daemon.running) {
+        continue;
+      }
+      live.push_back(Live{daemon.daemon_id, daemon.pid, daemon.cpu});
+    }
+  }
+  std::vector<ScheduledDaemon> scheduled;
+  scheduled.reserve(live.size());
+  for (const auto& daemon : live) {
+    ScheduledDaemon row;
+    row.daemon_id = daemon.daemon_id;
+    row.pid = daemon.pid;
+    const auto text = trimmed(read_file("/sys/fs/cgroup/mercury/" + daemon.daemon_id + "/cpuset.cpus"));
+    if (auto cpus = parse_cpuset(text)) {
+      row.cpus = std::move(*cpus);
+    } else if (daemon.cpu >= 0) {
+      row.cpus.push_back(daemon.cpu);
+    }
+    scheduled.push_back(std::move(row));
+  }
+  return scheduled;
+}
+
+static std::string map_json(const std::vector<ScheduledDaemon>& daemons_on,
+                            const std::vector<ResourceGroupInfo>& groups) {
+  std::ostringstream out;
+  out << "{\"mercury_cpu\":" << mercury_linux_cpu << ",\"allocatable\":";
+  append_ints(out, allocatable_cpus());
+  out << ",\"daemons\":[";
+  for (std::size_t i = 0; i < daemons_on.size(); ++i) {
+    if (i != 0) {
+      out << ',';
+    }
+    const auto& daemon = daemons_on[i];
+    out << "{\"daemon_id\":\"" << daemon.daemon_id << "\",\"pid\":" << daemon.pid << ",\"cpus\":";
+    append_ints(out, daemon.cpus);
+    out << '}';
+  }
+  out << "],\"groups\":[";
+  for (std::size_t i = 0; i < groups.size(); ++i) {
+    if (i != 0) {
+      out << ',';
+    }
+    const auto& group = groups[i];
+    out << "{\"level\":\"" << resource_level_name(group.level) << "\",\"name\":\"" << group.name << "\",\"parent\":\""
+        << group.parent << "\",\"children\":";
+    append_quoted(out, group.children);
+    out << ",\"linux_cpus\":";
+    append_ints(out, group.linux_cpus);
+    out << ",\"load\":" << json_load(group.load) << ",\"samples\":" << group.samples << ",\"daemons\":[";
+    bool first = true;
+    for (const auto& daemon : daemons_on) {
+      if (!cpus_hit(group.linux_cpus, daemon.cpus)) {
+        continue;
+      }
+      if (!first) {
+        out << ',';
+      }
+      first = false;
+      out << '"' << daemon.daemon_id << '"';
+    }
+    out << "]}";
+  }
+  out << "]}";
+  return out.str();
+}
+
+std::optional<std::string> map_route(const std::string& request) {
+  if (request_target(request) != "/map") {
+    return std::nullopt;
+  }
+  if (!resources_ready()) {
+    return http_response(500, "Internal Server Error", ok_json(false), kJson);
+  }
+  return http_response(200, "OK", map_json(scheduled_daemons(), resource_groups()), kJson);
+}
+
+static std::string rings_json(const std::vector<ResourceRingView>& views) {
+  std::ostringstream out;
+  out << "{\"sample_ms\":" << kSampleMs << ",\"capacity\":" << kRingSlots << ",\"groups\":[";
+  for (std::size_t i = 0; i < views.size(); ++i) {
+    if (i != 0) {
+      out << ',';
+    }
+    const auto& view = views[i];
+    out << "{\"level\":\"" << resource_level_name(view.level) << "\",\"name\":\"" << view.name << "\",\"counters\":";
+    append_quoted(out, view.counters);
+    out << ",\"stored\":" << view.stored << ",\"samples\":[";
+    for (std::size_t s = 0; s < view.samples.size(); ++s) {
+      if (s != 0) {
+        out << ',';
+      }
+      const auto& sample = view.samples[s];
+      out << "{\"timestamp_ns\":" << sample.timestamp_ns;
+      for (std::size_t c = 0; c < view.counters.size() && c < static_cast<std::size_t>(kMaxCounters); ++c) {
+        const auto value = c < static_cast<std::size_t>(sample.nvalues) ? sample.value[c] : 0;
+        out << ",\"" << view.counters[c] << "\":" << value;
+      }
+      out << '}';
+    }
+    out << "]}";
+  }
+  out << "]}";
+  return out.str();
+}
+
+static std::optional<std::size_t> rings_query_count(const std::string& target, bool& bad) {
+  constexpr std::string_view path = "/rings";
+  if (target == path) {
+    return std::nullopt;
+  }
+  constexpr std::string_view prefix = "/rings?count=";
+  if (target.rfind(prefix, 0) != 0 || target.size() == prefix.size()) {
+    bad = true;
+    return std::nullopt;
+  }
+  const auto text = target.substr(prefix.size());
+  for (const unsigned char c : text) {
+    if (std::isdigit(c) == 0) {
+      bad = true;
+      return std::nullopt;
+    }
+  }
+  try {
+    std::size_t used = 0;
+    const auto value = std::stoull(text, &used);
+    if (used != text.size() || value > kRingSlots) {
+      bad = true;
+      return std::nullopt;
+    }
+    return static_cast<std::size_t>(value);
+  } catch (const std::exception&) {
+    bad = true;
+    return std::nullopt;
+  }
+}
+
+std::optional<std::string> rings_route(const std::string& request) {
+  const auto target = request_target(request);
+  if (target != "/rings" && target.rfind("/rings?", 0) != 0) {
+    return std::nullopt;
+  }
+  bool bad = false;
+  const auto asked = rings_query_count(target, bad);
+  if (bad) {
+    return http_response(400, "Bad Request", ok_json(false), kJson);
+  }
+  if (!resources_ready()) {
+    return http_response(500, "Internal Server Error", ok_json(false), kJson);
+  }
+  constexpr std::size_t kDefaultRingSamples = 100;
+  const auto count = asked ? *asked : kDefaultRingSamples;
+  return http_response(200, "OK", rings_json(resource_rings(count)), kJson);
 }
 
 std::optional<std::string> kill_route(const std::string& request) {

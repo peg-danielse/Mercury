@@ -1,5 +1,8 @@
 #pragma once
 
+#include "ring.hpp"
+
+#include <cstddef>
 #include <optional>
 #include <string>
 #include <vector>
@@ -34,11 +37,49 @@ std::optional<ResourceGroupState> least_loaded(ResourceLevel level);
 std::optional<ResourceGroupState> least_loaded_touching(ResourceLevel level,
                                                         const std::vector<int>& linux_cpus);
 
-// A core at or above this /proc/stat load is overloaded. request_cpu will not offer a
-// Linux CPU on that core. Below it, the same CPU may be added to more than one daemon.
-inline constexpr double kCoreFull = 0.90;
-
-// Next allocatable Linux CPU. The walk is round-robin across socket, node, L3, then core.
-// exclude are Linux CPUs the caller already holds. A CPU on an overloaded core is skipped.
-// Empty when every candidate is excluded or overloaded.
+// Allocatable Linux CPU on the least-loaded core that still has one outside exclude.
+// exclude are Linux CPUs the caller already holds. Another daemon may already run on
+// the CPU returned. Empty when every allocatable CPU is excluded.
 std::optional<int> request_cpu(const std::vector<int>& exclude);
+
+inline const char* resource_level_name(ResourceLevel level) {
+  switch (level) {
+    case ResourceLevel::Socket:
+      return "socket";
+    case ResourceLevel::Node:
+      return "node";
+    case ResourceLevel::L3:
+      return "l3";
+    case ResourceLevel::Core:
+      return "core";
+  }
+  return "core";
+}
+
+// One group in the socket → node → L3 → core tree. parent is empty for a socket.
+struct ResourceGroupInfo {
+  ResourceLevel level = ResourceLevel::Core;
+  std::string name;
+  std::string parent;
+  std::vector<std::string> children;
+  std::vector<int> linux_cpus;
+  double load = 0;
+  std::size_t samples = 0;
+};
+
+std::vector<ResourceGroupInfo> resource_groups();
+
+// Linux CPUs init_resources was allowed to hand out.
+std::vector<int> allocatable_cpus();
+
+// Newest samples from one resource-group ring, oldest first.
+struct ResourceRingView {
+  ResourceLevel level = ResourceLevel::Core;
+  std::string name;
+  std::size_t stored = 0;
+  std::vector<std::string> counters;
+  std::vector<Sample> samples;
+};
+
+// count is how many of the newest samples to copy. Zero copies every sample stored.
+std::vector<ResourceRingView> resource_rings(std::size_t count);

@@ -1,8 +1,10 @@
 #include "resources.hpp"
+#include "ring.hpp"
 
 #include <unistd.h>
 
 #include <algorithm>
+#include <ctime>
 #include <fstream>
 #include <iostream>
 #include <sstream>
@@ -84,25 +86,50 @@ std::vector<int> online_cpus() {
   return cpus;
 }
 
-// One lap, or until the walk wraps onto a CPU already handed. The wrap call has
-// already advanced the cursor past that CPU.
-std::vector<int> take(std::size_t count) {
-  std::vector<int> handed;
-  handed.reserve(count);
-  for (std::size_t i = 0; i < count; ++i) {
-    const auto cpu = request_cpu({});
-    if (!cpu) {
-      break;
-    }
-    if (std::find(handed.begin(), handed.end(), *cpu) != handed.end()) {
-      break;
-    }
-    handed.push_back(*cpu);
+bool contains(const std::vector<int>& cpus, int cpu) { return std::binary_search(cpus.begin(), cpus.end(), cpu); }
+
+bool quieter(const ResourceGroupState& candidate, const ResourceGroupState& best) {
+  if (candidate.load != best.load) {
+    return candidate.load < best.load;
   }
-  return handed;
+  const int candidate_cpu = candidate.linux_cpus.empty() ? 1 << 30 : candidate.linux_cpus.front();
+  const int best_cpu = best.linux_cpus.empty() ? 1 << 30 : best.linux_cpus.front();
+  if (candidate_cpu != best_cpu) {
+    return candidate_cpu < best_cpu;
+  }
+  return candidate.name < best.name;
 }
 
-bool contains(const std::vector<int>& cpus, int cpu) { return std::binary_search(cpus.begin(), cpus.end(), cpu); }
+// Lowest pool CPU on the least-loaded core that still has one outside exclude.
+std::optional<int> expected_cpu(const std::vector<ResourceGroupState>& states, const std::vector<int>& pool,
+                                const std::vector<int>& exclude) {
+  const ResourceGroupState* best = nullptr;
+  int chosen = -1;
+  for (const auto& state : states) {
+    if (state.level != ResourceLevel::Core) {
+      continue;
+    }
+    int cpu = -1;
+    for (const int member : state.linux_cpus) {
+      if (!contains(pool, member) || contains(exclude, member)) {
+        continue;
+      }
+      cpu = member;
+      break;
+    }
+    if (cpu < 0) {
+      continue;
+    }
+    if (best == nullptr || quieter(state, *best)) {
+      best = &state;
+      chosen = cpu;
+    }
+  }
+  if (best == nullptr) {
+    return std::nullopt;
+  }
+  return chosen;
+}
 
 const ResourceGroupState* group_of(const std::vector<ResourceGroupState>& states, ResourceLevel level, int cpu) {
   const ResourceGroupState* found = nullptr;
@@ -116,24 +143,39 @@ const ResourceGroupState* group_of(const std::vector<ResourceGroupState>& states
   return found;
 }
 
-bool on_full_core(const std::vector<ResourceGroupState>& states, int cpu) {
-  const auto* core = group_of(states, ResourceLevel::Core, cpu);
-  require(core != nullptr, "cpu " + std::to_string(cpu) + " has no core group");
-  return core->load >= kCoreFull;
+std::string level_name(ResourceLevel level) { return resource_level_name(level); }
+
+const ResourceGroupInfo* named(const std::vector<ResourceGroupInfo>& groups, const std::string& name) {
+  const ResourceGroupInfo* found = nullptr;
+  for (const auto& group : groups) {
+    if (group.name != name) {
+      continue;
+    }
+    require(found == nullptr, "duplicate group name " + name);
+    found = &group;
+  }
+  return found;
 }
 
-std::string level_name(ResourceLevel level) {
+ResourceLevel parent_level(ResourceLevel level) {
   switch (level) {
-    case ResourceLevel::Socket:
-      return "socket";
     case ResourceLevel::Node:
-      return "node";
+      return ResourceLevel::Socket;
     case ResourceLevel::L3:
-      return "l3";
+      return ResourceLevel::Node;
     case ResourceLevel::Core:
-      return "core";
+      return ResourceLevel::L3;
+    case ResourceLevel::Socket:
+      return ResourceLevel::Socket;
   }
-  return "resource";
+  return ResourceLevel::Socket;
+}
+
+void sleep_ms(int ms) {
+  timespec delay{};
+  delay.tv_sec = ms / 1000;
+  delay.tv_nsec = static_cast<long>(ms % 1000) * 1000000L;
+  ::nanosleep(&delay, nullptr);
 }
 
 }  // namespace
@@ -168,80 +210,91 @@ int main() {
       }
     }
 
-    const auto first = take(pool.size());
-    auto sorted = first;
-    std::sort(sorted.begin(), sorted.end());
+    const auto offered = resource_states();
+    const auto want = expected_cpu(offered, pool, {});
+    const auto first = request_cpu({});
+    const auto shared = request_cpu({});
+    require(want.has_value(), "no allocatable cpu on any core");
+    require(first && *first == *want, "request_cpu did not return the least-loaded core");
+    require(shared && *shared == *first, "a second request did not share the least-loaded cpu");
+    require(contains(pool, *first), "handed cpu is outside the pool");
     if (online.size() > 1) {
-      require(std::find(first.begin(), first.end(), reserved) == first.end(), "reserved cpu was handed out");
+      require(*first != reserved, "reserved cpu was handed out");
     }
-    const auto after = resource_states();
-    for (const int cpu : pool) {
-      if (std::binary_search(sorted.begin(), sorted.end(), cpu)) {
+
+    std::vector<int> skip{*first};
+    const auto next_want = expected_cpu(offered, pool, skip);
+    const auto next = request_cpu(skip);
+    if (pool.size() > 1) {
+      require(next_want && next && *next == *next_want, "excluding the granted cpu did not move to the next least-loaded cpu");
+      require(*next != *first, "excluding a cpu returned that same cpu");
+    }
+    require(!request_cpu(pool), "request_cpu returned a cpu that was excluded");
+
+    const auto infos = resource_groups();
+    require(infos.size() == states.size(), "resource_groups size");
+    for (std::size_t i = 0; i < infos.size(); ++i) {
+      require(infos[i].name == states[i].name, "group name order");
+      require(infos[i].level == states[i].level, "group level");
+      require(infos[i].linux_cpus == states[i].linux_cpus, "group cpus");
+    }
+    for (const auto& group : infos) {
+      if (group.level == ResourceLevel::Core) {
+        require(group.children.empty(), group.name + " core has children");
+      } else {
+        require(!group.children.empty(), group.name + " has no children");
+      }
+      if (group.parent.empty()) {
+        require(group.level == ResourceLevel::Socket, group.name + " has no parent");
         continue;
       }
-      require(on_full_core(after, cpu), "cpu " + std::to_string(cpu) + " was withheld from a core under the load line");
+      const auto* parent = named(infos, group.parent);
+      require(parent != nullptr, "missing parent " + group.parent);
+      require(parent->level == parent_level(group.level), group.name + " parent level");
+      bool linked = false;
+      for (const auto& child : parent->children) {
+        if (child == group.name) {
+          linked = true;
+        }
+      }
+      require(linked, "parent children omit " + group.name);
+      for (const int cpu : group.linux_cpus) {
+        require(contains(parent->linux_cpus, cpu), "cpu missing from parent of " + group.name);
+      }
     }
-    for (const int cpu : sorted) {
-      require(std::binary_search(pool.begin(), pool.end(), cpu),
-              "handed cpu " + std::to_string(cpu) + " is outside the pool");
+    require(allocatable_cpus() == pool, "allocatable pool");
+
+    sleep_ms(80);
+    const auto rings = resource_rings(3);
+    require(rings.size() == infos.size(), "ring view size");
+    bool sampled = false;
+    for (std::size_t i = 0; i < rings.size(); ++i) {
+      require(rings[i].name == infos[i].name, "ring name order");
+      require(rings[i].counters.size() == 8, rings[i].name + " counter count");
+      require(rings[i].counters.back() == "busy", rings[i].name + " missing busy");
+      require(rings[i].stored <= kRingSlots, rings[i].name + " stored past capacity");
+      require(rings[i].samples.size() <= 3, rings[i].name + " returned more than asked");
+      if (rings[i].samples.empty()) {
+        continue;
+      }
+      sampled = true;
+      require(rings[i].samples.back().nvalues == 8, rings[i].name + " sample width");
+      require(rings[i].samples.back().timestamp_ns > 0, rings[i].name + " sample time");
+    }
+    require(sampled, "no resource ring samples");
+    const auto full = resource_rings(0);
+    require(full.size() == rings.size(), "full ring view size");
+    for (std::size_t i = 0; i < full.size(); ++i) {
+      require(full[i].samples.size() == full[i].stored, full[i].name + " did not return the stored ring");
+      require(full[i].stored >= rings[i].samples.size(), full[i].name + " stored fewer than the short view");
     }
 
-    // A withheld CPU consumes a cursor step inside request_cpu, and the repeated CPU
-    // that revealed the wrap was consumed too. The second lap starts just after it.
-    const auto second = take(first.size());
-    if (sorted.size() == pool.size()) {
-      require(second == first, "second pass changed the handout order");
-    }
-
-    int socket_changes = 0;
-    int l3_changes = 0;
-    for (std::size_t i = 1; i < first.size(); ++i) {
-      const auto* previous_socket = group_of(states, ResourceLevel::Socket, first[i - 1]);
-      const auto* current_socket = group_of(states, ResourceLevel::Socket, first[i]);
-      const auto* previous_l3 = group_of(states, ResourceLevel::L3, first[i - 1]);
-      const auto* current_l3 = group_of(states, ResourceLevel::L3, first[i]);
-      if (previous_socket->name != current_socket->name) {
-        ++socket_changes;
-      }
-      if (previous_l3->name != current_l3->name) {
-        ++l3_changes;
-      }
-    }
-    std::vector<std::string> sockets_used;
-    std::vector<std::string> l3_used;
-    for (const int cpu : pool) {
-      const auto socket = group_of(states, ResourceLevel::Socket, cpu)->name;
-      const auto l3 = group_of(states, ResourceLevel::L3, cpu)->name;
-      if (std::find(sockets_used.begin(), sockets_used.end(), socket) == sockets_used.end()) {
-        sockets_used.push_back(socket);
-      }
-      if (std::find(l3_used.begin(), l3_used.end(), l3) == l3_used.end()) {
-        l3_used.push_back(l3);
-      }
-    }
-    if (sockets_used.size() > 1) {
-      require(socket_changes > 0, "round-robin stayed on one socket");
-      require(sorted != first, "round-robin handed cpus in numeric order");
-    }
-    if (l3_used.size() > 1) {
-      require(l3_changes > 0, "round-robin stayed on one L3 domain");
-    }
-
-    require(!request_cpu(pool), "request_cpu returned a cpu that was excluded");
-    if (sorted.size() == pool.size() && !first.empty()) {
-      const auto again = request_cpu({});
-      require(again && *again == first.front(), "cursor did not return to the first cpu");
-      if (first.size() > 1) {
-        const auto skipped = request_cpu({first.front()});
-        require(skipped && *skipped == first[1], "excluding the first cpu did not yield the second");
-      }
-    }
-
-    std::cout << "resources_test handed " << first.size() << " cpus";
+    const auto* core = group_of(offered, ResourceLevel::Core, *first);
+    std::cout << "resources_test least " << core->name << " cpu " << *first;
     if (online.size() > 1) {
       std::cout << " reserved " << reserved;
     }
-    std::cout << " sockets " << sockets_used.size() << " l3 " << l3_used.size() << std::endl;
+    std::cout << std::endl;
     // sample_loop is still running. Skip static teardown so it cannot race the rings.
     _exit(0);
   } catch (const std::exception& error) {

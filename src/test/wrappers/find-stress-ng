@@ -1,0 +1,20 @@
+# Sets found to an executable stress-ng, or leaves it empty.
+# sudo replaces HOME with /root, so the invoking user's home is searched too.
+found=${found:-}
+look_home() {
+  home=$1
+  [ -n "${home}" ] || return 1
+  for dir in "${home}/benchmarks/stress-ng" "${home}/Benchmarks/stress-ng"; do
+    if [ -x "${dir}/stress-ng" ]; then
+      found=${dir}/stress-ng
+      return 0
+    fi
+  done
+  return 1
+}
+if [ -z "${found}" ]; then
+  look_home "${HOME:-}" || true
+fi
+if [ -z "${found}" ] && [ -n "${SUDO_USER:-}" ]; then
+  look_home "$(getent passwd "${SUDO_USER}" 2>/dev/null | cut -d: -f6)" || true
+fi

@@ -1,7 +1,7 @@
 # One workload per line, submitted in this order.
 # A line is `cpu <path>` or `memory <path>`. A bare path is classified from its name.
 # A relative path is resolved next to this file, then under ~/benchmarks/stress-ng
-# and ~/Benchmarks/stress-ng.
+# and ~/Benchmarks/stress-ng. sudo sets HOME to /root, so SUDO_USER's home is searched too.
 # cpus takes numbers and ranges. The lowest CPU is Mercury; the rest run daemons.
 # SMT siblings are included so a memory stressor and a cpu stressor can share a core.
 # daemon_test places these round-robin and checks the pins.

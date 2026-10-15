@@ -1,4 +1,5 @@
 #include <dirent.h>
+#include <pwd.h>
 #include <sched.h>
 #include <signal.h>
 #include <sys/socket.h>
@@ -197,14 +198,25 @@ std::string exe_dir() {
   return dirname_of(buf);
 }
 
+void add_stress_home(std::vector<std::string>& dirs, const char* home) {
+  if (home == nullptr || home[0] == '\0') {
+    return;
+  }
+  dirs.push_back(std::string(home) + "/benchmarks/stress-ng");
+  dirs.push_back(std::string(home) + "/Benchmarks/stress-ng");
+}
+
 std::vector<std::string> stress_ng_dirs() {
   std::vector<std::string> dirs;
   if (const char* env = std::getenv("STRESS_NG_DIR")) {
     dirs.emplace_back(env);
   }
-  if (const char* home = std::getenv("HOME")) {
-    dirs.push_back(std::string(home) + "/benchmarks/stress-ng");
-    dirs.push_back(std::string(home) + "/Benchmarks/stress-ng");
+  add_stress_home(dirs, std::getenv("HOME"));
+  // sudo sets HOME to /root. The benchmarks live in the invoking user's home.
+  if (const char* sudo_user = std::getenv("SUDO_USER")) {
+    if (const passwd* entry = ::getpwnam(sudo_user)) {
+      add_stress_home(dirs, entry->pw_dir);
+    }
   }
   return dirs;
 }
@@ -752,8 +764,15 @@ std::string fd_target(pid_t pid, int fd) {
   return buf;
 }
 
+std::vector<pid_t> sorted_tasks(pid_t pid) {
+  auto ids = task_ids(pid);
+  std::sort(ids.begin(), ids.end());
+  return ids;
+}
+
 void migrate_hello(const std::string& hello, int from_linux, int to_linux) {
   constexpr int kListenPort = 8083;
+  ::rmdir("/sys/fs/cgroup/mercury/hello");
   const std::string start_body = std::string("{\"daemon_id\":\"hello\",\"exec_path\":\"") + json_escape(hello) +
                                   "\",\"cpu\":" + std::to_string(from_linux) +
                                   ",\"listen_port\":" + std::to_string(kListenPort) + "}";
@@ -761,8 +780,8 @@ void migrate_hello(const std::string& hello, int from_linux, int to_linux) {
       kPort, "POST /start HTTP/1.1\r\nHost: 127.0.0.1:" + std::to_string(kPort) +
                  "\r\nContent-Type: application/json\r\nContent-Length: " + std::to_string(start_body.size()) +
                  "\r\nConnection: close\r\n\r\n" + start_body);
-  const pid_t old_pid = response_pid(started);
-  if (!http_ok(started) || old_pid <= 0) {
+  const pid_t pid = response_pid(started);
+  if (!http_ok(started) || pid <= 0) {
     throw std::runtime_error("start hello failed: " + trim(response_body(started)));
   }
 
@@ -770,12 +789,14 @@ void migrate_hello(const std::string& hello, int from_linux, int to_linux) {
                            "\r\nConnection: close\r\n\r\n";
   bool up = false;
   std::string socket_id;
+  std::string placement;
   for (int attempt = 0; attempt < 50; ++attempt) {
     try {
       const auto response = http_exchange(kListenPort, ping);
       if (response_body(response).find("pong") != std::string::npos) {
-        socket_id = fd_target(old_pid, 3);
-        if (!socket_id.empty()) {
+        socket_id = fd_target(pid, 3);
+        placement = check_process(pid, from_linux, false);
+        if (!socket_id.empty() && placement.empty() && task_ids(pid).size() > 1) {
           up = true;
           break;
         }
@@ -785,8 +806,9 @@ void migrate_hello(const std::string& hello, int from_linux, int to_linux) {
     sleep_ms(100);
   }
   if (!up) {
-    throw std::runtime_error("hello daemon did not answer on port 8083");
+    throw std::runtime_error("hello daemon did not settle on cpu " + std::to_string(from_linux) + "\n" + placement);
   }
+  const auto before = sorted_tasks(pid);
 
   const std::string migrate_body =
       std::string("{\"daemon_id\":\"hello\",\"cpu\":") + std::to_string(to_linux) + "}";
@@ -794,34 +816,36 @@ void migrate_hello(const std::string& hello, int from_linux, int to_linux) {
       kPort, "POST /migrate HTTP/1.1\r\nHost: 127.0.0.1:" + std::to_string(kPort) +
                  "\r\nContent-Type: application/json\r\nContent-Length: " + std::to_string(migrate_body.size()) +
                  "\r\nConnection: close\r\n\r\n" + migrate_body);
-  const pid_t new_pid = response_pid(moved);
-  if (!http_ok(moved) || new_pid <= 0) {
+  if (!http_ok(moved) || response_pid(moved) != pid) {
     throw std::runtime_error("migrate hello failed: " + trim(response_body(moved)));
   }
 
-  bool old_dead = false;
-  std::string placement;
-  for (int attempt = 0; attempt < 30; ++attempt) {
-    const auto old_id = identity_of(old_pid);
-    old_dead = !old_id.present || old_id.starttime.empty();
-    const auto same_socket = fd_target(new_pid, 3) == socket_id;
-    placement = check_process(new_pid, to_linux, false);
+  for (std::size_t n = 0; n < before.size(); ++n) {
     try {
-      const auto response = http_exchange(kListenPort, ping);
-      if (old_dead && same_socket && placement.empty() && response_body(response).find("pong") != std::string::npos) {
-        break;
-      }
+      http_exchange(kListenPort, ping);
     } catch (const std::exception&) {
     }
-    old_dead = false;
+  }
+
+  bool moved_ok = false;
+  for (int attempt = 0; attempt < 30; ++attempt) {
+    try {
+      http_exchange(kListenPort, ping);
+    } catch (const std::exception&) {
+    }
+    placement = check_process(pid, to_linux, false);
+    if (placement.empty() && sorted_tasks(pid) == before && fd_target(pid, 3) == socket_id) {
+      moved_ok = true;
+      break;
+    }
     sleep_ms(100);
   }
-  if (!old_dead || !placement.empty() || fd_target(new_pid, 3) != socket_id) {
-    throw std::runtime_error("migrate left pid " + std::to_string(old_pid) + " or socket " + socket_id +
-                             " pid " + std::to_string(new_pid) + " fd " + fd_target(new_pid, 3) + "\n" + placement);
+  if (!moved_ok) {
+    throw std::runtime_error("threads of pid " + std::to_string(pid) + " did not move to cpu " +
+                             std::to_string(to_linux) + "\n" + placement);
   }
-  std::cout << "migrated hello pid " << old_pid << " -> " << new_pid << " linux cpu " << to_linux << " socket "
-            << socket_id << std::endl;
+  std::cout << "migrated hello pid " << pid << " cpu " << from_linux << " -> " << to_linux << " threads "
+            << before.size() << std::endl;
 
   const std::string kill_body = R"({"daemon_id":"hello"})";
   const auto killed = http_exchange(
@@ -832,14 +856,14 @@ void migrate_hello(const std::string& hello, int from_linux, int to_linux) {
     throw std::runtime_error("kill hello failed: " + trim(response_body(killed)));
   }
   for (int attempt = 0; attempt < 30; ++attempt) {
-    const auto identity = identity_of(new_pid);
+    const auto identity = identity_of(pid);
     if (!identity.present) {
-      std::cout << "dead hello pid " << new_pid << std::endl;
+      std::cout << "dead hello pid " << pid << std::endl;
       return;
     }
     sleep_ms(100);
   }
-  throw std::runtime_error("hello pid " + std::to_string(new_pid) + " still alive after kill");
+  throw std::runtime_error("hello pid " + std::to_string(pid) + " still alive after kill");
 }
 
 struct Started {
