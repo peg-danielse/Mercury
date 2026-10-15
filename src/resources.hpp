@@ -34,6 +34,11 @@ std::optional<ResourceGroupState> least_loaded(ResourceLevel level);
 std::optional<ResourceGroupState> least_loaded_touching(ResourceLevel level,
                                                         const std::vector<int>& linux_cpus);
 
+// A core at or above this /proc/stat load is overloaded. request_cpu will not offer a
+// Linux CPU on that core. Below it, the same CPU may be added to more than one daemon.
+inline constexpr double kCoreFull = 0.90;
+
 // Next allocatable Linux CPU. The walk is round-robin across socket, node, L3, then core.
-// exclude are Linux CPUs the caller already holds. Empty when none remain.
+// exclude are Linux CPUs the caller already holds. A CPU on an overloaded core is skipped.
+// Empty when every candidate is excluded or overloaded.
 std::optional<int> request_cpu(const std::vector<int>& exclude);

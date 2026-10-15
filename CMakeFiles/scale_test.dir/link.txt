@@ -1,1 +1,0 @@
-/usr/bin/c++ -Wl,--dependency-file=CMakeFiles/scale_test.dir/link.d CMakeFiles/scale_test.dir/src/test/scale.cpp.o -o build/test/scale_test

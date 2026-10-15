@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <fstream>
 #include <iostream>
 #include <stdexcept>
 #include <string>
@@ -14,9 +15,12 @@
 namespace {
 
 void pin_to(int cpu) {
+  if (cpu < 0 || cpu >= CPU_SETSIZE) {
+    throw std::runtime_error("invalid cpu");
+  }
   cpu_set_t set;
   CPU_ZERO(&set);
-  CPU_SET(cpu - 1, &set);
+  CPU_SET(cpu, &set);
   if (::sched_setaffinity(0, sizeof(set), &set) != 0) {
     throw std::runtime_error("sched_setaffinity failed");
   }
@@ -26,7 +30,7 @@ int parse_cpu(const char* text) {
   try {
     std::size_t used = 0;
     const int cpu = std::stoi(text, &used);
-    if (text[used] != '\0' || cpu < 1 || cpu > CPU_SETSIZE) {
+    if (text[used] != '\0' || cpu < 0 || cpu >= CPU_SETSIZE) {
       throw std::runtime_error("invalid cpu");
     }
     return cpu;
@@ -35,6 +39,73 @@ int parse_cpu(const char* text) {
   } catch (const std::exception&) {
     throw std::runtime_error("invalid cpu");
   }
+}
+
+std::vector<int> online_cpus() {
+  std::ifstream in("/sys/devices/system/cpu/online");
+  if (!in) {
+    throw std::runtime_error("cannot read online cpus");
+  }
+  std::string text;
+  std::getline(in, text);
+  while (!text.empty() && (text.back() == '\n' || text.back() == '\r' || text.back() == ' ' || text.back() == '\t')) {
+    text.pop_back();
+  }
+  std::size_t i = 0;
+  while (i < text.size() && (text[i] == ' ' || text[i] == '\t')) {
+    ++i;
+  }
+  if (i >= text.size()) {
+    throw std::runtime_error("no online cpus");
+  }
+  std::vector<int> cpus;
+  auto read_cpu = [&](int& cpu) {
+    if (i >= text.size() || text[i] < '0' || text[i] > '9') {
+      return false;
+    }
+    if (text[i] == '0' && i + 1 < text.size() && text[i + 1] >= '0' && text[i + 1] <= '9') {
+      return false;
+    }
+    int value = 0;
+    while (i < text.size() && text[i] >= '0' && text[i] <= '9') {
+      value = value * 10 + (text[i] - '0');
+      ++i;
+      if (value >= CPU_SETSIZE) {
+        return false;
+      }
+    }
+    cpu = value;
+    return true;
+  };
+  while (i < text.size()) {
+    if (!cpus.empty()) {
+      if (text[i] != ',') {
+        throw std::runtime_error("invalid online cpus");
+      }
+      ++i;
+    }
+    int first = 0;
+    if (!read_cpu(first)) {
+      throw std::runtime_error("invalid online cpus");
+    }
+    int last = first;
+    if (i < text.size() && text[i] == '-') {
+      ++i;
+      if (!read_cpu(last) || last < first) {
+        throw std::runtime_error("invalid online cpus");
+      }
+    }
+    for (int cpu = first; cpu <= last; ++cpu) {
+      if (std::find(cpus.begin(), cpus.end(), cpu) != cpus.end()) {
+        throw std::runtime_error("duplicate cpu");
+      }
+      cpus.push_back(cpu);
+    }
+  }
+  if (cpus.empty() || std::find(cpus.begin(), cpus.end(), 0) == cpus.end()) {
+    throw std::runtime_error("cpu 0 is not online");
+  }
+  return cpus;
 }
 
 std::string route(const std::string& request) {
@@ -65,8 +136,8 @@ std::string route(const std::string& request) {
 }  // namespace
 
 int main(int argc, char** argv) {
-  if (argc < 3) {
-    std::cerr << "usage: mercury <port> <cpu> [cpu...]\n";
+  if (argc < 2) {
+    std::cerr << "usage: mercury <port> [cpu...]\n";
     return 1;
   }
   try {
@@ -75,12 +146,16 @@ int main(int argc, char** argv) {
       throw std::runtime_error("invalid port");
     }
     std::vector<int> cpus;
-    for (int i = 2; i < argc; ++i) {
-      const int cpu = parse_cpu(argv[i]);
-      if (std::find(cpus.begin(), cpus.end(), cpu) != cpus.end()) {
-        throw std::runtime_error("duplicate cpu");
+    if (argc == 2) {
+      cpus = online_cpus();
+    } else {
+      for (int i = 2; i < argc; ++i) {
+        const int cpu = parse_cpu(argv[i]);
+        if (std::find(cpus.begin(), cpus.end(), cpu) != cpus.end()) {
+          throw std::runtime_error("duplicate cpu");
+        }
+        cpus.push_back(cpu);
       }
-      cpus.push_back(cpu);
     }
     const int self = *std::min_element(cpus.begin(), cpus.end());
     pin_to(self);
@@ -98,13 +173,8 @@ int main(int argc, char** argv) {
       std::cout << ' ' << cpu;
     }
     std::cout << std::endl;
-    std::vector<int> allocatable;
-    allocatable.reserve(daemon_cpus.size());
-    for (const int cpu : daemon_cpus) {
-      allocatable.push_back(cpu - 1);
-    }
-    set_daemon_cpus(std::move(daemon_cpus));
-    init_resources(std::move(allocatable));
+    set_daemon_cpus(daemon_cpus);
+    init_resources(std::move(daemon_cpus));
     serve(static_cast<std::uint16_t>(port_number), "mercury", route);
   } catch (const std::exception& error) {
     std::cerr << error.what() << std::endl;

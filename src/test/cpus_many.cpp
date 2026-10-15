@@ -490,7 +490,7 @@ pid_t start_mercury(const std::string& mercury) {
       ::dup2(devnull, STDOUT_FILENO);
       ::close(devnull);
     }
-    const auto cpu = std::to_string(kMercuryLinuxCpu + 1);
+    const auto cpu = std::to_string(kMercuryLinuxCpu);
     ::execl(mercury.c_str(), mercury.c_str(), port.c_str(), cpu.c_str(), nullptr);
     _exit(127);
   }

@@ -8,7 +8,7 @@ The **controller** keeps the daemon table. The operator submits a set of `(exec_
 
 A **worker** runs on each computer. It listens on one TCP port, starts local processes, and reports when they exit.
 
-Each node runs one process. Its argument `cpus` is an array of CPU numbers, the share of cores it may use. It pins itself to the lowest number in `cpus` for its whole life. The remaining numbers are divided round-robin over the other CPUs. Affinity for every CPU number here is that number minus one. On one node this process also holds the daemon table; on the others it is the worker. It is not a daemon. Round-robin does not place it, and delete does not stop it.
+Each node runs one process. Its share of cores is an array of Linux CPU numbers. Starting it with only a port uses every CPU in `/sys/devices/system/cpu/online`. An explicit list after the port is that share instead. It pins itself to the lowest number in the share for its whole life, so a port-only start pins it to CPU 0 when that CPU is online. The remaining numbers are the daemon pool. On one node this process also holds the daemon table; on the others it is the worker. It is not a daemon. Round-robin does not place it, and delete does not stop it.
 
 A worker registers with `{hostname, cpus}` when it connects. A tuple is schedulable when at least one registered worker reports that `exec_path` exists and is executable. Any other tuple is rejected and not stored.
 
@@ -51,9 +51,9 @@ Controller to worker, as HTTP JSON on the worker's listen port:
 - `POST /scale` — `{daemon_id, min?, max?, policy?}` returns `{ok, min, max, cores, threads}`
 - `POST /kill` — `{daemon_id}` returns `{ok, finished}`
 
-CPU numbers in these messages are Mercury numbers: the Linux CPU is that number minus one. The worker's own CPU is the lowest number it was given and is never part of a daemon cpuset.
+CPU numbers in `start` and `migrate` are Linux CPU numbers, the same numbers `cpus` writes into a cpuset. The worker's own CPU is the lowest number in its share and is never part of a daemon cpuset.
 
-On `start`, the worker places the daemon in a cgroup and sets that cgroup's cpuset to the single Linux CPU `cpu - 1`. It pins the child, then the child widens its affinity to every online CPU except the worker. The cpuset is the limit. Later threads are not pinned one by one; they run on whatever the cpuset allows. The worker raises its own open-file soft limit to the hard limit before it listens, and each daemon does the same before `exec`. `exec_path` is run with no arguments unless `listen_port` is set. Then the worker binds `127.0.0.1` on that port, passes the socket as fd 3, and the arguments are `--listen-fd 3`. Stdout and stderr are read until the child exits, then `exited` is sent once. The exit code and log stay those of the process that was `exec`'d.
+On `start`, the worker places the daemon in a cgroup and sets that cgroup's cpuset to that Linux CPU. It pins the child, then the child widens its affinity to every online CPU except the worker. The cpuset is the limit. Later threads are not pinned one by one; they run on whatever the cpuset allows. The worker raises its own open-file soft limit to the hard limit before it listens, and each daemon does the same before `exec`. `exec_path` is run with no arguments unless `listen_port` is set. Then the worker binds `127.0.0.1` on that port, passes the socket as fd 3, and the arguments are `--listen-fd 3`. Stdout and stderr are read until the child exits, then `exited` is sent once. The exit code and log stay those of the process that was `exec`'d.
 
 `env`, when present, is an object of strings. Each name matches `[A-Za-z_][A-Za-z0-9_]*`. Those names are added to the environment the worker itself inherited, replacing an inherited value with the same name. Every other inherited variable stays. A missing `env` changes nothing. A bad name or a value that is not a string is rejected and the process is not started.
 
@@ -79,7 +79,7 @@ A thread counts as busy when its task-clock, divided by its own gap and capped a
 - Add one CPU when every sample in the window has occupancy of at least 0.90 and more busy threads than CPUs granted, and the cpuset is still under `max`. After an add, the next decision waits for a fresh window, so one saturated window cannot add every CPU.
 - Remove one CPU when every sample has fewer busy threads than CPUs granted and the occupancy shows that spare CPU idle: at or below `(cores - 1) / cores`, plus 0.02. A removal does not clear the window. While those samples still show spare CPUs, one CPU is dropped per sample until the cpuset matches the busy threads, and not below `min`.
 
-The CPU added comes from `request_cpu` (`src/resources.cpp`). That walk is round-robin across socket, NUMA node, L3, and core. It skips a CPU another live daemon already holds until the pool has nothing else. The CPU removed is the highest one in the cpuset.
+The CPU added comes from `request_cpu` (`src/resources.cpp`). That walk is round-robin across socket, NUMA node, L3, and core. It skips a CPU this daemon already holds, and it skips a CPU whose core load is at least `kCoreFull` (0.90). Below that line the same Linux CPU may be added to another daemon, so two daemons can run on one CPU while the core is not overloaded. When every remaining CPU is already in this cpuset or sits on an overloaded core, nothing is added. The CPU removed is the highest one in the cpuset.
 
 ## Round-robin
 
@@ -111,9 +111,9 @@ Four threads share one worker. `main` accepts HTTP and runs every route to compl
 
 File: `src/mercury.cpp`.
 
-`main` reads `<port> <cpu> [cpu...]`. `parse_cpu` accepts a Mercury CPU from 1 through `CPU_SETSIZE` and rejects duplicates. The lowest number is the worker CPU. `pin_to` calls `sched_setaffinity` on that number minus one and the process stays there. The other numbers are sorted into `daemon_cpus`. `raise_nofile` (`src/daemons.cpp`) lifts the soft open-file limit to the hard limit, or to 65536 when the hard limit is infinite. `set_mercury_cpu` stores the Linux CPU. `set_daemon_cpus` stores the sorted daemon pool. `serve` then blocks in the accept loop.
+`main` reads `<port> [cpu...]`. With no CPU arguments, `online_cpus` reads `/sys/devices/system/cpu/online` and that list is the share; CPU 0 must be in it. `parse_cpu` accepts a Linux CPU from 0 through `CPU_SETSIZE - 1` and rejects duplicates. The lowest number is the worker CPU. `pin_to` calls `sched_setaffinity` on that CPU and the process stays there. The other numbers are sorted into `daemon_cpus`. `raise_nofile` (`src/daemons.cpp`) lifts the soft open-file limit to the hard limit, or to 65536 when the hard limit is infinite. `set_mercury_cpu` stores that Linux CPU. `set_daemon_cpus` stores the sorted daemon pool. `serve` then blocks in the accept loop.
 
-`daemon_cpus` and `mercury_linux_cpu` are written on this thread before any other thread starts. Later readers do not lock them. `main` then turns the daemon pool into Linux CPU numbers and calls `init_resources` (`src/resources.cpp`) before `serve`.
+`daemon_cpus` and `mercury_linux_cpu` are written on this thread before any other thread starts. Later readers do not lock them. `main` passes `daemon_cpus` to `init_resources` (`src/resources.cpp`) before `serve`.
 
 `route` is the only dispatch. It tries `ping_route`, `stat_route`, `start_route`, `migrate_route`, `cpus_route`, `scale_route`, then `kill_route`. The first function that recognizes the target returns the response. Anything else is HTTP 404 from `http_response`.
 
@@ -163,11 +163,11 @@ File: `src/daemons.cpp`.
 
 `start_route` parses `daemon_id`, `exec_path`, `cpu`, optional `listen_port`, and optional `env`. `parse_env` and `valid_env_name` accept an object of strings whose names match `[A-Za-z_][A-Za-z0-9_]*`. A bad name or a non-string value fails the request and skips `launch`. The cpu must be in `daemon_cpus`. `access(exec_path, X_OK)` must succeed. `bind_loopback` binds `127.0.0.1` when `listen_port` is set.
 
-`launch` is the placement critical section. `prepare_placement` calls `ensure_daemon_cpuset`, which creates `/sys/fs/cgroup/mercury/<daemon_id>` and enables the cpuset controller through `ensure_cpuset_controller` and `controller_enabled`. It writes `cpuset.cpus` to the single Linux CPU `cpu - 1` when that file is empty, then polls `cpuset_applied` for up to 50 times at 10 ms. `cpuset_applied` requires `cpuset.cpus` and `cpuset.cpus.effective` to both equal the requested list. An existing non-empty cpuset is left as it is, and the child is pinned to its first CPU.
+`launch` is the placement critical section. `prepare_placement` calls `ensure_daemon_cpuset`, which creates `/sys/fs/cgroup/mercury/<daemon_id>` and enables the cpuset controller through `ensure_cpuset_controller` and `controller_enabled`. It writes `cpuset.cpus` to that Linux CPU when that file is empty, then polls `cpuset_applied` for up to 50 times at 10 ms. `cpuset_applied` requires `cpuset.cpus` and `cpuset.cpus.effective` to both equal the requested list. An existing non-empty cpuset is left as it is, and the child is pinned to its first CPU.
 
 The parent then pipes stdout, stderr, and, when placement succeeded, a sync pipe, and `fork`s.
 
-Child, in order: read one byte from the sync pipe; `dup2` the log pipes onto stdout and stderr; `dup2` the listen socket onto fd 3 when present and `close_range` every fd above it; `widen_to_online` when placement exists, otherwise `sched_setaffinity` to `cpu - 1`; `raise_nofile`; `exec_daemon`. `widen_to_online` sets the affinity to every CPU in `/sys/devices/system/cpu/online` except `mercury_linux_cpu`. `exec_daemon` calls `execv` when `env` is empty and `execve` otherwise, merging those names over the inherited environment. Arguments are empty, or `--listen-fd 3` when a listen socket was passed. Failure exits 127.
+Child, in order: read one byte from the sync pipe; `dup2` the log pipes onto stdout and stderr; `dup2` the listen socket onto fd 3 when present and `close_range` every fd above it; `widen_to_online` when placement exists, otherwise `sched_setaffinity` to that Linux CPU; `raise_nofile`; `exec_daemon`. `widen_to_online` sets the affinity to every CPU in `/sys/devices/system/cpu/online` except `mercury_linux_cpu`. `exec_daemon` calls `execv` when `env` is empty and `execve` otherwise, merging those names over the inherited environment. Arguments are empty, or `--listen-fd 3` when a listen socket was passed. Failure exits 127.
 
 Parent, after the child is waiting on the sync pipe: `pin_pid` on the child, then `move_into_cgroup` via `cgroup.procs`, then write the byte `'1'`. The cgroup is in place before the child widens its mask. A failed pin, move, or write sends `SIGKILL`, `waitpid`, and `launch` returns empty.
 
@@ -230,11 +230,11 @@ Each group gets one `Ring` of `kRingSlots` and no archive file. The counter name
 
 `resources_ready` is true once at least one group exists. `resource_groups_see` is true when every given Linux CPU is online and landed in a group.
 
-`build_order` walks the tree with `step_cpu_walk` and records the first visit to each allocatable CPU. One step takes the next socket, then that socket's next node, then that node's next L3, then that L3's next core, then the next logical CPU on the core. `request_cpu` walks the recorded order under `mu`, skips any Linux CPU in `exclude`, and returns the one it stops on. A full pass with every CPU excluded returns empty, and the cursor is back where the pass started. `mu` covers that cursor only. `sample_loop` and `least_loaded` take `Ring::mu_` inside `push` and `recent`, and they do not take `mu`.
+`build_order` walks the tree with `step_cpu_walk` and records the first visit to each allocatable CPU. One step takes the next socket, then that socket's next node, then that node's next L3, then that L3's next core, then the next logical CPU on the core. `request_cpu` walks the recorded order under `mu`, skips any Linux CPU in `exclude`, and skips a CPU whose core group load from `core_load` is at least `kCoreFull` (0.90). `core_load` is `load_of` for the `Core` group that contains the CPU. No samples yet is load 0, so the CPU is offered. The CPU it stops on is returned even when another daemon already runs there. A full pass that offers nothing returns empty, and the cursor is back where the pass started. `mu` covers that cursor only. `core_load` takes `Ring::mu_` through `recent` while `mu` is held. `sample_loop` and `least_loaded` take `Ring::mu_` inside `push` and `recent`, and they do not take `mu`.
 
 `scale_route` calls `resources_ready` and `least_loaded(Core)` before it attaches a policy. If either is empty it returns HTTP 500. After the attach it logs the least-loaded socket, node, L3, and core through `resource_choice`. Those numbers are the state of the groups. The CPU `add_core` actually appends is still the one `request_cpu` returns.
 
-`add_core` passes the daemon's current cpuset plus `cpus_held_by_others` as `exclude`. If that request is empty it calls `request_cpu` again with only the current cpuset, so a held CPU is shared only when the allocatable pool has nothing else. `remove_core` still drops the highest CPU in the cpuset and does not ask `request_cpu`.
+`add_core` passes the daemon's current cpuset as `exclude` and appends the CPU `request_cpu` returns. A daemon does not keep a private pool. The same Linux CPU can be added to a second daemon when that core's load is under `kCoreFull`. `remove_core` still drops the highest CPU in the cpuset and does not ask `request_cpu`.
 
 ### Scaling
 

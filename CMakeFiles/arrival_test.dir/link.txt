@@ -1,1 +1,0 @@
-/usr/bin/c++ -Wl,--dependency-file=CMakeFiles/arrival_test.dir/link.d CMakeFiles/arrival_test.dir/src/test/arrival.cpp.o -o build/test/arrival_test

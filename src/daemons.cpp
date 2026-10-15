@@ -690,7 +690,7 @@ void set_daemon_cpus(std::vector<int> cpus) {
   daemon_cpus = std::move(cpus);
 }
 
-void set_mercury_cpu(int cpu) { mercury_linux_cpu = cpu - 1; }
+void set_mercury_cpu(int cpu) { mercury_linux_cpu = cpu; }
 
 std::optional<std::string> stat_route(const std::string& request) {
   if (request_target(request) != "/stat") {
@@ -781,7 +781,7 @@ struct Launched {
 
 std::optional<Launched> launch(const std::string& daemon_id, const std::string& exec_path, int cpu, int listen_fd,
                                const std::vector<std::pair<std::string, std::string>>& env) {
-  const int linux_cpu = cpu - 1;
+  const int linux_cpu = cpu;
   const auto placement = prepare_placement(daemon_id, linux_cpu);
   int out_pipe[2] = {-1, -1};
   int err_pipe[2] = {-1, -1};
@@ -1061,41 +1061,6 @@ std::string format_cpuset(const std::vector<int>& cpus) {
   return out;
 }
 
-// CPUs granted to some other live daemon. An empty cgroup left from an earlier
-// run does not count: nothing is scheduled there.
-std::vector<int> cpus_held_by_others(const std::string& daemon_id) {
-  std::vector<int> held;
-  const std::string root = "/sys/fs/cgroup/mercury";
-  DIR* dir = ::opendir(root.c_str());
-  if (dir == nullptr) {
-    return held;
-  }
-  while (const auto* entry = ::readdir(dir)) {
-    const std::string name = entry->d_name;
-    if (name == "." || name == ".." || name == daemon_id) {
-      continue;
-    }
-    const auto path = root + "/" + name;
-    struct stat info {};
-    if (::stat(path.c_str(), &info) != 0 || !S_ISDIR(info.st_mode)) {
-      continue;
-    }
-    const auto procs = trimmed(read_file(path + "/cgroup.procs"));
-    if (procs.empty()) {
-      continue;
-    }
-    const auto cpus = parse_cpuset(trimmed(read_file(path + "/cpuset.cpus")));
-    if (!cpus) {
-      continue;
-    }
-    held.insert(held.end(), cpus->begin(), cpus->end());
-  }
-  ::closedir(dir);
-  std::sort(held.begin(), held.end());
-  held.erase(std::unique(held.begin(), held.end()), held.end());
-  return held;
-}
-
 int cpuset_cores(const std::string& daemon_id) {
   const auto have = parse_cpuset(trimmed(read_file("/sys/fs/cgroup/mercury/" + daemon_id + "/cpuset.cpus")));
   if (!have) {
@@ -1113,15 +1078,9 @@ bool add_core(const std::string& daemon_id, int max_cores, int& cores_after, std
   if (!have || have->empty() || static_cast<int>(have->size()) >= max_cores) {
     return false;
   }
-  // Sharing a CPU divides occupancy by a core this daemon only partly gets.
-  // Skip CPUs another live daemon holds until the allocatable pool has nothing else.
-  std::vector<int> exclude = *have;
-  const auto held = cpus_held_by_others(daemon_id);
-  exclude.insert(exclude.end(), held.begin(), held.end());
-  auto next = request_cpu(exclude);
-  if (!next) {
-    next = request_cpu(*have);
-  }
+  // The resource manager chooses the CPU. A core under kCoreFull may already
+  // belong to another daemon; an overloaded core is not offered.
+  auto next = request_cpu(*have);
   if (!next) {
     return false;
   }

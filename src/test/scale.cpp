@@ -228,8 +228,8 @@ std::string json_escape(const std::string& text) {
 
 pid_t start_mercury(const std::string& mercury) {
   const auto port = std::to_string(kMercuryPort);
-  const auto self = std::to_string(kMercuryLinuxCpu + 1);
-  const auto daemon = std::to_string(kInitialLinuxCpu + 1);
+  const auto self = std::to_string(kMercuryLinuxCpu);
+  const auto daemon = std::to_string(kInitialLinuxCpu);
   const pid_t pid = ::fork();
   if (pid < 0) {
     throw std::runtime_error("fork failed");
@@ -383,7 +383,7 @@ std::string http_post(const std::string& target, const std::string& body) {
 
 pid_t start_daemon(const std::string& id, const std::string& path, bool listen) {
   std::string body = std::string("{\"daemon_id\":\"") + id + "\",\"exec_path\":\"" + json_escape(path) +
-                     "\",\"cpu\":" + std::to_string(kInitialLinuxCpu + 1);
+                     "\",\"cpu\":" + std::to_string(kInitialLinuxCpu);
   if (listen) {
     body += ",\"listen_port\":" + std::to_string(kServerPort);
   }

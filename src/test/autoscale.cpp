@@ -325,7 +325,7 @@ void on_signal(int) {
 
 pid_t start_mercury(const std::string& mercury) {
   std::vector<std::string> args{mercury, std::to_string(kMercuryPort)};
-  for (int cpu = 1; cpu <= kPoolCores + 1; ++cpu) {
+  for (int cpu = 0; cpu <= kPoolCores; ++cpu) {
     args.push_back(std::to_string(cpu));
   }
   const pid_t pid = ::fork();
@@ -378,7 +378,7 @@ std::string http_post(const std::string& target, const std::string& body) {
 
 pid_t start_hello(const std::string& path) {
   const std::string body = std::string("{\"daemon_id\":\"") + kHelloId + "\",\"exec_path\":\"" + json_escape(path) +
-                           "\",\"cpu\":2,\"listen_port\":" + std::to_string(kHelloPort) + "}";
+                           "\",\"cpu\":1,\"listen_port\":" + std::to_string(kHelloPort) + "}";
   const auto response = http_post("/start", body);
   const pid_t pid = response_pid(response);
   if (response_status(response) != 200 || pid <= 0) {

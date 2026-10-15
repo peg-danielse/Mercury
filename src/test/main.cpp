@@ -530,7 +530,7 @@ void on_signal(int) {
 pid_t start_mercury(const std::string& mercury, const std::vector<int>& linux_cpus) {
   std::vector<std::string> args{mercury, std::to_string(kPort)};
   for (const int cpu : linux_cpus) {
-    args.push_back(std::to_string(cpu + 1));
+    args.push_back(std::to_string(cpu));
   }
   std::vector<char*> argv;
   argv.reserve(args.size() + 1);
@@ -755,7 +755,7 @@ std::string fd_target(pid_t pid, int fd) {
 void migrate_hello(const std::string& hello, int from_linux, int to_linux) {
   constexpr int kListenPort = 8083;
   const std::string start_body = std::string("{\"daemon_id\":\"hello\",\"exec_path\":\"") + json_escape(hello) +
-                                  "\",\"cpu\":" + std::to_string(from_linux + 1) +
+                                  "\",\"cpu\":" + std::to_string(from_linux) +
                                   ",\"listen_port\":" + std::to_string(kListenPort) + "}";
   const auto started = http_exchange(
       kPort, "POST /start HTTP/1.1\r\nHost: 127.0.0.1:" + std::to_string(kPort) +
@@ -789,7 +789,7 @@ void migrate_hello(const std::string& hello, int from_linux, int to_linux) {
   }
 
   const std::string migrate_body =
-      std::string("{\"daemon_id\":\"hello\",\"cpu\":") + std::to_string(to_linux + 1) + "}";
+      std::string("{\"daemon_id\":\"hello\",\"cpu\":") + std::to_string(to_linux) + "}";
   const auto moved = http_exchange(
       kPort, "POST /migrate HTTP/1.1\r\nHost: 127.0.0.1:" + std::to_string(kPort) +
                  "\r\nContent-Type: application/json\r\nContent-Length: " + std::to_string(migrate_body.size()) +
@@ -985,7 +985,7 @@ Started start_daemon(const Workload& work, int linux_cpu) {
   daemon.id = work.name;
   daemon.path = work.path;
   daemon.linux_cpu = linux_cpu;
-  daemon.mercury_cpu = linux_cpu + 1;
+  daemon.mercury_cpu = linux_cpu;
   const std::string body = std::string("{\"daemon_id\":\"") + daemon.id + "\",\"exec_path\":\"" +
                            json_escape(daemon.path) + "\",\"cpu\":" + std::to_string(daemon.mercury_cpu) + "}";
   const auto response = http_exchange(
@@ -1292,7 +1292,7 @@ int main(int argc, char** argv) {
       daemon.id = "d" + std::to_string(i + 1);
       daemon.path = job.workloads[i].path;
       daemon.linux_cpu = daemon_cpus[i % daemon_cpus.size()];
-      daemon.mercury_cpu = daemon.linux_cpu + 1;
+      daemon.mercury_cpu = daemon.linux_cpu;
       const std::string body = std::string("{\"daemon_id\":\"") + daemon.id + "\",\"exec_path\":\"" +
                                json_escape(daemon.path) + "\",\"cpu\":" + std::to_string(daemon.mercury_cpu) +
                                "}";

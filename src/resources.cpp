@@ -424,6 +424,24 @@ bool intersects(const std::vector<int>& group_cpus, const std::vector<int>& want
   return false;
 }
 
+// Load of the physical core that contains this Linux CPU. No group is treated as full
+// so a CPU we cannot place is not offered.
+double core_load(int cpu) {
+  for (const auto& group : groups) {
+    if (group.level != ResourceLevel::Core) {
+      continue;
+    }
+    if (!std::binary_search(group.linux_cpus.begin(), group.linux_cpus.end(), cpu)) {
+      continue;
+    }
+    if (!group.ring) {
+      return 0;
+    }
+    return load_of(*group.ring);
+  }
+  return 1;
+}
+
 std::optional<ResourceGroupState> least_among(ResourceLevel level, const std::vector<int>* touching) {
   std::optional<ResourceGroupState> best;
   for (const auto& group : groups) {
@@ -685,6 +703,10 @@ std::optional<int> request_cpu(const std::vector<int>& exclude) {
     const int cpu = order[static_cast<std::size_t>(order_cursor)];
     order_cursor = (order_cursor + 1) % static_cast<int>(order.size());
     if (std::binary_search(skip.begin(), skip.end(), cpu)) {
+      continue;
+    }
+    // Another daemon may already run here. A core under the line can take it.
+    if (core_load(cpu) >= kCoreFull) {
       continue;
     }
     return cpu;

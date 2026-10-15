@@ -167,26 +167,27 @@ int main() {
       ::dup2(pipes[1], STDERR_FILENO);
       ::close(pipes[0]);
       ::close(pipes[1]);
-      ::execl(mercury_bin.c_str(), mercury_bin.c_str(), std::to_string(kPort).c_str(), "1", "2", "3", nullptr);
+      ::execl(mercury_bin.c_str(), mercury_bin.c_str(), std::to_string(kPort).c_str(), "0", "1", "2", nullptr);
       _exit(127);
     }
     ::setpgid(mercury, mercury);
     ::close(pipes[1]);
     log_fd = pipes[0];
-    const auto ready = wait_for(log_fd, "pinned to cpu", 3000);
-    if (ready.find("pinned to cpu") == std::string::npos) {
+    const auto ready = wait_for(log_fd, "listening", 3000);
+    if (ready.find("pinned to cpu 0, daemons on 1 2") == std::string::npos ||
+        ready.find("listening") == std::string::npos) {
       throw std::runtime_error("mercury did not start: " + ready);
     }
 
     const std::string bad = std::string("{\"daemon_id\":\"envprobe\",\"exec_path\":\"") + json_escape(probe) +
-                            "\",\"cpu\":2,\"env\":{\"bad-name\":\"x\"}}";
+                            "\",\"cpu\":1,\"env\":{\"bad-name\":\"x\"}}";
     const auto rejected = http_post("/start", bad);
     if (response_status(rejected) != 400) {
       throw std::runtime_error("bad env name was accepted: " + rejected);
     }
 
     const std::string body = std::string("{\"daemon_id\":\"envprobe\",\"exec_path\":\"") + json_escape(probe) +
-                             "\",\"cpu\":2,\"listen_port\":18112,\"env\":{\"MERCURY_TEST_ENV\":\"from-request\","
+                             "\",\"cpu\":1,\"listen_port\":18112,\"env\":{\"MERCURY_TEST_ENV\":\"from-request\","
                              "\"PATH\":\"/only-this\"}}";
     const auto started = http_post("/start", body);
     const int first = response_pid(started);
@@ -194,7 +195,7 @@ int main() {
       throw std::runtime_error("start failed: " + started);
     }
 
-    const auto migrated = http_post("/migrate", R"({"daemon_id":"envprobe","cpu":3})");
+    const auto migrated = http_post("/migrate", R"({"daemon_id":"envprobe","cpu":2})");
     const int second = response_pid(migrated);
     if (response_status(migrated) != 200 || second <= 0 || second == first) {
       throw std::runtime_error("migrate failed: " + migrated);

@@ -1,1 +1,0 @@
-/usr/bin/c++ -Wl,--dependency-file=CMakeFiles/hello_server.dir/link.d CMakeFiles/hello_server.dir/src/test/hello_server.cpp.o -o build/test/hello_server  libmercury_http.a

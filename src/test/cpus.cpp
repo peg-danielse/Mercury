@@ -306,7 +306,7 @@ pid_t start_mercury(const std::string& mercury) {
       ::dup2(devnull, STDOUT_FILENO);
       ::close(devnull);
     }
-    ::execl(mercury.c_str(), mercury.c_str(), port.c_str(), "1", nullptr);
+    ::execl(mercury.c_str(), mercury.c_str(), port.c_str(), "0", nullptr);
     _exit(127);
   }
   ::setpgid(pid, pid);
