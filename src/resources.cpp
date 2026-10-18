@@ -59,7 +59,11 @@ struct MetricTarget {
   std::shared_ptr<Ring> ring;
 };
 
+// load_of averages the last 100 ms, independent of the saturate window.
+constexpr std::size_t kLoadWindow = 10;
+
 bool ready = false;
+void (*policy_thread)() = nullptr;
 std::vector<Group> groups;
 std::vector<char> known;
 std::vector<char> allocatable;
@@ -294,7 +298,7 @@ void finish_groups() {
 }
 
 double load_of(const Ring& ring) {
-  const auto samples = ring.recent(static_cast<std::size_t>(kScaleWindow));
+  const auto samples = ring.recent(kLoadWindow);
   std::uint64_t busy = 0;
   std::uint64_t idle = 0;
   std::uint64_t iowait = 0;
@@ -361,30 +365,69 @@ std::optional<int> lowest_free(const Group& group, const std::vector<int>& skip)
   return std::nullopt;
 }
 
-std::optional<int> least_core_cpu(const std::vector<int>& skip) {
+int held_in(const Group& group, const std::vector<int>& skip) {
+  int count = 0;
+  for (const int cpu : group.linux_cpus) {
+    if (std::binary_search(skip.begin(), skip.end(), cpu)) {
+      ++count;
+    }
+  }
+  return count;
+}
+
+// Fewer CPUs already held keeps sibling groups even. Equal counts take the lower load,
+// then the lower Linux CPU, the same tie break as less_loaded.
+bool more_balanced(const Group& candidate, const Group& best, const std::vector<int>& skip) {
+  const int candidate_held = held_in(candidate, skip);
+  const int best_held = held_in(best, skip);
+  if (candidate_held != best_held) {
+    return candidate_held < best_held;
+  }
+  const auto candidate_state = state_of(candidate);
+  const auto best_state = state_of(best);
+  if (candidate_state.load != best_state.load) {
+    return candidate_state.load < best_state.load;
+  }
+  const int candidate_cpu = candidate.linux_cpus.empty() ? CPU_SETSIZE : candidate.linux_cpus.front();
+  const int best_cpu = best.linux_cpus.empty() ? CPU_SETSIZE : best.linux_cpus.front();
+  if (candidate_cpu != best_cpu) {
+    return candidate_cpu < best_cpu;
+  }
+  return candidate.name < best.name;
+}
+
+// Socket, then node, then L3, then core. Each step stays inside the group chosen above it.
+std::optional<int> balanced_cpu(const std::vector<int>& skip) {
   if (!ready) {
     return std::nullopt;
   }
-  std::optional<ResourceGroupState> best;
-  int chosen = -1;
-  for (const auto& group : groups) {
-    if (group.level != ResourceLevel::Core) {
-      continue;
-    }
-    const auto cpu = lowest_free(group, skip);
-    if (!cpu) {
-      continue;
-    }
-    auto state = state_of(group);
-    if (!best || less_loaded(state, *best)) {
-      best = std::move(state);
-      chosen = *cpu;
+  std::vector<int> level;
+  for (int id = 0; id < static_cast<int>(groups.size()); ++id) {
+    if (groups[static_cast<std::size_t>(id)].parent < 0) {
+      level.push_back(id);
     }
   }
-  if (!best) {
+  int chosen = -1;
+  while (!level.empty()) {
+    int best = -1;
+    for (const int id : level) {
+      if (!lowest_free(groups[static_cast<std::size_t>(id)], skip)) {
+        continue;
+      }
+      if (best < 0 || more_balanced(groups[static_cast<std::size_t>(id)], groups[static_cast<std::size_t>(best)], skip)) {
+        best = id;
+      }
+    }
+    if (best < 0) {
+      return std::nullopt;
+    }
+    chosen = best;
+    level = groups[static_cast<std::size_t>(best)].children;
+  }
+  if (chosen < 0) {
     return std::nullopt;
   }
-  return chosen;
+  return lowest_free(groups[static_cast<std::size_t>(chosen)], skip);
 }
 
 std::optional<ResourceGroupState> least_among(ResourceLevel level, const std::vector<int>* touching) {
@@ -584,8 +627,13 @@ void init_resources(std::vector<int> allocatable_linux_cpus) {
   ready = !groups.empty();
   if (ready) {
     std::thread(sample_loop, std::move(targets)).detach();
+    if (policy_thread != nullptr) {
+      std::thread(policy_thread).detach();
+    }
   }
 }
+
+void set_policy_loop(void (*loop)()) { policy_thread = loop; }
 
 bool resources_ready() { return ready; }
 
@@ -631,7 +679,81 @@ std::optional<int> request_cpu(const std::vector<int>& exclude) {
   std::vector<int> skip = exclude;
   std::sort(skip.begin(), skip.end());
   skip.erase(std::unique(skip.begin(), skip.end()), skip.end());
-  return least_core_cpu(skip);
+  return balanced_cpu(skip);
+}
+
+namespace {
+
+// Group id holding this CPU at a level, or -1.
+int group_at(ResourceLevel level, int cpu) {
+  for (int id = 0; id < static_cast<int>(groups.size()); ++id) {
+    const auto& group = groups[static_cast<std::size_t>(id)];
+    if (group.level == level && std::binary_search(group.linux_cpus.begin(), group.linux_cpus.end(), cpu)) {
+      return id;
+    }
+  }
+  return -1;
+}
+
+}  // namespace
+
+std::optional<int> request_cpu_nearest(const std::vector<int>& held, const std::vector<int>& exclude) {
+  if (!ready) {
+    return std::nullopt;
+  }
+  if (held.empty()) {
+    return request_cpu(exclude);
+  }
+  std::vector<int> skip = exclude;
+  skip.insert(skip.end(), held.begin(), held.end());
+  std::sort(skip.begin(), skip.end());
+  skip.erase(std::unique(skip.begin(), skip.end()), skip.end());
+  // Tier 0 core, 1 L3, 2 node, 3 socket, 4 anywhere.
+  const ResourceLevel levels[] = {ResourceLevel::Core, ResourceLevel::L3, ResourceLevel::Node, ResourceLevel::Socket};
+  std::vector<std::vector<int>> held_groups(4);
+  for (int t = 0; t < 4; ++t) {
+    for (const int cpu : held) {
+      held_groups[static_cast<std::size_t>(t)].push_back(group_at(levels[t], cpu));
+    }
+  }
+  int best_cpu = -1;
+  int best_tier = 5;
+  double best_load = 0;
+  for (int cpu = 0; cpu < static_cast<int>(allocatable.size()); ++cpu) {
+    if (!is_allocatable(cpu) || std::binary_search(skip.begin(), skip.end(), cpu)) {
+      continue;
+    }
+    int tier = 4;
+    for (int t = 0; t < 4; ++t) {
+      const int id = group_at(levels[t], cpu);
+      const auto& mine = held_groups[static_cast<std::size_t>(t)];
+      if (id >= 0 && std::find(mine.begin(), mine.end(), id) != mine.end()) {
+        tier = t;
+        break;
+      }
+    }
+    const int core = group_at(ResourceLevel::Core, cpu);
+    const double load = core >= 0 ? state_of(groups[static_cast<std::size_t>(core)]).load : 0;
+    // Ascending CPU scan: a later CPU only wins with a better tier or a lower load.
+    if (best_cpu < 0 || tier < best_tier || (tier == best_tier && load < best_load)) {
+      best_cpu = cpu;
+      best_tier = tier;
+      best_load = load;
+    }
+  }
+  if (best_cpu < 0) {
+    return std::nullopt;
+  }
+  return best_cpu;
+}
+
+std::optional<int> request_cpu_for(CpuPlacement placement, const std::vector<int>& held, const std::vector<int>& exclude) {
+  if (placement == CpuPlacement::NearestFirst) {
+    return request_cpu_nearest(held, exclude);
+  }
+  std::vector<int> all = exclude;
+  all.insert(all.end(), held.begin(), held.end());
+  return request_cpu(all);
 }
 
 std::vector<ResourceGroupInfo> resource_groups() {

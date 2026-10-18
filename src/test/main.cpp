@@ -458,6 +458,19 @@ bool http_ok(const std::string& response) {
   return line.find(" 200 ") != std::string::npos;
 }
 
+// saturate is attached to every daemon at start. These checks rely on the pin they asked for, so
+// cap the daemon at one CPU.
+void hold_pins(const std::string& daemon_id) {
+  const std::string body = std::string("{\"daemon_id\":\"") + daemon_id + "\",\"max\":1}";
+  const auto response = http_exchange(
+      kPort, "POST /scale HTTP/1.1\r\nHost: 127.0.0.1:" + std::to_string(kPort) +
+                 "\r\nContent-Type: application/json\r\nContent-Length: " + std::to_string(body.size()) +
+                 "\r\nConnection: close\r\n\r\n" + body);
+  if (!http_ok(response)) {
+    throw std::runtime_error("scale max 1 failed for " + daemon_id + ": " + response);
+  }
+}
+
 int response_pid(const std::string& response) {
   const auto body = response_body(response);
   const auto key = body.find("\"pid\"");
@@ -784,6 +797,7 @@ void migrate_hello(const std::string& hello, int from_linux, int to_linux) {
   if (!http_ok(started) || pid <= 0) {
     throw std::runtime_error("start hello failed: " + trim(response_body(started)));
   }
+  hold_pins("hello");
 
   const std::string ping = "GET /ping HTTP/1.1\r\nHost: 127.0.0.1:" + std::to_string(kListenPort) +
                            "\r\nConnection: close\r\n\r\n";
@@ -1021,6 +1035,7 @@ Started start_daemon(const Workload& work, int linux_cpu) {
   if (!http_ok(response) || daemon.pid <= 0) {
     throw std::runtime_error("start failed for " + daemon.path + ": " + trim(response_body(response)));
   }
+  hold_pins(daemon.id);
   return daemon;
 }
 
@@ -1328,6 +1343,7 @@ int main(int argc, char** argv) {
       if (!http_ok(response) || daemon.pid <= 0) {
         throw std::runtime_error("start failed for " + daemon.path + ": " + trim(response_body(response)));
       }
+      hold_pins(daemon.id);
       started.push_back(daemon);
       std::cout << "submitted " << daemon.id << " " << daemon.path << " pid " << daemon.pid << " linux cpu "
                 << daemon.linux_cpu << std::endl;

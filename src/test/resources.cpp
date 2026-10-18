@@ -88,7 +88,23 @@ std::vector<int> online_cpus() {
 
 bool contains(const std::vector<int>& cpus, int cpu) { return std::binary_search(cpus.begin(), cpus.end(), cpu); }
 
-bool quieter(const ResourceGroupState& candidate, const ResourceGroupState& best) {
+int held_in(const ResourceGroupInfo& group, const std::vector<int>& exclude) {
+  int count = 0;
+  for (const int cpu : group.linux_cpus) {
+    if (contains(exclude, cpu)) {
+      ++count;
+    }
+  }
+  return count;
+}
+
+bool more_balanced(const ResourceGroupInfo& candidate, const ResourceGroupInfo& best,
+                   const std::vector<int>& exclude) {
+  const int candidate_held = held_in(candidate, exclude);
+  const int best_held = held_in(best, exclude);
+  if (candidate_held != best_held) {
+    return candidate_held < best_held;
+  }
   if (candidate.load != best.load) {
     return candidate.load < best.load;
   }
@@ -100,35 +116,64 @@ bool quieter(const ResourceGroupState& candidate, const ResourceGroupState& best
   return candidate.name < best.name;
 }
 
-// Lowest pool CPU on the least-loaded core that still has one outside exclude.
-std::optional<int> expected_cpu(const std::vector<ResourceGroupState>& states, const std::vector<int>& pool,
-                                const std::vector<int>& exclude) {
-  const ResourceGroupState* best = nullptr;
-  int chosen = -1;
-  for (const auto& state : states) {
-    if (state.level != ResourceLevel::Core) {
-      continue;
+bool has_free(const ResourceGroupInfo& group, const std::vector<int>& pool, const std::vector<int>& exclude) {
+  for (const int cpu : group.linux_cpus) {
+    if (contains(pool, cpu) && !contains(exclude, cpu)) {
+      return true;
     }
-    int cpu = -1;
-    for (const int member : state.linux_cpus) {
-      if (!contains(pool, member) || contains(exclude, member)) {
+  }
+  return false;
+}
+
+const ResourceGroupInfo* find_named(const std::vector<ResourceGroupInfo>& groups, const std::string& name) {
+  for (const auto& group : groups) {
+    if (group.name == name) {
+      return &group;
+    }
+  }
+  return nullptr;
+}
+
+// Same walk as balanced_cpu: even sibling counts, then lower load, then lower Linux CPU.
+std::optional<int> expected_cpu(const std::vector<ResourceGroupInfo>& groups, const std::vector<int>& pool,
+                                const std::vector<int>& exclude) {
+  std::vector<const ResourceGroupInfo*> level;
+  for (const auto& group : groups) {
+    if (group.parent.empty()) {
+      level.push_back(&group);
+    }
+  }
+  const ResourceGroupInfo* chosen = nullptr;
+  while (!level.empty()) {
+    const ResourceGroupInfo* best = nullptr;
+    for (const auto* group : level) {
+      if (!has_free(*group, pool, exclude)) {
         continue;
       }
-      cpu = member;
-      break;
+      if (best == nullptr || more_balanced(*group, *best, exclude)) {
+        best = group;
+      }
     }
-    if (cpu < 0) {
-      continue;
+    if (best == nullptr) {
+      return std::nullopt;
     }
-    if (best == nullptr || quieter(state, *best)) {
-      best = &state;
-      chosen = cpu;
+    chosen = best;
+    level.clear();
+    for (const auto& child : best->children) {
+      if (const auto* next = find_named(groups, child)) {
+        level.push_back(next);
+      }
     }
   }
-  if (best == nullptr) {
+  if (chosen == nullptr) {
     return std::nullopt;
   }
-  return chosen;
+  for (const int cpu : chosen->linux_cpus) {
+    if (contains(pool, cpu) && !contains(exclude, cpu)) {
+      return cpu;
+    }
+  }
+  return std::nullopt;
 }
 
 const ResourceGroupState* group_of(const std::vector<ResourceGroupState>& states, ResourceLevel level, int cpu) {
@@ -180,6 +225,59 @@ void sleep_ms(int ms) {
 
 }  // namespace
 
+
+std::vector<ResourceGroupInfo> infos_now() { return resource_groups(); }
+
+int count_level_groups(const std::vector<ResourceGroupInfo>& infos, ResourceLevel level) {
+  int n = 0;
+  for (const auto& g : infos) {
+    n += g.level == level ? 1 : 0;
+  }
+  return n;
+}
+
+// nearest_first tier of cpu relative to held: 0 core, 1 l3, 2 node, 3 socket, 4 none.
+int nearest_tier(const std::vector<ResourceGroupInfo>& infos, const std::vector<int>& held, int cpu) {
+  const ResourceLevel levels[] = {ResourceLevel::Core, ResourceLevel::L3, ResourceLevel::Node, ResourceLevel::Socket};
+  for (int t = 0; t < 4; ++t) {
+    for (const auto& g : infos) {
+      if (g.level != levels[t] || !contains(g.linux_cpus, cpu)) {
+        continue;
+      }
+      for (const int h : held) {
+        if (contains(g.linux_cpus, h)) {
+          return t;
+        }
+      }
+    }
+  }
+  return 4;
+}
+
+// The returned cpu is allocatable, outside held and exclude, and no candidate has a better tier.
+void check_nearest(const std::vector<int>& pool, std::vector<int> held, std::vector<int> exclude,
+                   const std::string& label) {
+  std::sort(held.begin(), held.end());
+  std::sort(exclude.begin(), exclude.end());
+  const auto infos = resource_groups();
+  const auto got = request_cpu_nearest(held, exclude);
+  int best = 5;
+  for (const int cpu : pool) {
+    if (!contains(held, cpu) && !contains(exclude, cpu)) {
+      best = std::min(best, nearest_tier(infos, held, cpu));
+    }
+  }
+  if (best == 5) {
+    require(!got, label + ": nothing free but a cpu was returned");
+    return;
+  }
+  require(got.has_value(), label + ": no cpu returned");
+  require(contains(pool, *got) && !contains(held, *got) && !contains(exclude, *got), label + ": cpu not allowed");
+  require(nearest_tier(infos, held, *got) == best, label + ": cpu " + std::to_string(*got) + " is tier " +
+                                                    std::to_string(nearest_tier(infos, held, *got)) + ", best " +
+                                                    std::to_string(best));
+}
+
 int main() {
   try {
     const auto online = online_cpus();
@@ -210,12 +308,12 @@ int main() {
       }
     }
 
-    const auto offered = resource_states();
+    const auto offered = resource_groups();
     const auto want = expected_cpu(offered, pool, {});
     const auto first = request_cpu({});
     const auto shared = request_cpu({});
     require(want.has_value(), "no allocatable cpu on any core");
-    require(first && *first == *want, "request_cpu did not return the least-loaded core");
+    require(first && *first == *want, "request_cpu did not return the balanced cpu");
     require(shared && *shared == *first, "a second request did not share the least-loaded cpu");
     require(contains(pool, *first), "handed cpu is outside the pool");
     if (online.size() > 1) {
@@ -223,13 +321,57 @@ int main() {
     }
 
     std::vector<int> skip{*first};
-    const auto next_want = expected_cpu(offered, pool, skip);
+    const auto next_offered = resource_groups();
+    const auto next_want = expected_cpu(next_offered, pool, skip);
     const auto next = request_cpu(skip);
     if (pool.size() > 1) {
-      require(next_want && next && *next == *next_want, "excluding the granted cpu did not move to the next least-loaded cpu");
+      require(next_want && next && *next == *next_want, "excluding the granted cpu did not move to the next balanced cpu");
       require(*next != *first, "excluding a cpu returned that same cpu");
     }
     require(!request_cpu(pool), "request_cpu returned a cpu that was excluded");
+
+    // nearest_first.
+    require(request_cpu_nearest({}, {}) == request_cpu({}), "nearest_first with an empty cpuset is least_loaded");
+    for (const int start : pool) {
+      check_nearest(pool, {start}, {}, "nearest from " + std::to_string(start));
+    }
+    {
+      std::vector<int> held;
+      for (std::size_t i = 0; i < 20 && i < pool.size(); ++i) {
+        const auto next = request_cpu_nearest(held.empty() ? std::vector<int>{pool.front()} : held, {});
+        check_nearest(pool, held.empty() ? std::vector<int>{pool.front()} : held, {}, "nearest grow step " + std::to_string(i));
+        if (held.empty()) {
+          held.push_back(pool.front());
+        }
+        if (next) {
+          held.push_back(*next);
+        }
+      }
+    }
+    std::cout << "nearest_first generic ok" << std::endl;
+    // dtn-01: EPYC 7301, 2 sockets, 8 nodes, 16 L3 of 2 cores, SMT sibling = cpu + 32.
+    const bool dtn01 = online.size() == 64 && count_level_groups(infos_now(), ResourceLevel::L3) == 16 &&
+                       count_level_groups(infos_now(), ResourceLevel::Node) == 8;
+    if (dtn01) {
+      auto in = [](int cpu, std::initializer_list<int> set) { return std::find(set.begin(), set.end(), cpu) != set.end(); };
+      require(request_cpu_nearest({1}, {}) == 33, "dtn-01: sibling of 1 is 33");
+      require(request_cpu_nearest({1, 33}, {}) == 32, "dtn-01: l3 of 1 (0 reserved) gives 32");
+      const auto node0 = request_cpu_nearest({1, 32, 33}, {});
+      require(node0 && in(*node0, {2, 3, 34, 35}), "dtn-01: full l3 moves within node 0");
+      const auto l3 = request_cpu_nearest({8}, {40});
+      require(l3 && in(*l3, {9, 41}), "dtn-01: excluded sibling falls to the l3");
+      std::vector<int> socket0;
+      for (int c = 0; c < 16; ++c) {
+        socket0.push_back(c);
+        socket0.push_back(c + 32);
+      }
+      const auto sock = request_cpu_nearest({1}, socket0);
+      require(sock && *sock >= 16 && (*sock < 32 || *sock >= 48), "dtn-01: socket 0 excluded goes to socket 1");
+      const auto same_socket = request_cpu_nearest({1, 2, 3, 32, 33, 34, 35}, {});
+      require(same_socket && in(*same_socket, {4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47}) ,
+              "dtn-01: full node 0 stays on socket 0");
+      std::cout << "nearest_first dtn-01 ok" << std::endl;
+    }
 
     const auto infos = resource_groups();
     require(infos.size() == states.size(), "resource_groups size");
@@ -289,8 +431,15 @@ int main() {
       require(full[i].stored >= rings[i].samples.size(), full[i].name + " stored fewer than the short view");
     }
 
-    const auto* core = group_of(offered, ResourceLevel::Core, *first);
-    std::cout << "resources_test least " << core->name << " cpu " << *first;
+    const ResourceGroupInfo* core = nullptr;
+    for (const auto& group : offered) {
+      if (group.level == ResourceLevel::Core && contains(group.linux_cpus, *first)) {
+        core = &group;
+        break;
+      }
+    }
+    require(core != nullptr, "granted cpu has no core");
+    std::cout << "resources_test balanced " << core->name << " cpu " << *first;
     if (online.size() > 1) {
       std::cout << " reserved " << reserved;
     }

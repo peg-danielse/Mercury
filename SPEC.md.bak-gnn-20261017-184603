@@ -1,0 +1,263 @@
+# Mercury
+
+Mercury places, starts, and deletes native programs on computers on one LAN. This system is for managing daemons. Each program is an executable compiled for that machine. Nothing runs in a container.
+
+## Roles
+
+The **controller** keeps the daemon table. The operator submits a set of `(exec_path, hostname)` tuples. That hostname is the node offering the file.
+
+A **worker** runs on each computer. It listens on one TCP port, starts local processes, and reports when they exit.
+
+Each node runs one process. Its share of cores is an array of Linux CPU numbers. Starting it with only a port uses every CPU in `/sys/devices/system/cpu/online`. An explicit list after the port is that share instead. It pins itself to the lowest number in the share for its whole life, so a port-only start pins it to CPU 0 when that CPU is online. The remaining numbers are the daemon pool. On one node this process also holds the daemon table; on the others it is the worker. It is not a daemon. Round-robin does not place it, and delete does not stop it.
+
+A worker registers with `{hostname, cpus}` when it connects. A tuple is schedulable when at least one registered worker reports that `exec_path` exists and is executable. Any other tuple is rejected and not stored.
+
+## Daemon
+
+
+| Field       | Meaning                           |
+| ----------- | --------------------------------- |
+| `daemon_id` | Assigned by the controller        |
+| `exec_path` | Absolute path on the worker       |
+| `hostname`  | Worker selected to run it         |
+| `cpu`       | Index chosen by round-robin       |
+| `env`       | Variables added for that process  |
+| `state`     | `pending`, `running`, or `exited` |
+| `exit_code` | Set when the process exits        |
+| `log`       | That process's stdout and stderr  |
+
+
+`pending` is placed but not started. `running` means the worker holds a live pid. `exited` means `exit_code` and `log` are stored for that `daemon_id`.
+
+Delete sends kill if the process is running, then removes the record. A deleted daemon keeps no exit record.
+
+## Messages
+
+The worker accepts HTTP/1.1 on its listen port. Request and response bodies are UTF-8 JSON.
+
+Worker to controller:
+
+- `register` — `{hostname, cpus}`
+- `exited` — `{daemon_id, exit_code, log}`
+
+Thread membership stays on the worker. A new thread is not reported as its own daemon, and it is not pinned to the next free CPU.
+
+Controller to worker, as HTTP JSON on the worker's listen port:
+
+- `POST /stat` — `{exec_path}` returns `{ok}`
+- `POST /start` — `{daemon_id, exec_path, cpu, listen_port?, env?}` returns `{pid}`
+- `POST /migrate` — `{daemon_id, cpu}` returns `{pid}`
+- `POST /cpus` — `{daemon_id, cpus}` returns `{ok}`
+- `POST /scale` — `{daemon_id, min?, max?, policy?}` returns `{ok, min, max, cores, threads}`
+- `POST /policies` — `{daemon_id, exec_path?, shift?, restrict?, widen?, degrade?}` returns `{ok, path?}` (see `policies.md`)
+- `POST /kill` — `{daemon_id}` returns `{ok, finished}`
+
+The worker also answers two reads for a page that draws where daemons sit:
+
+- `GET /map` — resource-group tree, and the running daemons whose cpuset intersects each group
+- `GET /rings` — recent samples from each resource-group ring. `?count=N` selects how many of the newest samples to return
+
+CPU numbers in `start` and `migrate` are Linux CPU numbers, the same numbers `cpus` writes into a cpuset. The worker's own CPU is the lowest number in its share and is never part of a daemon cpuset.
+
+On `start`, the worker places the daemon in a cgroup and sets that cgroup's cpuset to that Linux CPU. It pins the child, then the child widens its affinity to every online CPU except the worker. The cpuset is the limit. Later threads are not pinned one by one; they run on whatever the cpuset allows. The worker raises its own open-file soft limit to the hard limit before it listens, and each daemon does the same before `exec`. `exec_path` is run with no arguments unless `listen_port` is set. Then the worker binds `127.0.0.1` on that port, passes the socket as fd 3, and the arguments are `--listen-fd 3`. Stdout and stderr are read until the child exits, then `exited` is sent once. The exit code and log stay those of the process that was `exec`'d.
+
+`env`, when present, is an object of strings. Each name matches `[A-Za-z_][A-Za-z0-9_]*`. Those names are added to the environment the worker itself inherited, replacing an inherited value with the same name. Every other inherited variable stays. A missing `env` changes nothing. A bad name or a value that is not a string is rejected and the process is not started.
+
+`migrate` rewrites that daemon's `cpuset.cpus` to the requested Linux CPU and leaves the process running. The returned pid is the pid already running. Threads stay in the cgroup; the new cpuset is the limit, so each thread runs on that CPU once it is scheduled. A cpuset that had grown past one CPU is replaced by this single CPU.
+
+`cpus` writes the daemon cpuset. `cpus` is a Linux cpuset string, such as `1-4`. The set must not contain the worker's Linux CPU.
+
+## Monitoring
+
+The worker reads the daemon cgroup once per tick. A sample is taken every 10 ms and the ring keeps 60 s. Scaling does not open a perf counter per thread and does not keep a ring per thread, so a daemon with thousands of threads costs the same two file reads as a daemon with one.
+
+The cgroup `cpu.stat` total for every task in the daemon is written to `rings/<daemon_id>.mring`. Its `task-clock`, `user`, and `system` values are the nanoseconds the whole daemon was scheduled in that gap. Its fourth value, `pressure`, is the gap in the `some total` line of the cgroup `cpu.pressure` file: the nanoseconds in that gap during which at least one runnable task of the daemon waited for a CPU. This ring is the input to `saturate`.
+
+Occupancy of one sample is `task-clock` divided by the gap and by the number of CPUs in the cpuset. Pressure of one sample is `pressure` divided by the gap. One busy thread on one CPU has occupancy 1 and pressure 0. Six busy threads on one CPU have occupancy 1 and pressure 1. Six busy threads on four CPUs have occupancy 1 and pressure 0.5, because some task is waiting about half the time.
+
+When `cpu.pressure` cannot be read (PSI disabled in the kernel), the worker counts the threads of the daemon and its descendants whose state in `/proc/<tid>/stat` is `R` once per tick and stores that count instead of `pressure`, with the ring name `runnable`. This fallback opens no perf fd.
+
+## Scaling
+
+`saturate` is attached to every daemon when it starts, with `min` 1 and `max` 16. `scale` updates a running daemon: `min` defaults to 1 and `max` defaults to 16. `policy` defaults to `saturate`. An unknown policy is rejected. The policy name `none` detaches `saturate` from that daemon, for callers that hold a cpuset fixed; posting `saturate` again attaches it. Posting again updates the limits and the policy and does not clear the current window.
+
+`saturate` decides on the mean of the last `kScaleWindow` (64) samples, which is 640 ms. Every sample in the window is newer than the last change of the cpuset by `saturate`, `widen`, or `shift`.
+
+- If the cpuset has fewer CPUs than `min`, add one immediately. If it has more than `max`, remove one immediately.
+- Add one CPU when the mean occupancy is at least 0.85, the mean pressure is at least 0.10, and the cpuset is still under `max`.
+- Remove one CPU when the cpuset is over `min`, the mean pressure is at most 0.02, and the mean occupancy is at or below `(cores - 1) / cores - 0.05` (margin rule) or at or below `(cores - 1) / cores` (relaxed rule). With pressure that low the relaxed rule covers the margin rule; both are kept as named tests. The relaxed rule lets N busy threads that picked up an (N+1)th CPU, at occupancy `N / (N + 1)`, give it back.
+- Otherwise hold.
+
+After any add or remove, the next decision waits for a fresh full window of 64 samples. One CPU changes per window, in either direction. Between the add line and the remove line no change is made. A daemon that just fits its cpuset (occupancy near 1) is above `(cores - 1) / cores` and is not shrunk; one that is short a CPU has pressure and is not shrunk either.
+
+With the `runnable` fallback, the pressure test is replaced by the mean runnable count: add when it is at least `cores + 0.5`, remove when it is at most `cores - 1` and the occupancy passes the margin or the relaxed rule.
+
+`scale` also takes an optional `placement`, the rule for the CPU `add_core` adds: `least_loaded` (the default, described next) or `nearest_first`. Omitting it keeps the daemon's current placement; an unknown name is rejected with 400. The response carries `placement`. A daemon starts with `least_loaded`. Placement is per daemon only: there is no worker-wide CLI or environment default, so one Mercury can run both and an experiment names the placement in the request. `widen` and `shift` (`policies.md`) choose their CPUs by their own rules regardless of placement.
+
+`nearest_first` (`request_cpu_nearest`, `src/resources.cpp`) takes the allocatable CPU outside the cpuset and the exclude list that is closest to the current cpuset: a CPU on the same physical core as a held CPU (SMT sibling), else in the same L3, else the same NUMA node, else the same socket, else anywhere. Within a tier the lower `load_of` of the candidate's core group wins, then the lower Linux CPU, the same tie break as `least_loaded`. An empty cpuset falls back to `request_cpu`. A grant restricts it through the exclude list exactly as for `least_loaded`. On dtn-01, a daemon on CPU 1 grows 1 → 33 → 32 (L3 0-1,32-33 with CPU 0 reserved), then within node 0, then node 1-3 on socket 0, and only then onto socket 1.
+
+`least_loaded`: the CPU added comes from `request_cpu` (`src/resources.cpp`). `request_cpu` calls `balanced_cpu`, which walks the group tree from the socket down through the node and the L3 to the core. At each level it keeps every group that still has an allocatable Linux CPU outside `exclude`, and only the children of the group chosen on the level above. The group with fewer of those excluded CPUs already in it wins, so sibling groups receive the same number of this daemon's CPUs before any sibling receives another. An equal count keeps the lower `load_of`, and an equal load keeps the group whose lowest Linux CPU is smaller. The CPU returned is the lowest allocatable Linux CPU on the chosen core that is not in `exclude`. A CPU another daemon already runs on is still offered. When every allocatable CPU is already in this cpuset, nothing is added. The CPU removed is the highest one in the cpuset.
+
+## Round-robin
+
+Workers are numbered from 1 in registration order. A cluster cursor `next_node` starts at 1. For each worker, `daemon_cpus` is `cpus` without its lowest number, sorted ascending. A cursor walks `daemon_cpus` from the first entry. A share of one CPU accepts no daemons.
+
+Walk schedulable tuples in submission order. From `next_node`, take the next worker for which `stat` returns ok, store it as `hostname`, and set `next_node` to the worker after it, wrapping to 1. Then set `cpu` to the next entry of that worker's `daemon_cpus` and advance, wrapping to the first entry. Store the daemon as `pending`.
+
+Activate starts every `pending` daemon. Several daemons may run on the same cpu.
+
+## Delivery
+
+A daemon stays on the controller until activate. Delivery is a single `start` to the worker in `hostname`. Load balancing across nodes is round-robin, by `next_node`. The controller does not copy the binary. A worker is skipped when `stat` fails, so if only the offering node has the path, every daemon is delivered there.
+
+## Actions
+
+- **Submit** — place the given tuples as above.
+- **Activate** — start every placed daemon.
+- **Delete** — kill if running, then drop the daemon.
+
+If a worker disconnects, each of its `running` daemons is stored as `exited` with `exit_code` -1 and the log `worker lost`. Those daemons are not restarted.
+
+## Subsystems
+
+The `mercury` binary is the worker. CMake builds it from `src/mercury.cpp`, `src/daemons.cpp`, `src/counters.cpp`, `src/ring.cpp`, `src/ring_archive.cpp`, `src/policy.cpp`, `src/resources.cpp`, and `src/http.cpp`. Submit, activate, round-robin, and the controller daemon table are the contract above. These files are the worker that receives `start`, `migrate`, `cpus`, `scale`, and `kill`.
+
+Four threads share one worker. `main` accepts HTTP and runs every route to completion before it accepts again. `arm_daemon` detaches `watch_daemon` and `monitor_daemon` for each live pid. `init_resources` detaches `sample_loop`, which samples host load into the resource-group rings. A critical section is a stretch those threads must not interleave on the same state.
+
+### Process start
+
+File: `src/mercury.cpp`.
+
+`main` first strips `--numa-balancing=keep` from the arguments, then runs `setup_numa_balancing` (below), then reads `<port> [cpu...]`. With no CPU arguments, `online_cpus` reads `/sys/devices/system/cpu/online` and that list is the share; CPU 0 must be in it. `parse_cpu` accepts a Linux CPU from 0 through `CPU_SETSIZE - 1` and rejects duplicates. The lowest number is the worker CPU. `pin_to` calls `sched_setaffinity` on that CPU and the process stays there. The other numbers are sorted into `daemon_cpus`. `raise_nofile` (`src/daemons.cpp`) lifts the soft open-file limit to the hard limit, or to 65536 when the hard limit is infinite. `set_mercury_cpu` stores that Linux CPU. `set_daemon_cpus` stores the sorted daemon pool. `serve` then blocks in the accept loop.
+
+#### numa_balancing
+
+Mercury runs with `kernel.numa_balancing` set to 0 by default, so automatic NUMA balancing does not keep a daemon's threads on a preferred node after its cpuset moves or grows onto another node. It changes the live sysctl only (`/proc/sys/kernel/numa_balancing`) and never writes `/etc/sysctl.d`.
+
+Startup, in `setup_numa_balancing`, before the port is parsed:
+1. Read the current value. If the file is missing, log `numa_balancing unavailable` and change nothing.
+2. If the state file `/run/mercury/numa_balancing.orig` exists, it holds `<original value> <owner pid>`. If that pid is alive and is not this process, another mercury owns the setting: log it and change nothing (this instance will not restore it either). Otherwise the state is stale (a crash or `SIGKILL`): write the saved original back to the sysctl, log `stale state ... restoring`, delete the file, and treat that value as the original.
+3. Opt-out: with `MERCURY_NUMA_BALANCING=keep` in the environment or `--numa-balancing=keep` on the command line, log `numa_balancing kept at <v>` and change nothing further.
+4. Otherwise write `<original> <pid>` to the state file (`/run` is tmpfs, so the file goes away on reboot together with the sysctl value), register the `atexit` restore and `SIGINT`/`SIGTERM` handlers, write 0, and log `numa_balancing <before> -> <after>`.
+
+Shutdown: a normal return from `main` (including an exception, such as a port that cannot be bound) runs `restore_numa_at_exit`, which writes the original back, deletes the state file, and logs `numa_balancing restored to <v>`. `SIGINT` and `SIGTERM` run `on_terminate`, which does the same with only `open`, `write`, `close`, and `unlink` (async-signal-safe, no log line) and then `_exit(128 + signal)`. Only the owning instance restores. After `SIGKILL` or a crash the next mercury start restores the value in step 2.
+
+`daemon_cpus` and `mercury_linux_cpu` are written on this thread before any other thread starts. Later readers do not lock them. `main` passes `daemon_cpus` to `init_resources` (`src/resources.cpp`) before `serve`.
+
+`route` is the only dispatch. It tries `ping_route`, `stat_route`, `start_route`, `migrate_route`, `cpus_route`, `scale_route`, `policies_route`, `map_route`, `rings_route`, then `kill_route`. The first function that recognizes the target returns the response. Anything else is HTTP 404 from `http_response`.
+
+### HTTP accept loop
+
+Files: `src/http.cpp`, `src/http.hpp`.
+
+`serve` calls `listen_on`, which binds `127.0.0.1` with backlog 16, then `serve_fd`. `serve_fd` accepts one connection and calls `handle_client` on the same thread. `handle_client` calls `read_request`, then the `route` function, then `send_all`, then closes the socket. `read_request` stops at 64 KiB. `request_target` and `http_target` parse the request line.
+
+This accept thread is a control-flow section. `launch`, `migrate_route`, and `kill_route` run inside it, so a placement wait, a cpuset wait, or a kill wait delays the next request. No second route runs until `handle_client` returns.
+
+`Arrivals` and `Arrivals::mu` count requests inside `handle_client`. `/arrivals` reads that count. Daemon routes do not take this lock. `ping_route` answers `ping` and `GET /ping`. `relay_route` and `ping_reply` belong to the hello-server relay and are not on the `mercury` route list.
+
+### Daemon table
+
+File: `src/daemons.cpp`. Header: `src/daemons.hpp`.
+
+The table is the vector `daemons` of `Daemon`. `find_daemon` walks it by `daemon_id`. The mutex is `daemons_mu`. The condition variable is `daemons_cv`. Every field of `Daemon` is read and written under `daemons_mu`: identity, `exec_path`, `pid`, `running`, `exit_code`, `log`, `finished`, `threads`, `scale`, `cpu`, `listen_fd`, `counters_done`, and `env`.
+
+`ScaleState` holds `enabled`, `min_cores`, `max_cores`, `policy`, and `changed_at_ns`. `ThreadRing` holds a tid and a `shared_ptr<Ring>`.
+
+Holders of `daemons_mu`:
+
+| Function | What it does under the lock |
+| --- | --- |
+| `daemon_running` | True when this `daemon_id` still has this pid and `running` |
+| `stat_route` | `{ok:true}` when some running daemon was started with this `exec_path` |
+| `start_route` | Rejects the start when this `daemon_id` is already running |
+| `migrate_route` | Reads `pid` and `cpu` of a running daemon whose cpu differs, then stores the new cpu after `cpuset.cpus` is written |
+| `arm_daemon` | Inserts the record, or replaces it and closes a different previous `listen_fd` |
+| `watch_daemon` | Sets `running` false, `exit_code`, `log`, and `finished`, then `notify_all` |
+| `mark_counters_done` | Sets `counters_done` when the pid still matches, then `notify_all` |
+| `remember_thread`, `forget_thread` | Push or erase a `ThreadRing` when the root pid still matches |
+| `monitor_daemon` | Copies `ScaleState` and the ring pointers; after any add or remove, writes `changed_at_ns` |
+| `scale_route` | Attaches, replaces, or (`none`) detaches the policy and updates the limits; never writes `changed_at_ns` |
+| `kill_route` | Holds a `unique_lock` across the waits below |
+
+`kill_route` is the long critical section. It takes `daemons_mu`, sends `SIGTERM`, and `wait_for`s up to 2 seconds until `watch_daemon` sets `finished`. On timeout it sends `SIGKILL` and `wait`s until `finished` is set. It then `wait_for`s up to 2 seconds for `counters_done`. It closes `listen_fd` before releasing the lock. `watch_daemon` and `mark_counters_done` take the same mutex only to publish and notify, so this wait can complete.
+
+`arm_daemon` runs on the accept thread after `launch` returns. It publishes the record, then detaches the two threads. `watch_daemon` and `monitor_daemon` ignore the record when the pid no longer matches.
+
+Work outside the lock: fork, cgroup writes, perf reads, `Ring::push`, `Ring::recent`, and `Policy::decide`. The monitor copies `shared_ptr<Ring>` under `daemons_mu`, drops the lock, then calls `recent`. It never takes `daemons_mu` while holding `Ring::mu_`.
+
+### Start and migrate
+
+File: `src/daemons.cpp`.
+
+`start_route` parses `daemon_id`, `exec_path`, `cpu`, optional `listen_port`, and optional `env`. `parse_env` and `valid_env_name` accept an object of strings whose names match `[A-Za-z_][A-Za-z0-9_]*`. A bad name or a non-string value fails the request and skips `launch`. The cpu must be in `daemon_cpus`. `access(exec_path, X_OK)` must succeed. `bind_loopback` binds `127.0.0.1` when `listen_port` is set.
+
+`launch` is the placement critical section. `prepare_placement` calls `ensure_daemon_cpuset`, which creates `/sys/fs/cgroup/mercury/<daemon_id>` and enables the cpuset controller through `ensure_cpuset_controller` and `controller_enabled`. It writes `cpuset.cpus` to that Linux CPU when that file is empty, then polls `cpuset_applied` for up to 50 times at 10 ms. `cpuset_applied` requires `cpuset.cpus` and `cpuset.cpus.effective` to both equal the requested list. An existing non-empty cpuset is left as it is, and the child is pinned to its first CPU.
+
+The parent then pipes stdout, stderr, and, when placement succeeded, a sync pipe, and `fork`s.
+
+Child, in order: read one byte from the sync pipe; `dup2` the log pipes onto stdout and stderr; `dup2` the listen socket onto fd 3 when present and `close_range` every fd above it; `widen_to_online` when placement exists, otherwise `sched_setaffinity` to that Linux CPU; `raise_nofile`; `exec_daemon`. `widen_to_online` sets the affinity to every CPU in `/sys/devices/system/cpu/online` except `mercury_linux_cpu`. `exec_daemon` calls `execv` when `env` is empty and `execve` otherwise, merging those names over the inherited environment. Arguments are empty, or `--listen-fd 3` when a listen socket was passed. Failure exits 127.
+
+Parent, after the child is waiting on the sync pipe: `pin_pid` on the child, then `move_into_cgroup` via `cgroup.procs`, then write the byte `'1'`. The cgroup is in place before the child widens its mask. A failed pin, move, or write sends `SIGKILL`, `waitpid`, and `launch` returns empty.
+
+`migrate_route` reads the live pid and cpu under `daemons_mu`. The cpu must be in `daemon_cpus` and must differ from the recorded cpu. It does not fork. It writes `cpuset.cpus` through `ensure_daemon_cpuset`, `write_sysfs`, and `cpuset_applied`, polling for up to 50 times at 10 ms. On success it stores the new cpu on the same record and returns that pid.
+
+Every write of a daemon's `cpuset.cpus` goes through `write_cpus_and_mems` (start in `prepare_placement`, `migrate_route`, `cpus_route`, `add_core`, `remove_core`, and `write_cpuset` for `widen` and `shift`). It sets `cpuset.mems` to the NUMA nodes that contain at least one CPU of the new `cpuset.cpus` (`nodes_for_cpus`, from `/sys/devices/system/node/node<N>/cpulist`, read once). Order: first `cpuset.mems` is widened to the union of the old and the new nodes, then `cpuset.cpus` is written, then `cpuset.mems` is shrunk to the new nodes. Growing therefore widens mems before cpus, shrinking narrows mems after cpus, and no intermediate state has a CPU without its node. A failed `cpuset.mems` write is logged and does not fail the cpuset write; a failed `cpuset.cpus` write does. In cgroup v2 the kernel migrates the daemon's pages when `cpuset.mems` changes.
+
+`cpus_route` parses a Linux cpuset with `parse_cpuset`, rejects a set that contains `mercury_linux_cpu`, and rejects a set `resource_groups_see` does not know. It writes the set through `ensure_daemon_cpuset`, `write_sysfs`, and `cpuset_applied`. On success it logs the least-loaded socket, node, L3, and core that contain one of those CPUs, from `least_loaded_touching`, formatted by `resource_choice`. `add_core` and `remove_core` write that same `cpuset.cpus` from the monitor thread. Those three functions do not take `daemons_mu`. The accept thread and the monitor thread can both write one daemon's cpuset.
+
+### Watch
+
+File: `src/daemons.cpp`.
+
+`watch_daemon` calls `read_pipes`, which `poll`s stdout and stderr until both ends close, then `waitpid`. It publishes `exit_code` (`WEXITSTATUS`, or -1 when the process did not exit normally), the log, and `finished` from `now_ms`, under `daemons_mu`, and notifies `daemons_cv`. The publish is skipped when `arm_daemon` has already replaced this pid.
+
+### Monitoring
+
+Files: `src/daemons.cpp`, `src/counters.cpp`, `src/counters.hpp`.
+
+`monitor_daemon` opens the cgroup ring first: `RingArchive` at `rings/<daemon_id>.mring` and a `Ring` named `task-clock`, `user`, `system`. `rings_dir` uses `MERCURY_RINGS` or `rings`. `archive_name` keeps letters, digits, `.`, `_`, and `-`.
+
+The loop condition is `daemon_running`. Each pass sleeps `kSampleMs` (10), then `read_cgroup_cpu` reads `cpu.stat` and `read_cgroup_pressure` reads the `some total` value of `cpu.pressure`. `usec_delta_ns` converts the `usage_usec`, `user_usec`, `system_usec`, and pressure `total` gaps into one sample of the cgroup ring. A tick where either read fails pushes nothing. When `cpu.pressure` is missing at the first read, the monitor uses `count_runnable`, which walks `descendants` (`child_pids` reads `/proc/<pid>/task/<pid>/children`) and `/proc/<pid>/task/*/stat`, for the whole life of that daemon. The monitor opens no perf counters.
+
+On the way out, the loop flushes the cgroup ring and calls `mark_counters_done`.
+
+### Scaling
+
+Files: `src/policy.cpp`, `src/policy.hpp`, and the decision loop in `monitor_daemon`.
+
+Thresholds are named constants in `src/policy.hpp`: `kScaleWindow` (64), `kAddOccupancy` (0.85), `kAddPressure` (0.10), `kRemoveMargin` (0.05, margin rule only), `kRemovePressure` (0.02, both remove rules), `kRunnableAddMargin` (0.5). `load_of` in `src/resources.cpp` keeps its own window, `kLoadWindow` (10 samples, 100 ms), independent of `kScaleWindow`. The cgroup ring counters are `task-clock`, `user`, `system`, and `pressure` (the `some total` delta of `cpu.pressure`, in ns) or, without PSI, `runnable` (the count of runnable threads in the cgroup); `kCgroupTaskClock` (0) and `kCgroupPressure` (3) index them.
+
+`arm_daemon` sets `ScaleState` to `enabled`, `min_cores` 1, `max_cores` `kDefaultMaxCores` (16), and a `SaturatePolicy`, and sets `changed_at_ns` to the start time. `scale_route` runs on the accept thread. `scale_int` reads `min` (default 1) and `max` (default 16). `make_policy` returns a `SaturatePolicy` for `saturate` and empty for any other name. `scale_route` rejects an empty policy with 400 unless the name is `none`. Under `daemons_mu` it requires `running`, stores the limits and the policy, and sets `enabled` to whether a policy is attached. It does not touch `changed_at_ns`.
+
+Each monitor pass, after the sample, copies `ScaleState` under `daemons_mu`. It builds an `OccupancyWindow` with `cores` from `cpuset_cores`, the limits, the pressure source, and the cgroup samples from `Ring::recent(kScaleWindow + 1)` whose `timestamp_ns` is greater than `changed_at_ns`. `SaturatePolicy::decide` is a pure function of that window. It returns `AddCore` when `cores < min_cores` and `RemoveCore` when `cores > max_cores`. It returns `Hold` until the window holds 65 samples, so each of the 64 has a gap. A gap of zero or less returns `Hold`. Mean occupancy is the sum of `task-clock` over the sum of the gaps, divided by `cores`. Mean pressure is the sum of `pressure` over the sum of the gaps. The add and remove tests are the ones under Scaling above.
+
+Back in `monitor_daemon`, `Hold` does nothing. `AddCore` calls `add_core` and `RemoveCore` calls `remove_core`. Both poll `cpuset_applied`. After either succeeds, the monitor sets `changed_at_ns` under `daemons_mu`. `widen` and `shift` set the same field, so every cpuset change opens a fresh window.
+
+`decide` is tested without a host: `policy_test` feeds it synthetic windows (including 6 busy threads on 7 CPUs, which must remove) and the recorded traces in `src/test/traces/` (CSV, `ts,task_clock,user,system,pressure`, header `# cores=N ... expect=X`; `TRACES_DIR` in CMake). Every sliding 65-sample window of a trace must give its expected decision. `src/test/record_traces.py` (root) re-records them with `spinner` in the cgroup `mercury/ptrec`. Acceptance on dtn-01: `spinner` with N busy threads started on one CPU settles at N CPUs and stays there for ten windows; `src/test/saturate_it.sh` checks N = 1, 3, 6 on the CPUs of NUMA nodes 0-2 (`saturate_integration` under `ctest`).
+
+Test expectations that follow from saturate being attached at start:
+- Tests that pin a daemon (`main.cpp` after `hello` starts and after each "start failed for" probe) post `/scale` with `max` 1 so the cpuset is not grown.
+- `scale_test` and the fixed-size steps of `autoscale_test` post `/scale` with policy `none` before writing `/cpus`, and `autoscale_test` re-attaches `saturate` afterwards and checks the default range 1-16.
+- `autoscale_test` allows 60 s to grow from 1 to 16 cores (one CPU per window plus the cooldown), and in its ramp and down phases expects N `/cpu` clients, each burning one core, to settle at N cores (clamped to 1-16).
+- `autoscale_nearest_first` mirrors `autoscale_least_loaded` (own ports 18133/18134 and daemon id `nearest`) with `placement` `nearest_first` and `partial_server` started with `PARTIAL_BURN_PCT=100`, so each served connection burns a whole core and N clients must settle at N cores (clamped to 1-16). Every CPU it sees added must be in the nearest tier any free allocatable CPU offered. `partial_server` reads `PARTIAL_BURN_PCT` (1-100, default 33).
+- `resources_test` checks `nearest_first` on the live topology (each start CPU and a 20-step grow pick a CPU of the best tier) and, on dtn-01, the concrete picks: 1 → 33, {1,33} → 32, a full L3 stays on node 0, an excluded sibling falls to the L3, socket 0 excluded goes to socket 1.
+- `saturate_it.sh` takes `SAT_PLACEMENT` and `autoscale_test` takes `AUTOSCALE_PLACEMENT`; when set, the test posts that placement to `/scale` (test-side only).
+- `autoscale_least_loaded` still encodes the earlier 90% rule (`cores_for_clients`: 0.33 core per client) and does not match this rule.
+
+Policies beyond `saturate` are specified in `policies.md`. That file is the contract for moving a running daemon off a hot NUMA node, for restricting a daemon to resource groups and adding groups, and for application degradation. `make_policy` still returns only `SaturatePolicy`.
+
+In `policies.md`, the saturate add test that `widen` uses over the last 1 s is the add test above, taken over the samples of that second: mean occupancy at least 0.85 and mean pressure at least 0.10. `shift` still ranks daemons by the cgroup `task-clock` of the last 1 s. The statement there that saturate is always active is true because `arm_daemon` attaches it.
+
+### Policies
+
+Files: `src/daemons.cpp` (`policies_route`, `policy_loop`, `policy_tick`, `run_shift`, `run_widen`, `run_degrade`), `src/policy.cpp` and `src/policy.hpp` (`interval_loads`, `node_hot`, `least_allocated`, `degrade_set`), `src/resources.cpp` (`set_policy_loop`). The contract is `policies.md`.
+
+`main` calls `set_policy_loop(policy_loop)` before `init_resources`, and `init_resources` detaches that thread beside `sample_loop`, so `resources.cpp` does not link against the daemon table. `policies_route` is tried after `scale_route`. It parses the body with a small JSON tree (`JParser`), rejects unknown fields and shapes with HTTP 400 before touching the table, returns HTTP 500 when resource groups are missing, and stores a `PolicyState` on the `Daemon` under `daemons_mu`. Each post bumps a generation number; `policy_loop` stores a change only when the generation it copied is still current, so a re-post or an empty document wins over a decision that was in flight. The ceiling must be a known group whose level is the grant level or above it. `widen` accepts an object (`{max_groups?}`) or `true`.
+
+`Daemon::cgroup_ring` is the cgroup `cpu.stat` ring that `monitor_daemon` publishes under `daemons_mu`. `policy_loop` uses its `task-clock` over the last 1 s for the `shift` rank and for the `widen` saturate test (the saturate add test over that second), because the record keeps no per-thread rings. The `widen` test is `saturated_last_second`: `window_means` and `saturate_add_test` over the samples of that second.
+
+`monitor_daemon` copies the grant with `ScaleState`, and `add_core` takes the grant CPUs as an optional argument: the exclude list is then the cpuset plus every allocatable CPU outside the grant. `policy_loop` writes cpusets through `write_cpuset` (`ensure_daemon_cpuset`, `write_sysfs`, `cpuset_applied`) without holding `daemons_mu`, and sets `ScaleState::changed_at_ns` after a successful shift or widen. `cpus_route` and `migrate_route` do not write it. The policy file is written by `write_policy_file`, a temp file in `rings_dir()` renamed into place under `policy_file_mu`; the path in the response is absolute.
+
+Tests: `policy_test` (`src/test/policy.cpp`) covers the pure decisions. `src/test/policies_it.sh` starts `mercury` on a free port in 18180-18199 with the CPUs of NUMA nodes 0-2, uses `spinner` (`src/test/spinner.cpp`) as daemons and as external load, and checks attach validation, shift, widen with `max_groups` and with a ceiling, degrade, and the empty document. Both run under `ctest` in `build/`.
+

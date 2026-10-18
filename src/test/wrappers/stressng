@@ -1,0 +1,102 @@
+#!/usr/bin/env python3
+"""Env-driven stress-ng wrapper for Mercury daemons (Mercury execs it with no arguments).
+
+STRESS_MODE     cpu (default) | vm | stream
+STRESS_WORKERS  worker count N (default 4)
+STRESS_STEPS    cpu mode: "load:seconds,..." e.g. "20:3,50:3,80:3,100:3,50:3,20:3"
+STRESS_RAMP     cpu mode, instead of STEPS: "from,to,seconds" in 1 s steps, e.g. "10,100,15"
+STRESS_SECONDS  vm/stream run length (default 20)
+STRESS_VM_BYTES vm bytes per worker (default 1G)
+STRESS_METHOD   cpu method (default int64)
+STRESS_LABELS   labels CSV (gnnload format: phase_start_ns,phase,thread,tid,demand; CLOCK_MONOTONIC);
+                a header line "# spans=1" marks per-step worker tids (each step is a new stress-ng run,
+                so workers are new processes: demand L/100 from their start, 0 at the step end)
+STRESS_RESULT   JSON result path: per step load, seconds, bogo_ops, wall_s
+
+cpu mode runs one stress-ng --cpu N --cpu-load L per step (stress-ng cannot change --cpu-load while
+running). Ground truth per worker is L/100 of a core.
+"""
+import json, os, re, subprocess, sys, time
+
+def find():
+    for home in (os.environ.get("HOME", ""), os.path.expanduser("~" + os.environ.get("SUDO_USER", "")) if os.environ.get("SUDO_USER") else ""):
+        for d in ("benchmarks/stress-ng", "Benchmarks/stress-ng"):
+            p = os.path.join(home, d, "stress-ng")
+            if home and os.access(p, os.X_OK):
+                return p
+    for p in ("/home/paul/Benchmarks/stress-ng/stress-ng",):
+        if os.access(p, os.X_OK):
+            return p
+    sys.exit("stress-ng binary not found")
+
+def children(pid):
+    try:
+        return [int(x) for x in open(f"/proc/{pid}/task/{pid}/children").read().split()]
+    except OSError:
+        return []
+
+def bogo(path):
+    try:
+        return sum(int(x) for x in re.findall(r"bogo-ops:\s*(\d+)", open(path).read()))
+    except OSError:
+        return None
+
+def main():
+    sng = find()
+    e = os.environ.get
+    mode, n = e("STRESS_MODE", "cpu"), int(e("STRESS_WORKERS", "4"))
+    labels = open(e("STRESS_LABELS"), "w") if e("STRESS_LABELS") else None
+    yaml = f"/tmp/stressng-{os.getpid()}.yaml"
+    result = {"mode": mode, "workers": n, "steps": []}
+    if labels:
+        labels.write("# spans=1 mode=%s workers=%d\nphase_start_ns,phase,thread,tid,demand\n" % (mode, n))
+    if mode == "cpu":
+        if e("STRESS_RAMP"):
+            a, b, s = (float(x) for x in e("STRESS_RAMP").split(","))
+            k = max(1, int(s))
+            steps = [(round(a + (b - a) * i / max(1, k - 1)), 1.0) for i in range(k)]
+        else:
+            steps = [(int(x.split(":")[0]), float(x.split(":")[1])) for x in e("STRESS_STEPS", "50:10").split(",")]
+    else:
+        steps = [(100, float(e("STRESS_SECONDS", "20")))]
+    for ph, (load, secs) in enumerate(steps):
+        if mode == "cpu":
+            args = [sng, "--cpu", str(n), "--cpu-load", str(load), "--cpu-method", e("STRESS_METHOD", "int64")]
+        elif mode == "vm":
+            args = [sng, "--vm", str(n), "--vm-bytes", e("STRESS_VM_BYTES", "1G")]
+        else:
+            args = [sng, "--stream", str(n)]
+        args += ["--timeout", f"{secs:g}s", "--metrics-brief", "--yaml", yaml, "-q"]
+        t0 = time.monotonic_ns()
+        p = subprocess.Popen(args)
+        tids = []
+        for _ in range(200):  # workers appear within a few ms
+            tids = children(p.pid)
+            if len(tids) >= n or p.poll() is not None:
+                break
+            time.sleep(0.002)
+        ts = time.monotonic_ns()
+        if labels:
+            for i, t in enumerate(sorted(tids)):
+                labels.write(f"{ts},{ph},{i},{t},{load / 100.0 if mode == 'cpu' else 1.0}\n")
+            labels.flush()
+        p.wait()
+        te = time.monotonic_ns()
+        if labels:
+            for i, t in enumerate(sorted(tids)):
+                labels.write(f"{te},{ph},{i},{t},0\n")
+            labels.flush()
+        result["steps"].append({"load": load, "seconds": secs, "bogo_ops": bogo(yaml), "wall_s": (te - t0) / 1e9,
+                                "start_ns": t0, "end_ns": te, "workers_seen": len(tids)})
+    if labels:
+        labels.write(f"{time.monotonic_ns()},-1,-1,-1,0\n")
+        labels.close()
+    try:
+        os.unlink(yaml)
+    except OSError:
+        pass
+    if e("STRESS_RESULT"):
+        json.dump(result, open(e("STRESS_RESULT"), "w"), indent=1)
+    time.sleep(3600)  # stay alive idle until the driver kills the daemon (keeps the cgroup for the trace tail)
+
+main()

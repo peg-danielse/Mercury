@@ -393,6 +393,11 @@ pid_t start_daemon(const std::string& id, const std::string& path, bool listen) 
   if (response_status(response) != 200 || pid <= 0) {
     throw std::runtime_error("start " + id + " failed: " + trim(response_body(response)));
   }
+  // This test sets the cpuset itself; detach the saturate policy that start attaches.
+  const auto detached = http_post("/scale", std::string("{\"daemon_id\":\"") + id + "\",\"policy\":\"none\"}");
+  if (response_status(detached) != 200) {
+    throw std::runtime_error("scale none " + id + " failed: " + trim(response_body(detached)));
+  }
   return pid;
 }
 
