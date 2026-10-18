@@ -6,7 +6,7 @@
 set -u
 SYS=$1; OUT=$2; REPS=$3; EXTRA=$4; TRACE=${5:-}
 # Host layout (PC port): defaults are dtn-01; $DSB_ROOT/perturb/hosts/$(hostname -s).env or HOST_ENV overrides.
-B=${DSB_ROOT:-/home/paul/Benchmarks}
+B=${DSB_ROOT:-$([ -d /home/paul/Benchmarks ] && echo /home/paul/Benchmarks || echo $HOME/Benchmarks)}
 HOST_ENV=${HOST_ENV:-$B/perturb/hosts/$(hostname -s).env}; [ -f "$HOST_ENV" ] && . "$HOST_ENV"
 B=${DSB_ROOT:-$B}; M=${MERCURY_ROOT:-/home/paul/Mercury}; export DSB_ROOT=$B
 MERCURY_CPU=${MERCURY_CPU:-0}; POOL=${POOL:-1-60}; GEN_CPU=${GEN_CPU:-60}; OP_CPU=${OP_CPU:-61}
