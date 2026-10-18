@@ -5,7 +5,13 @@
 # (which starts and kills every service), and dsb_sample.py on CPU 63. Stops mercury with SIGTERM.
 set -u
 SYS=$1; OUT=$2; REPS=$3; EXTRA=$4; TRACE=${5:-}
-B=/home/paul/Benchmarks; M=/home/paul/Mercury
+# Host layout (PC port): defaults are dtn-01; $DSB_ROOT/perturb/hosts/$(hostname -s).env or HOST_ENV overrides.
+B=${DSB_ROOT:-/home/paul/Benchmarks}
+HOST_ENV=${HOST_ENV:-$B/perturb/hosts/$(hostname -s).env}; [ -f "$HOST_ENV" ] && . "$HOST_ENV"
+B=${DSB_ROOT:-$B}; M=${MERCURY_ROOT:-/home/paul/Mercury}; export DSB_ROOT=$B
+MERCURY_CPU=${MERCURY_CPU:-0}; POOL=${POOL:-1-60}; GEN_CPU=${GEN_CPU:-60}; OP_CPU=${OP_CPU:-61}
+HELPER_CPU=${HELPER_CPU:-62}; SAMPLER_CPU=${SAMPLER_CPU:-63}
+POOL_LIST=$(python3 -c "import sys; sys.path.insert(0, '$B/perturb'); from common import parse_cpuset; print(' '.join(map(str, parse_cpuset('$POOL'))))")
 case $SYS in
   hotel) WD=$B/deathstar-hotelReservations; OP=$WD/bin/loadgen; PFX=hotel-; TR="hotel-frontend hotel-search hotel-geo hotel-profile hotel-rate";;
   social) WD=$B/deathstar-socialNetwork; OP=$WD/goperate/bin/goperate; PFX=social-; TR="social-ComposePostService social-HomeTimelineService social-UserTimelineService social-PostStorageService social-SocialGraphService";;
@@ -26,21 +32,21 @@ for r in $(seq 1 $REPS); do for pol in ${POLICIES:-saturate gnn}; do
   case $pol in gnn-nopin) PARGS="-policy gnn -pin=false";; *) PARGS="-policy $pol";; esac
   D=$RUN/$r-$NAME; mkdir -p $D
   ss -ltnH | grep -q ":8080 " && { echo "port 8080 busy"; exit 1; }
-  (cd $WD && exec sudo -n env ${MODEL:+MERCURY_GNN_MODEL=$MODEL} $M/build/mercury 8080 0 $(seq 1 60)) > $D/mercury.log 2>&1 &
-  sleep 1; MPID=$(pgrep -f "^$M/build/mercury 8080 0" | head -1)
+  (cd $WD && exec sudo -n env ${MODEL:+MERCURY_GNN_MODEL=$MODEL} $M/build/mercury 8080 $MERCURY_CPU $POOL_LIST) > $D/mercury.log 2>&1 &
+  sleep 1; MPID=$(pgrep -f "^$M/build/mercury 8080 $MERCURY_CPU" | head -1)
   for i in $(seq 50); do curl -s -m 1 127.0.0.1:8080/ping >/dev/null && break; sleep 0.2; done
-  taskset -c 63 python3 $M/src/test/dsb_sample.py --prefix $PFX --out $D/sample.jsonl & SPID=$!
+  taskset -c $SAMPLER_CPU python3 $M/src/test/dsb_sample.py --prefix $PFX --out $D/sample.jsonl & SPID=$!
   if [ "$TRACE" = --trace ] && [ $r = 1 ] && [ $pol = saturate ] && [ -z "${NOTRACE:-}" ]; then
-    ( sleep 20; for d in $TR; do taskset -c 62 sudo -n $M/build/threadtrace $d --interval-ms 50 --duration-s 240 --out $D/trace-$d.jsonl 2>/dev/null & done; wait ) &
+    ( sleep 20; for d in $TR; do taskset -c $HELPER_CPU sudo -n $M/build/threadtrace $d --interval-ms 50 --duration-s 240 --out $D/trace-$d.jsonl 2>/dev/null & done; wait ) &
   fi
   if [ -n "${TRACEALL:-}" ]; then
     ( for i in $(seq 300); do [ -d /sys/fs/cgroup/mercury/${PFX}loadgen ] && break; sleep 1; done  # services are all up once the load generator starts
       for c in /sys/fs/cgroup/mercury/$PFX*; do d=$(basename $c); iv=$TRACEALL
         case " ${TRACE_SLOW:-} " in *" $d "*) iv=50;; esac
-        taskset -c 62,63 sudo -n $M/build/threadtrace $d --interval-ms $iv --duration-s 900 --out $D/trace-$d.jsonl 2>/dev/null & done; wait ) &
+        taskset -c $HELPER_CPU,$SAMPLER_CPU sudo -n $M/build/threadtrace $d --interval-ms $iv --duration-s 900 --out $D/trace-$d.jsonl 2>/dev/null & done; wait ) &
   fi
   echo "$(date +%T) run $r $NAME"
-  (cd $WD && taskset -c 61 $OP -mercury 127.0.0.1:8080 -cpu 2 -client mercury $PARGS -placement least_loaded -gen-out $D/loadgen.out $EXTRA ${SVC_ARGS:-} autoscale) > $D/operate.out 2> $D/operate.err
+  (cd $WD && taskset -c $OP_CPU $OP -mercury 127.0.0.1:8080 -cpu 2 -client mercury -gen-cpu $GEN_CPU $PARGS -placement least_loaded -gen-out $D/loadgen.out $EXTRA ${SVC_ARGS:-} autoscale) > $D/operate.out 2> $D/operate.err
   echo "  operator exit $? routes=$(grep -c ^route $D/operate.out)"
   kill $SPID; SPID=""
   sudo -n kill -TERM $MPID; for i in $(seq 50); do kill -0 $MPID 2>/dev/null || break; sleep 0.2; done; MPID=""
