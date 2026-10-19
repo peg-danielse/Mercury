@@ -205,7 +205,7 @@ def service_cpus(mapping: dict, svc: str) -> list[int]:
 
 
 def arm_documents(arm: str, svc: str, level: str, ceiling: str, llm: str = "mock",
-                  every: int = 10) -> tuple[dict | None, dict | None]:
+                  every: int = 10, gnn: bool = True, jaeger: str = "auto") -> tuple[dict | None, dict | None]:
     """(policies document, scale document) for one service, per arm."""
     if arm == "none":
         return None, None
@@ -233,7 +233,8 @@ def arm_documents(arm: str, svc: str, level: str, ceiling: str, llm: str = "mock
         }, None
     if arm == "zeroctl":
         # infrabench --policy zeroctl: the model picks one cross-layer action per call.
-        return {"daemon_id": svc, "zeroctl": {"llm": llm, "every": every, "level": level,
+        # RCA before the prompt: gnn = Mercury's per-thread demand model (models/gnn_v5.json), jaeger only for DSB.
+        return {"daemon_id": svc, "zeroctl": {"llm": llm, "every": every, "level": level, "gnn": gnn, "jaeger": jaeger,
                                               "components": [{"name": "extra", "cost": EXTRA_COST}]}}, None
     raise ValueError(arm)
 
@@ -316,7 +317,8 @@ def run_arm(arm: str, args, out_root: Path) -> dict:
         mapping = mercury.get("/map")
         cost_before = cost(mapping, services)
         for svc in services:
-            policies, scale = arm_documents(arm, svc, level, ceiling, llm, args.zeroctl_every)
+            policies, scale = arm_documents(arm, svc, level, ceiling, llm, args.zeroctl_every,
+                                             not args.no_gnn, args.jaeger)
             if policies is not None:
                 mercury.post("/policies", policies)
             if scale is not None:
@@ -398,6 +400,10 @@ def main() -> int:
     parser.add_argument("--burn-threads", type=int, default=0, help="default: 2 x victim CPUs")
     parser.add_argument("--llm", default="auto", choices=("auto", "openai", "gemini", "mock", "none"),
                         help="zeroctl model: auto = openai if OPENAI_API_KEY, gemini if GEMINI_API_KEY, else skip")
+    parser.add_argument("--no-gnn", action="store_true",
+                        help="zeroctl RCA without the GNN (ring-load heuristic only)")
+    parser.add_argument("--jaeger", default="auto",
+                        help="zeroctl RCA traces: auto (JAEGER_URL or localhost:16686, skipped when absent), off, or a URL")
     parser.add_argument("--zeroctl-every", type=int, default=10, help="seconds between zeroctl model calls")
     parser.add_argument("--warmup", type=int, default=15)
     parser.add_argument("--hold", type=int, default=15, help="stabilize seconds after inject before scoring")

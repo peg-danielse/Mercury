@@ -17,6 +17,11 @@ Providers (same as infrabench rca/controller/llm/client.py):
   --llm mock    no network: a fixed rule (move the busiest daemon off a hot group),
                 or replay ZEROCTL_MOCK_RESPONSE (a file holding raw model text)
 
+RCA (rca.py) runs first: GNN demand from state["rca"]["gnn"] (Mercury's C++ sampler),
+ring-load ranking, and Jaeger traces for DSB workloads (state["rca"]["jaeger"]: auto | off | URL;
+auto uses JAEGER_URL or http://localhost:16686 and skips cleanly when unreachable;
+ZEROCTL_JAEGER=off disables, ZEROCTL_JAEGER_TRACES=<file> replays a saved /api/traces reply).
+
 Optional: ZEROCTL_SITUATION_FILE, a JSON file with {"now": {...}, "reference": {...},
 "load": "..."} (p50_ms, p95_ms, error_rate, requests_per_s) written by the experiment
 harness, rendered as the Situation section.
@@ -27,6 +32,7 @@ Python 3.8+, stdlib only. API keys are read from the environment and never logge
 from __future__ import annotations
 
 import argparse
+import math
 import json
 import os
 import re
@@ -38,6 +44,8 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE))
+import rca as rca_step  # noqa: E402
 TEMPLATE = HERE / "generate.txt"
 
 GOAL = (
@@ -195,10 +203,14 @@ def constraint_lines(state: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def build_prompt(state: dict[str, Any], situation: dict[str, Any] | None = None) -> str:
+def build_prompt(state: dict[str, Any], situation: dict[str, Any] | None = None,
+                 rca: dict[str, Any] | None = None) -> str:
     template = TEMPLATE.read_text(encoding="utf-8")
+    if rca is None:
+        rca = rca_step.run_rca(state, situation)
     return template.format(
         situation=format_situation(situation, state),
+        rca=rca_step.format_rca(rca),
         group_state=format_groups(state),
         daemon_state=format_daemons(state),
         events=format_events(state.get("events")),
@@ -258,11 +270,22 @@ def _gemini(prompt: str) -> str:
     return "".join(str(part.get("text") or "") for part in parts)
 
 
-def mock_reply(state: dict[str, Any]) -> str:
-    """Deterministic stand-in for a model. Replays ZEROCTL_MOCK_RESPONSE when set."""
+def mock_reply(state: dict[str, Any], rca: dict[str, Any] | None = None) -> str:
+    """Deterministic stand-in for a model. Replays ZEROCTL_MOCK_RESPONSE when set.
+
+    Rule: scale a GNN-STARVED daemon to its p90 need; else move the busiest daemon off a hot
+    group; else degrade; else none.
+    """
     canned = os.environ.get("ZEROCTL_MOCK_RESPONSE")
     if canned:
         return Path(canned).read_text(encoding="utf-8")
+    for row in (rca or {}).get("gnn") or []:
+        need = min(int(state.get("max_cpus") or 16), max(int(row.get("required_p90") or 0), math.ceil(float(row.get("required_mean") or 0))))
+        if row.get("starved") and need > int(row.get("cpus") or 0):
+            return (
+                f"action: scale_out\nworkload: {row['daemon_id']}\ncpus: {need}\n"
+                f"reason: GNN predicts {float(row['required_mean']):.1f} cores of demand on {row['cpus']} cpus\n"
+            )
     level = state.get("move_level") or "node"
     groups = {g["name"]: g for g in state.get("groups") or []}
     level_groups = [g for g in groups.values() if g.get("level") == level and g.get("allocatable", 0) > 0]
@@ -298,12 +321,12 @@ def mock_reply(state: dict[str, Any]) -> str:
     return "action: none\nreason: no group above 75%\n"
 
 
-def complete(prompt: str, llm: str, state: dict[str, Any]) -> str:
+def complete(prompt: str, llm: str, state: dict[str, Any], rca: dict[str, Any] | None = None) -> str:
     kind = (llm or "openai").lower()
     if kind == "none":
         raise RuntimeError("LLM disabled")
     if kind == "mock":
-        return mock_reply(state)
+        return mock_reply(state, rca)
     if kind in {"gemini", "gimini"}:
         return _gemini(prompt)
     if kind == "openai":
@@ -396,13 +419,19 @@ def step(state: dict[str, Any], llm: str, log_dir: Path | None = None) -> dict[s
             situation = json.loads(Path(situation_file).read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             situation = None
-    prompt = build_prompt(state, situation)
+    try:
+        rca = rca_step.run_rca(state, situation)
+    except Exception as exc:  # the RCA step must never block the controller
+        rca = {"method": f"failed: {exc}", "localized": [], "gnn_status": "n/a", "gnn": [], "rings": [],
+               "jaeger": {"status": "n/a"}}
+    prompt = build_prompt(state, situation, rca)
     stamp = time.strftime("%Y%m%dT%H%M%S")
     if log_dir is not None:
         log_dir.mkdir(parents=True, exist_ok=True)
         (log_dir / f"{stamp}-prompt.txt").write_text(prompt, encoding="utf-8")
+        (log_dir / f"{stamp}-rca.json").write_text(json.dumps(rca, indent=1) + "\n", encoding="utf-8")
     try:
-        reply = complete(prompt, llm, state)
+        reply = complete(prompt, llm, state, rca)
     except Exception as exc:  # network, quota, missing key
         action = {"action": "none", "error": str(exc)}
     else:
@@ -428,7 +457,10 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps({"action": "none", "error": f"bad state: {exc}"}))
         return 0
     if args.print_prompt:
-        print(build_prompt(state))
+        situation = None
+        if os.environ.get("ZEROCTL_SITUATION_FILE") and Path(os.environ["ZEROCTL_SITUATION_FILE"]).is_file():
+            situation = json.loads(Path(os.environ["ZEROCTL_SITUATION_FILE"]).read_text(encoding="utf-8"))
+        print(build_prompt(state, situation))
         return 0
     action = step(state, args.llm, Path(args.log_dir) if args.log_dir else None)
     print(json.dumps(action))

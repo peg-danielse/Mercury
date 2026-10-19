@@ -16,7 +16,11 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
+import rca  # noqa: E402
 import zeroctl  # noqa: E402
+
+# No test may reach a real Jaeger on this host; the Jaeger tests opt back in.
+os.environ["ZEROCTL_JAEGER"] = "off"
 
 STATE = {
     "mercury_cpu": 0,
@@ -145,6 +149,7 @@ class Providers(unittest.TestCase):
     @classmethod
     def tearDownClass(cls):
         cls.server.shutdown()
+        cls.server.server_close()
 
     def setUp(self):
         FakeProvider.seen.clear()
@@ -184,6 +189,138 @@ class Providers(unittest.TestCase):
         self.assertEqual(action, {"action": "none", "error": "OPENAI_API_KEY is not set"})
 
 
+GNN = {"enabled": True, "available": True, "model": "/srv/Mercury/models/gnn_v5.json", "error": "", "tick_ms": 10,
+       "window_s": 5, "daemons": [
+           {"daemon_id": "svc0", "cpus": 1, "ticks": 500, "required_mean": 2.6, "required_max": 4, "required_p90": 3,
+            "under_share": 0.92, "pred_demand_mean": 2.31, "threads_mean": 9},
+           {"daemon_id": "svc1", "cpus": 1, "ticks": 500, "required_mean": 1.0, "required_max": 1, "required_p90": 1,
+            "under_share": 0.0, "pred_demand_mean": 0.4, "threads_mean": 5}]}
+
+
+def with_rca(gnn=None, jaeger="off"):
+    state = json.loads(json.dumps(STATE))
+    state["rca"] = {"gnn": gnn if gnn is not None else {"enabled": False, "available": False, "model": "", "error": "",
+                                                        "daemons": []},
+                    "jaeger": jaeger, "application": ""}
+    return state
+
+
+def span(span_id, service, op, duration, parent=None):
+    refs = [{"refType": "CHILD_OF", "spanID": parent}] if parent else []
+    return {"spanID": span_id, "operationName": op, "duration": duration, "processID": service, "references": refs}
+
+
+def jaeger_reply(slow=6, fast=30):
+    """Hotel-like traces: frontend root; slow ones spend their time in srv-reservation."""
+    data = []
+    for i in range(fast):
+        data.append({"traceID": f"f{i}", "processes": {"p1": {"serviceName": "frontend"}, "p2": {"serviceName": "srv-search"}},
+                     "spans": [span("a", "p1", "HTTP GET /hotels", 10_000 + 100 * (i % 5)),
+                               span("b", "p2", "/search.Search/Nearby", 6_000, "a")]})
+    for i in range(slow):
+        data.append({"traceID": f"s{i}", "processes": {"p1": {"serviceName": "frontend"}, "p3": {"serviceName": "srv-reservation"}},
+                     "spans": [span("a", "p1", "HTTP POST /reservation", 90_000),
+                               span("c", "p3", "/reservation.Reservation/MakeReservation", 80_000, "a")]})
+    return {"data": data}
+
+
+class FakeJaeger(BaseHTTPRequestHandler):
+    def do_GET(self):  # noqa: N802
+        if self.path.startswith("/api/services"):
+            reply = {"data": ["frontend", "srv-reservation", "jaeger-query"]}
+        elif self.path.startswith("/api/traces"):
+            reply = jaeger_reply()
+        else:
+            self.send_response(404)
+            self.end_headers()
+            return
+        data = json.dumps(reply).encode()
+        self.send_response(200)
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def log_message(self, *args):
+        pass
+
+
+class Rca(unittest.TestCase):
+    def tearDown(self):
+        os.environ["ZEROCTL_JAEGER"] = "off"
+        os.environ.pop("ZEROCTL_JAEGER_TRACES", None)
+        os.environ.pop("JAEGER_URL", None)
+
+    def test_with_gnn_localizes_starved_daemon(self):
+        result = rca.run_rca(with_rca(GNN))
+        self.assertEqual(result["localized"], ["svc0"])
+        self.assertEqual(result["method"], "GNN per-thread demand (gnn_v5.json)")
+        text = rca.format_rca(result)
+        self.assertIn("svc0  holds 1 cpus, needs 2.6 (p90 3, max 4), under-provisioned 92% of 500 ticks", text)
+        self.assertIn("STARVED", text)
+        self.assertIn("traces: Jaeger off", text)
+
+    def test_without_gnn_is_labelled_heuristic(self):
+        result = rca.run_rca(with_rca())
+        self.assertEqual(result["method"], "heuristic ring-load ranking (no GNN)")
+        self.assertIn("GNN: off (zeroctl.gnn false)", rca.format_rca(result))
+
+    def test_gnn_unavailable_reports_error(self):
+        gnn = {"enabled": True, "available": False, "model": "/x/models/gnn_v5.json", "error": "cannot read /x/models/gnn_v5.json"}
+        text = rca.format_rca(rca.run_rca(with_rca(gnn)))
+        self.assertIn("GNN: unavailable: cannot read /x/models/gnn_v5.json", text)
+        self.assertIn("heuristic ring-load ranking", text)
+
+    def test_old_state_without_rca(self):
+        self.assertIn("## Root cause analysis", zeroctl.build_prompt(STATE))
+
+    def test_mock_scales_starved_daemon(self):
+        state = with_rca(GNN)
+        doc = zeroctl.to_action(zeroctl.parse_docs(zeroctl.mock_reply(state, rca.run_rca(state))))
+        self.assertEqual((doc["action"], doc["workload"], doc["cpus"]), ("scale_out", "svc0", 3))
+        self.assertEqual(zeroctl.step(state, "mock")["action"], "scale_out")
+
+    def test_jaeger_auto_skips_without_jaeger(self):
+        os.environ.pop("ZEROCTL_JAEGER", None)
+        os.environ["JAEGER_URL"] = "http://127.0.0.1:9"  # discard port: refused
+        text = rca.format_rca(rca.run_rca(with_rca(GNN, "auto")))
+        self.assertIn("traces: skipped: no Jaeger, not a traced (DSB) workload", text)
+
+    def test_jaeger_explicit_url_unreachable_is_error(self):
+        os.environ.pop("ZEROCTL_JAEGER", None)
+        result = rca.run_rca(with_rca(None, "http://127.0.0.1:9"))
+        self.assertTrue(result["jaeger"]["status"].startswith("error: "))
+
+    def test_jaeger_replay_file(self):
+        os.environ.pop("ZEROCTL_JAEGER", None)
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as handle:
+            json.dump(jaeger_reply(), handle)
+        os.environ["ZEROCTL_JAEGER_TRACES"] = handle.name
+        try:
+            result = rca.run_rca(with_rca(GNN, "auto"))
+        finally:
+            os.unlink(handle.name)
+        self.assertEqual((result["jaeger"]["traces"], result["jaeger"]["anomalous"]), (36, 6))
+        self.assertEqual(result["jaeger"]["ranking"], [("srv-reservation", 6)])
+
+    def test_jaeger_http_api_with_reference(self):
+        os.environ.pop("ZEROCTL_JAEGER", None)
+        server = HTTPServer(("127.0.0.1", 0), FakeJaeger)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            state = with_rca(None, f"http://127.0.0.1:{server.server_port}")
+            result = rca.run_rca(state, {"reference": {"p95_ms": 20.0}})
+        finally:
+            server.shutdown()
+            server.server_close()
+        jaeger = result["jaeger"]
+        self.assertEqual(jaeger["status"], "ok")
+        self.assertEqual(jaeger["threshold_ms"], 20.0)
+        self.assertEqual(jaeger["ranking"], [("srv-reservation", 6)])
+        text = rca.format_rca(result)
+        self.assertIn("where the degradation shows, most affected first: srv-reservation (100%)", text)
+        self.assertIn("not infrabench's Isolation Forest", text)
+
+
 class Cli(unittest.TestCase):
     def test_stdin_stdout(self):
         with tempfile.TemporaryDirectory() as logs:
@@ -191,7 +328,7 @@ class Cli(unittest.TestCase):
                                  input=json.dumps(STATE), capture_output=True, text=True, check=True)
             self.assertEqual(json.loads(out.stdout.strip().splitlines()[-1])["action"], "move")
             names = sorted(p.name.split("-", 1)[1] for p in Path(logs).iterdir())
-            self.assertEqual(names, ["action.json", "prompt.txt", "response.txt"])
+            self.assertEqual(names, ["action.json", "prompt.txt", "rca.json", "response.txt"])
 
     def test_bad_state(self):
         out = subprocess.run([sys.executable, str(HERE / "zeroctl.py"), "--llm", "mock"], input="not json",

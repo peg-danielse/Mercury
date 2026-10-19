@@ -12,6 +12,12 @@ further change.
 ## Situation
 {situation}
 
+## Root cause analysis
+Run by Mercury before this prompt. Localization names the daemons that look like the source:
+with the GNN, the daemons whose predicted CPU demand exceeds their cpuset (STARVED); without it,
+a ring-load heuristic. Traces appear only for traced (DeathStarBench) workloads with Jaeger.
+{rca}
+
 ## CPU groups
 Groups nest socket > node > l3 > core. Each line: group, level, load over the last five
 1 s intervals (oldest first, busy share of the group's CPUs), allocatable CPUs, and the

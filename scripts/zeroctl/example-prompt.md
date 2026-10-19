@@ -1,6 +1,6 @@
 # Example zeroctl prompt (Mercury)
 
-Rendered from `example-state.json` with `python3 scripts/zeroctl/zeroctl.py --print-prompt --state scripts/zeroctl/example-state.json`. node.0 is saturated and holds both services; node.1 is nearly idle. An earlier move failed and is in History.
+Rendered from `example-state.json` with `python3 scripts/zeroctl/zeroctl.py --print-prompt --state scripts/zeroctl/example-state.json`. node.0 is saturated and holds both services; node.1 is nearly idle. An earlier move failed and is in History. The RCA section comes from `rca.py`: the GNN numbers are the `rca.gnn` block Mercury's sampler (`src/gnn_rca.cpp`, model `models/gnn_v5.json`) writes into the state; Jaeger is off because this is not a DSB workload. With Jaeger on a DSB workload a `traces:` line carries the longest-span blame ranking instead (see `test_zeroctl.py` `Rca`).
 
 ```text
 You operate a Linux server that runs one application as native daemons under Mercury,
@@ -17,6 +17,17 @@ further change.
 ## Situation
 application: mercury daemons svc0, svc1
 now: no latency measurement supplied
+
+## Root cause analysis
+Run by Mercury before this prompt. Localization names the daemons that look like the source:
+with the GNN, the daemons whose predicted CPU demand exceeds their cpuset (STARVED); without it,
+a ring-load heuristic. Traces appear only for traced (DeathStarBench) workloads with Jaeger.
+localization [GNN per-thread demand (gnn_v5.json)]: svc0
+GNN demand over the last 5 s (cores from FFD of predicted per-thread demand):
+  svc0  holds 1 cpus, needs 2.6 (p90 3, max 4), under-provisioned 92% of 500 ticks, predicted demand 2.31 cores, 33 threads  STARVED
+  svc1  holds 1 cpus, needs 1.0 (p90 1, max 1), under-provisioned 0% of 500 ticks, predicted demand 0.62 cores, 33 threads
+ring load (heuristic, busiest first): svc0 own cpus --, node.0 100%; svc1 own cpus --, node.0 100%
+traces: Jaeger off
 
 ## CPU groups
 Groups nest socket > node > l3 > core. Each line: group, level, load over the last five
@@ -66,5 +77,4 @@ node: <node group>          # move
 cpus: <1..7>               # scale_out
 component: <name>                   # degrade, restore
 reason: <one sentence>
-
 ```

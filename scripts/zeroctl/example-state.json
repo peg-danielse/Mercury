@@ -1,6 +1,24 @@
 {
-  "mercury_cpu": 0,
-  "allocatable": [
+ "mercury_cpu": 0,
+ "allocatable": [
+  1,
+  2,
+  3,
+  4,
+  5,
+  6,
+  7
+ ],
+ "interval_s": 1,
+ "move_level": "node",
+ "max_cpus": 7,
+ "groups": [
+  {
+   "name": "socket.0",
+   "level": "socket",
+   "parent": "",
+   "linux_cpus": [
+    0,
     1,
     2,
     3,
@@ -8,141 +26,159 @@
     5,
     6,
     7
-  ],
-  "interval_s": 1,
-  "move_level": "node",
-  "max_cpus": 7,
-  "groups": [
+   ],
+   "allocatable": 7,
+   "loads": [
+    0.5,
+    0.5,
+    0.5,
+    0.5,
+    0.5
+   ],
+   "daemons": [
+    "svc0",
+    "svc1"
+   ]
+  },
+  {
+   "name": "node.0",
+   "level": "node",
+   "parent": "socket.0",
+   "linux_cpus": [
+    0,
+    1,
+    2,
+    3
+   ],
+   "allocatable": 3,
+   "loads": [
+    0.9,
+    0.95,
+    0.97,
+    0.99,
+    1.0
+   ],
+   "daemons": [
+    "svc0",
+    "svc1"
+   ]
+  },
+  {
+   "name": "node.1",
+   "level": "node",
+   "parent": "socket.0",
+   "linux_cpus": [
+    4,
+    5,
+    6,
+    7
+   ],
+   "allocatable": 4,
+   "loads": [
+    0.1,
+    0.1,
+    null,
+    0.1,
+    0.12
+   ],
+   "daemons": []
+  }
+ ],
+ "daemons": [
+  {
+   "daemon_id": "svc0",
+   "exec_path": "/x/hello_server",
+   "cpus": [
+    1
+   ],
+   "groups": [
+    "socket.0",
+    "node.0"
+   ],
+   "scale": {
+    "enabled": false,
+    "min": 1,
+    "max": 16
+   },
+   "components": [
     {
-      "name": "socket.0",
-      "level": "socket",
-      "parent": "",
-      "linux_cpus": [
-        0,
-        1,
-        2,
-        3,
-        4,
-        5,
-        6,
-        7
-      ],
-      "allocatable": 7,
-      "loads": [
-        0.5,
-        0.5,
-        0.5,
-        0.5,
-        0.5
-      ],
-      "daemons": [
-        "svc0",
-        "svc1"
-      ]
+     "name": "extra",
+     "cost": 0.3,
+     "enabled": true
+    }
+   ]
+  },
+  {
+   "daemon_id": "svc1",
+   "exec_path": "/x/hello_server",
+   "cpus": [
+    2
+   ],
+   "groups": [
+    "socket.0",
+    "node.0"
+   ],
+   "scale": {
+    "enabled": false,
+    "min": 1,
+    "max": 16
+   },
+   "components": []
+  }
+ ],
+ "history": [
+  {
+   "at_seconds": 20,
+   "action": "move",
+   "workload": "svc1",
+   "node": "node.0",
+   "error": "svc1 already runs on node.0"
+  }
+ ],
+ "events": [
+  {
+   "tick": 4,
+   "policy": "shift",
+   "action": "move",
+   "daemon_id": "svc1",
+   "from": "node.1",
+   "to": "node.0"
+  }
+ ],
+ "rca": {
+  "gnn": {
+   "enabled": true,
+   "available": true,
+   "model": "/srv/Mercury/models/gnn_v5.json",
+   "error": "",
+   "tick_ms": 10,
+   "window_s": 5,
+   "daemons": [
+    {
+     "daemon_id": "svc0",
+     "cpus": 1,
+     "ticks": 500,
+     "required_mean": 2.6,
+     "required_max": 4,
+     "required_p90": 3,
+     "under_share": 0.92,
+     "pred_demand_mean": 2.31,
+     "threads_mean": 33
     },
     {
-      "name": "node.0",
-      "level": "node",
-      "parent": "socket.0",
-      "linux_cpus": [
-        0,
-        1,
-        2,
-        3
-      ],
-      "allocatable": 3,
-      "loads": [
-        0.9,
-        0.95,
-        0.97,
-        0.99,
-        1.0
-      ],
-      "daemons": [
-        "svc0",
-        "svc1"
-      ]
-    },
-    {
-      "name": "node.1",
-      "level": "node",
-      "parent": "socket.0",
-      "linux_cpus": [
-        4,
-        5,
-        6,
-        7
-      ],
-      "allocatable": 4,
-      "loads": [
-        0.1,
-        0.1,
-        null,
-        0.1,
-        0.12
-      ],
-      "daemons": []
+     "daemon_id": "svc1",
+     "cpus": 1,
+     "ticks": 500,
+     "required_mean": 1.0,
+     "required_max": 1,
+     "required_p90": 1,
+     "under_share": 0.0,
+     "pred_demand_mean": 0.62,
+     "threads_mean": 33
     }
-  ],
-  "daemons": [
-    {
-      "daemon_id": "svc0",
-      "exec_path": "/x/hello_server",
-      "cpus": [
-        1
-      ],
-      "groups": [
-        "socket.0",
-        "node.0"
-      ],
-      "scale": {
-        "enabled": false,
-        "min": 1,
-        "max": 16
-      },
-      "components": [
-        {
-          "name": "extra",
-          "cost": 0.3,
-          "enabled": true
-        }
-      ]
-    },
-    {
-      "daemon_id": "svc1",
-      "exec_path": "/x/hello_server",
-      "cpus": [
-        2
-      ],
-      "groups": [
-        "socket.0",
-        "node.0"
-      ],
-      "scale": {
-        "enabled": false,
-        "min": 1,
-        "max": 16
-      },
-      "components": []
-    }
-  ],
-  "history": [
-    {
-      "at_seconds": 20,
-      "action": "move",
-      "workload": "svc1",
-      "node": "node.0",
-      "error": "svc1 already runs on node.0"
-    }
-  ],
-  "events": [
-    {
-      "tick": 4,
-      "policy": "shift",
-      "action": "move",
-      "daemon_id": "svc1",
-      "from": "node.1",
-      "to": "node.0"
-    }
-  ]
+   ]
+  },
+  "jaeger": "off",
+  "application": ""
+ }
 }
