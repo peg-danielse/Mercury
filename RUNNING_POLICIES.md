@@ -16,7 +16,7 @@ infrabench-style results (one scored adaptation per policy arm).
 | `scale_out` | developed: 2 replicas, hostname pin kept | `/scale {"min":2,"max":2}` (saturate) plus `restrict.ceiling` = the group the daemon sits in, so the 2nd CPU comes from the same group |
 | `scale_out_spread` | developed: drop pin, 2 replicas | `/scale {"min":2,"max":2}` with no ceiling: 2nd CPU from the least-loaded core anywhere in the pool |
 | `combined` | developed: scale 0.80, move 0.85, degrade 0.90 | one document: `shift` `trigger: "either"` (`theta: 0.80`, `util: 0.85`) + `degrade` `limit: 0.90` |
-| `zeroctl` (ours) | LLM path in `adapt.py`; `decide()` raises NotImplementedError | **not ported.** The harness reports it as skipped |
+| `zeroctl` (ours) | LLM path in `adapt.py` + `rca/controller/llm/` | `zeroctl` document: Mercury calls the model step `scripts/zeroctl/zeroctl.py` every `every` seconds, validates the proposed action, and applies it (see "zeroctl" below) |
 | scale nodes, aggregate | planned (Baselines table / `policies.md`), no infrabench module | not built; documented only |
 | least allocated | planned, no infrabench module | pure `least_allocated()` decision in `src/policy.cpp` + test; the `widen` grant around it is **not built** (`POST /policies` with `widen` returns HTTP 501) |
 | tune app | planned, no infrabench module | built per `policies.md` (`tune.parameters` ladders, written to the policy file). Treat it as experimental: infrabench has no reference implementation to compare against |
@@ -106,6 +106,76 @@ scale_out,core,core.1,0,25730,53767,48872,55561,0.0,645,80.62,2,4
 scale_out_spread,core,core.1,0,49448,55666,71960,82864,0.0,440,55.0,2,4
 ```
 
+## zeroctl (LLM controller)
+
+Port of infrabench `--policy zeroctl` (`rca/controller/llm/{client,parse,prompts,situation,view}.py`,
+`scripts/generate.txt`, `example-prompt.md`).
+
+Design: Mercury (C++) owns the state, the validation, and the actuation. Every `every` seconds
+(`zeroctl_loop`, its own thread, one call in flight) it execs `MERCURY_ZEROCTL` with the worker state
+as JSON on stdin; the step renders the prompt, calls the model, parses the reply and prints one JSON
+action. Mercury checks it with `validate_zeroctl` (`src/policy.cpp`) and applies it. An illegal action,
+unparsable reply, missing key, HTTP error or a step that runs over 120 s is a no-op recorded as
+`FAILED` in the event log and in the History section of the next prompt. The step is Python stdlib
+only (no PyYAML, no SDK), so it runs on a bare server; TLS/HTTP stays out of the worker.
+
+Providers, same as infrabench `llm/client.py` (keys only from the environment; nothing is logged):
+
+| `--llm` | needs | optional |
+| --- | --- | --- |
+| `openai` | `OPENAI_API_KEY` | `OPENAI_MODEL` (default `gpt-4o-mini`), `OPENAI_BASE_URL` (default `https://api.openai.com/v1`; any OpenAI-compatible endpoint) |
+| `gemini` | `GEMINI_API_KEY` | `GEMINI_MODEL` (default `gemini-2.5-flash`), `GEMINI_BASE_URL`. The key goes in the `x-goog-api-key` header, not the URL |
+| `mock` | nothing | deterministic rule (move the busiest zeroctl daemon off a group above 75% to the least-loaded legal group, else degrade an optional component, else none). `ZEROCTL_MOCK_RESPONSE=<file>` replays raw model text instead |
+
+Prompt (`scripts/zeroctl/generate.txt`, same structure as infrabench `generate.txt`): Situation
+(p50/p95/errors/req/s now vs. the healthy reference, from `ZEROCTL_SITUATION_FILE` which the harness
+writes every 2 s), CPU groups (socket/node/l3/core with five 1 s loads, allocatable CPUs, daemons on
+each; cores are elided on hosts with more than 16 unless a daemon sits there), Daemons (cpuset, groups,
+scale limits, optional components with cost and state), recent policy events, History (earlier zeroctl
+steps, failed ones marked), Rules, Actions, Output schema. The action space is Mercury's:
+`move` (workload, node), `scale_out` (workload, cpus 1..N), `degrade`/`restore` (workload, component),
+`none`, `stop`. infrabench's Kubernetes-only actions (`add_worker`, requests/limits) are rejected.
+Validation rejects unknown daemons/groups, a move onto the daemon's own group, the wrong level, a
+group at 100% load or with too few allocatable CPUs, `cpus` out of range, and degrading a component
+that is not listed (critical) or already off. Every call leaves `<rings>/zeroctl/<stamp>-prompt.txt`,
+`-response.txt` and `-action.json`.
+
+Attach by hand (Mercury must have been started with `MERCURY_ZEROCTL`; otherwise HTTP 400 says so):
+
+```bash
+curl -s -XPOST localhost:18200/policies -d '{"daemon_id":"svc0","zeroctl":{"llm":"openai","every":10,"level":"node","components":[{"name":"extra","cost":0.3}]}}'
+```
+
+`zeroctl` fields: `llm` (`openai`|`gemini`|`mock`, default `openai`), `every` (2..3600 s, default 20),
+`level` (group level for `move`, default `node`), `components` (optional parts the model may degrade).
+All daemons with a zeroctl document share one prompt per call, as infrabench sends one prompt for the
+whole application.
+
+Run the zeroctl arm on the server (sudo drops the environment, so pass the key through explicitly):
+
+```bash
+export OPENAI_API_KEY=...            # or GEMINI_API_KEY=...; do not put it in a file in the repo
+sudo --preserve-env=OPENAI_API_KEY,OPENAI_MODEL,OPENAI_BASE_URL \
+  python3 scripts/policy_experiment.py --label zeroctl-$(date +%H%M) --arms none,zeroctl --hold 30 --measure 20
+# without a key, verify the whole path:
+sudo python3 scripts/policy_experiment.py --label zeroctl-mock --arms zeroctl --llm mock
+# render a prompt without calling anything:
+python3 scripts/zeroctl/zeroctl.py --print-prompt --state scripts/zeroctl/example-state.json
+```
+
+`--llm auto` (default) picks openai when `OPENAI_API_KEY` is visible, else gemini when `GEMINI_API_KEY`
+is, else the zeroctl arm is skipped with a message in `summary.csv`. `--zeroctl-every` (default 10 s)
+sets the call cadence; use `--hold 30` or more so a few calls land after the fault. zeroctl output:
+`output/<label>/zeroctl/rings/zeroctl/*` (prompts, replies, actions; root-owned) and its `applied`
+rows (`policy: zeroctl`, `status: applied|FAILED`, `error`) in `adaptations.jsonl`.
+
+Tests without a key: `ctest` runs `zeroctl_test` (prompt sections, parsing of fenced YAML/JSON/garbage,
+unknown actions, mock, OpenAI and Gemini request shapes against a local fake server, missing key) and
+the C++ `validate_zeroctl` checks in `policy_test`.
+
+Not ported: infrabench's `repair` script (re-asking after an apply failure); here the failure goes
+into History for the next call instead, which is what infrabench's zeroctl loop does too.
+
 ## Driving it by hand
 
 ```bash
@@ -119,7 +189,7 @@ curl -s localhost:18200/policies          # documents, interval loads, events
 curl -s -XPOST localhost:18200/policies -d '{"daemon_id":"svc"}'   # detach
 ```
 
-Document fields: `shift` (`true` or `{trigger: hotspot|mean|either, util, theta, level}`),
+Document fields: `zeroctl` (above), `shift` (`true` or `{trigger: hotspot|mean|either, util, theta, level}`),
 `restrict` (`{level, ceiling}`), `degrade` (`{components:[{name,cost}], limit, level}`),
 `tune` (`{parameters:[{name, values:[...]}], limit}`), `exec_path`. Unknown fields are
 HTTP 400; `widen` is HTTP 501.

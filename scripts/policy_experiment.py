@@ -62,13 +62,14 @@ def percentile(values: list[float], pct: float) -> float:
 
 
 class Mercury:
-    def __init__(self, binary: Path, port: int, cpus: list[int] | None, rings: Path, log: Path):
+    def __init__(self, binary: Path, port: int, cpus: list[int] | None, rings: Path, log: Path,
+                 extra_env: dict[str, str] | None = None):
         self.port = port
         self.rings = rings
         if rings.exists():
             shutil.rmtree(rings)
         rings.mkdir(parents=True)
-        env = dict(os.environ, MERCURY_RINGS=str(rings))
+        env = dict(os.environ, MERCURY_RINGS=str(rings), **(extra_env or {}))
         args = [str(binary), str(port)] + [str(c) for c in (cpus or [])]
         self.log_handle = open(log, "w")
         self.proc = subprocess.Popen(args, stdout=self.log_handle, stderr=subprocess.STDOUT, env=env)
@@ -203,7 +204,8 @@ def service_cpus(mapping: dict, svc: str) -> list[int]:
     return []
 
 
-def arm_documents(arm: str, svc: str, level: str, ceiling: str) -> tuple[dict | None, dict | None]:
+def arm_documents(arm: str, svc: str, level: str, ceiling: str, llm: str = "mock",
+                  every: int = 10) -> tuple[dict | None, dict | None]:
     """(policies document, scale document) for one service, per arm."""
     if arm == "none":
         return None, None
@@ -229,7 +231,39 @@ def arm_documents(arm: str, svc: str, level: str, ceiling: str) -> tuple[dict | 
             "shift": {"trigger": "either", "theta": 0.80, "util": 0.85, "level": level},
             "degrade": {"limit": 0.90, "level": level, "components": [{"name": "extra", "cost": EXTRA_COST}]},
         }, None
+    if arm == "zeroctl":
+        # infrabench --policy zeroctl: the model picks one cross-layer action per call.
+        return {"daemon_id": svc, "zeroctl": {"llm": llm, "every": every, "level": level,
+                                              "components": [{"name": "extra", "cost": EXTRA_COST}]}}, None
     raise ValueError(arm)
+
+
+def resolve_llm(wanted: str) -> str:
+    """auto: openai when OPENAI_API_KEY is set, else gemini when GEMINI_API_KEY is set, else none."""
+    if wanted != "auto":
+        return wanted
+    if os.environ.get("OPENAI_API_KEY"):
+        return "openai"
+    if os.environ.get("GEMINI_API_KEY"):
+        return "gemini"
+    return "none"
+
+
+def write_situation(path: Path, load: "Load", reference: dict, seconds: int) -> None:
+    now_end = time.monotonic()
+    now = load.window(now_end - seconds, now_end)
+    doc = {
+        "application": "hello_server services under Mercury",
+        "now": {"seconds": seconds, "requests": now["latency_traces"], "p50_ms": round(now["p50_us"] / 1000, 1),
+                "p95_ms": round(now["p95_us"] / 1000, 1), "error_rate": now["error_rate"],
+                "requests_per_s": now["throughput_rps"]},
+        "reference": {"p50_ms": round(reference["p50_us"] / 1000, 1), "p95_ms": round(reference["p95_us"] / 1000, 1),
+                      "error_rate": reference["error_rate"], "requests_per_s": reference["throughput_rps"]},
+        "load": "closed-loop /cpu clients, steady",
+    }
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(doc) + "\n")
+    tmp.replace(path)
 
 
 def cost(mapping: dict, services: list[str]) -> dict:
@@ -240,15 +274,21 @@ def cost(mapping: dict, services: list[str]) -> dict:
 def run_arm(arm: str, args, out_root: Path) -> dict:
     out_dir = out_root / arm
     out_dir.mkdir(parents=True, exist_ok=True)
+    extra_env: dict[str, str] = {}
+    llm = resolve_llm(args.llm)
+    situation_file = out_dir / "situation.json"
     if arm == "zeroctl":
-        row = {"policy": arm, "skipped": "zeroctl is the LLM-driven proposed controller in infrabench "
-               "(rca/controller/llm); it is not ported to Mercury on this branch"}
-        (out_dir / "last_adaptation.json").write_text(json.dumps(row, indent=2) + "\n")
-        print(f"[{arm}] skipped")
-        return row
+        if llm == "none":
+            row = {"policy": arm, "skipped": "zeroctl needs a model: set OPENAI_API_KEY or GEMINI_API_KEY "
+                   "(and pass it through sudo with --preserve-env), or use --llm mock"}
+            (out_dir / "last_adaptation.json").write_text(json.dumps(row, indent=2) + "\n")
+            print(f"[{arm}] skipped: {row['skipped']}")
+            return row
+        extra_env["MERCURY_ZEROCTL"] = str(REPO / "scripts" / "zeroctl" / "zeroctl.py")
+        extra_env["ZEROCTL_SITUATION_FILE"] = str(situation_file)
 
     build = Path(args.build).resolve()
-    mercury = Mercury(build / "mercury", args.port, args.cpus, out_dir / "rings", out_dir / "mercury.log")
+    mercury = Mercury(build / "mercury", args.port, args.cpus, out_dir / "rings", out_dir / "mercury.log", extra_env)
     services = [f"svc{i}" for i in range(args.services)]
     started = list(services)
     load = None
@@ -276,7 +316,7 @@ def run_arm(arm: str, args, out_root: Path) -> dict:
         mapping = mercury.get("/map")
         cost_before = cost(mapping, services)
         for svc in services:
-            policies, scale = arm_documents(arm, svc, level, ceiling)
+            policies, scale = arm_documents(arm, svc, level, ceiling, llm, args.zeroctl_every)
             if policies is not None:
                 mercury.post("/policies", policies)
             if scale is not None:
@@ -296,7 +336,12 @@ def run_arm(arm: str, args, out_root: Path) -> dict:
         started.append("inject")
         mercury.post("/cpus", {"daemon_id": "inject", "cpus": ",".join(str(c) for c in victim_cpus)})
         print(f"[{arm}] inject burn x{burn_threads} on {victim['name']}; hold {args.hold}s, score {args.measure}s")
-        time.sleep(args.hold + args.measure)
+        reference = load.window(max(t0, t_inject - args.measure), t_inject)
+        deadline = time.monotonic() + args.hold + args.measure
+        while time.monotonic() < deadline:
+            if arm == "zeroctl":
+                write_situation(situation_file, load, reference, 10)
+            time.sleep(min(2.0, max(deadline - time.monotonic(), 0)))
         t_end = time.monotonic()
         baseline = load.window(max(t0, t_inject - args.measure), t_inject)
         score = load.window(t_end - args.measure, t_end)
@@ -307,6 +352,7 @@ def run_arm(arm: str, args, out_root: Path) -> dict:
         row = {
             "policy": arm,
             "mercury_level": level,
+            "llm": llm if arm == "zeroctl" else None,
             "victim": victim["name"],
             "applied": applied,
             "errors": [],
@@ -350,6 +396,9 @@ def main() -> int:
                         help="group level shift moves between; auto = node when the host has 2+ NUMA nodes")
     parser.add_argument("--victim", default=None, help="group name to inject on (default: first usable group)")
     parser.add_argument("--burn-threads", type=int, default=0, help="default: 2 x victim CPUs")
+    parser.add_argument("--llm", default="auto", choices=("auto", "openai", "gemini", "mock", "none"),
+                        help="zeroctl model: auto = openai if OPENAI_API_KEY, gemini if GEMINI_API_KEY, else skip")
+    parser.add_argument("--zeroctl-every", type=int, default=10, help="seconds between zeroctl model calls")
     parser.add_argument("--warmup", type=int, default=15)
     parser.add_argument("--hold", type=int, default=15, help="stabilize seconds after inject before scoring")
     parser.add_argument("--measure", type=int, default=20, help="score window seconds")
