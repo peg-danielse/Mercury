@@ -2,6 +2,7 @@
 
 #include "counters.hpp"
 #include "http.hpp"
+#include "gnn_rca.hpp"
 #include "json.hpp"
 #include "policy.hpp"
 #include "resources.hpp"
@@ -1974,6 +1975,12 @@ struct PolicyDoc {
   int zeroctl_every = 20;
   std::string zeroctl_llm = "openai";
   std::string zeroctl_level = "node";
+  // RCA step before the prompt (RUNNING_POLICIES.md "zeroctl RCA"). gnn: the per-thread demand model
+  // observes this daemon (observe only). jaeger: "auto" (probe JAEGER_URL / the url, skip when absent),
+  // "off", or a Jaeger query base URL; only DeathStarBench-style traced workloads have one.
+  bool zeroctl_gnn = true;
+  std::string zeroctl_jaeger = "auto";
+  std::string zeroctl_application;
   std::int64_t attached_tick = 0;
   std::int64_t shifted_tick = -1000000;
   std::int64_t degrade_tick = -1000000;
@@ -2268,6 +2275,25 @@ std::string parse_policy_doc(const JsonValue& body, PolicyDoc& doc, bool& empty)
             return "zeroctl.level must be socket, node, l3, or core";
           }
           doc.zeroctl_level = value.text;
+        } else if (key == "gnn") {
+          if (!value.is_bool()) {
+            return "zeroctl.gnn must be true or false";
+          }
+          doc.zeroctl_gnn = value.boolean;
+        } else if (key == "jaeger") {
+          if (value.is_bool()) {
+            doc.zeroctl_jaeger = value.boolean ? "auto" : "off";
+          } else if (value.is_string() && (value.text == "auto" || value.text == "off" ||
+                                           value.text.rfind("http://", 0) == 0 || value.text.rfind("https://", 0) == 0)) {
+            doc.zeroctl_jaeger = value.text;
+          } else {
+            return "zeroctl.jaeger must be \"auto\", \"off\", true, false, or an http(s) URL";
+          }
+        } else if (key == "application") {
+          if (!value.is_string() || value.text.size() > 64) {
+            return "zeroctl.application must be a short string (e.g. hotel, social)";
+          }
+          doc.zeroctl_application = value.text;
         } else if (key == "components") {
           if (doc.degrade) {
             return "list optional components in degrade or in zeroctl, not both";
@@ -3017,6 +3043,8 @@ struct ZeroctlRound {
   std::map<std::string, std::vector<int>> group_cpus;
   std::vector<int> allocatable;
   std::string llm;
+  std::string jaeger = "auto";
+  std::string application;
 };
 
 ZeroctlRound zeroctl_state(const std::map<std::string, PolicyDoc>& docs) {
@@ -3043,6 +3071,12 @@ ZeroctlRound zeroctl_state(const std::map<std::string, PolicyDoc>& docs) {
     round.pids[daemon_id] = doc.pid;
     round.view.move_level = doc.zeroctl_level;
     round.llm = doc.zeroctl_llm;
+    if (doc.zeroctl_jaeger != "auto") {
+      round.jaeger = doc.zeroctl_jaeger;
+    }
+    if (!doc.zeroctl_application.empty()) {
+      round.application = doc.zeroctl_application;
+    }
   }
   round.view.max_cpus = std::max(1, std::min<int>(kDefaultMaxCores, static_cast<int>(round.allocatable.size())));
   std::ostringstream out;
@@ -3110,7 +3144,9 @@ ZeroctlRound zeroctl_state(const std::map<std::string, PolicyDoc>& docs) {
     }
     out << "]}";
   }
-  out << "],\"history\":" << json_list(history) << ",\"events\":" << json_list(events) << '}';
+  out << "],\"history\":" << json_list(history) << ",\"events\":" << json_list(events)
+      << ",\"rca\":{\"gnn\":" << gnn_rca_json() << ",\"jaeger\":\"" << json_escape(round.jaeger)
+      << "\",\"application\":\"" << json_escape(round.application) << "\"}}";
   round.state = out.str();
   return round;
 }
@@ -3308,13 +3344,25 @@ void zeroctl_loop() {
     std::this_thread::sleep_for(std::chrono::seconds(1));
     int every = 0;
     std::int64_t attached_ms = 0;
+    std::set<std::string> observe;
     {
       std::lock_guard lock(policies_mu);
-      for (const auto& [_, doc] : policy_docs) {
+      for (const auto& [daemon_id, doc] : policy_docs) {
         if (doc.zeroctl && (every == 0 || doc.zeroctl_every < every)) {
           every = doc.zeroctl_every;
         }
+        if (doc.zeroctl && doc.zeroctl_gnn) {
+          observe.insert(daemon_id);
+        }
       }
+    }
+    {
+      GnnRcaConfig config;
+      config.max_cpus = std::max(1, std::min<int>(kDefaultMaxCores, static_cast<int>(allocatable_cpus().size())));
+      gnn_rca_track(observe, config);  // observe-only; starts or stops the sampler
+    }
+    {
+      std::lock_guard lock(policies_mu);
       if (every == 0) {
         zeroctl_started_ms = 0;
         continue;
