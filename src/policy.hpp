@@ -2,7 +2,10 @@
 
 #include "ring.hpp"
 
+#include <cstddef>
+#include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -40,3 +43,98 @@ class SaturatePolicy : public Policy {
 };
 
 std::shared_ptr<Policy> make_policy(const std::string& name);
+
+// ---------------------------------------------------------------------------
+// Resource and application policies (policies.md). Pure decisions only: the
+// loop that feeds them lives with the daemon table in src/daemons.cpp.
+//
+// These are the Mercury forms of the infrabench rca/controller baselines:
+//   reactive_move    -> shift, hotspot trigger (3 of the last 5 intervals > 0.75)
+//   scale_nodes_ind  -> shift, mean trigger (mean of the last 5 intervals > 0.80)
+//   degrade_optional -> degrade (brownout on operator-listed optional components)
+//   scale_out        -> saturate with min = max = 2 inside the current NUMA node
+//   scale_out_spread -> saturate with min = max = 2 anywhere in the pool
+//   combined         -> one daemon with shift + degrade at staggered thresholds
+// ---------------------------------------------------------------------------
+
+// Five 1 s intervals stand in for the 75 s Prometheus window; the group ring holds 60 s.
+inline constexpr int kPolicyIntervals = 5;
+inline constexpr std::int64_t kIntervalNs = 1000000000LL;
+inline constexpr double kHotspotUtil = 0.75;  // reactive_move HOTSPOT_UTIL
+inline constexpr int kHotspotHits = 3;        // reactive_move HOTSPOT_HITS
+inline constexpr double kNodeTheta = 0.80;    // scale_nodes_ind THETA
+inline constexpr double kDegradeLimit = 0.80; // degrade_optional UTIL_LIMIT
+
+// One load per 1 s interval, oldest first. nullopt is an interval with no samples.
+using IntervalLoads = std::vector<std::optional<double>>;
+
+// Bucket ring samples into count 1 s intervals ending at end_ns (exclusive of older data).
+// Load is busy / (busy + idle + iowait) over the samples in that interval, the same ratio as load_of.
+IntervalLoads interval_loads(const std::vector<std::string>& names, const std::vector<Sample>& samples,
+                             std::int64_t end_ns, int count = kPolicyIntervals);
+
+// Sandpiper hotspot test: at least hits of the last kPolicyIntervals loads above util.
+// Fewer than kPolicyIntervals present intervals is cold.
+bool node_hot(const IntervalLoads& loads, double util = kHotspotUtil, int hits = kHotspotHits);
+
+// scale_nodes_ind test: the mean of all kPolicyIntervals loads is above theta. A missing interval is cold.
+bool node_overloaded(const IntervalLoads& loads, double theta = kNodeTheta);
+
+enum class ShiftTrigger { Hotspot, Mean, Either };
+
+struct ShiftRule {
+  ShiftTrigger trigger = ShiftTrigger::Hotspot;
+  double hot_util = kHotspotUtil;
+  double mean_theta = kNodeTheta;
+};
+
+bool shift_triggered(const IntervalLoads& loads, const ShiftRule& rule);
+
+// A NUMA node a shift may land on.
+struct NodeCandidate {
+  std::string name;
+  double load = 0;      // latest interval load
+  int lowest_cpu = 0;   // tie break, as in least_loaded
+  bool hot = false;
+  bool inside_ceiling = true;
+  int allocatable = 0;  // allocatable CPUs on that node
+};
+
+// Lowest-load legal node other than source that can hold need_cpus. Equal load keeps the lower CPU.
+std::optional<std::string> shift_destination(const std::string& source, const std::vector<NodeCandidate>& nodes,
+                                             int need_cpus);
+
+// least_allocated (planned in infrabench, specified in policies.md). The group with the highest share of
+// allocatable CPUs that no running daemon holds; ties keep lower load, then lower CPU.
+struct GroupCandidate {
+  std::string name;
+  int allocatable = 0;
+  int unallocated = 0;
+  double load = 0;
+  int lowest_cpu = 0;
+};
+
+std::optional<std::string> least_allocated(const std::vector<GroupCandidate>& groups);
+
+struct DegradeComponent {
+  std::string name;
+  double cost = 0;  // operator's fraction in (0, 1]
+  bool enabled = true;
+};
+
+// One brownout step. Disables the costliest enabled component while U - cost(disabled) > limit,
+// using the latest interval. Re-enables the cheapest disabled component when all five intervals
+// stay at or below limit with its cost added back. Returns the index that changed.
+std::optional<std::size_t> degrade_step(std::vector<DegradeComponent>& components, const IntervalLoads& loads,
+                                        double limit = kDegradeLimit);
+
+struct TuneParameter {
+  std::string name;
+  std::vector<std::string> values;  // smallest footprint first, at least two
+  std::size_t index = 0;            // starts at values.size() - 1
+};
+
+// One ladder step. Toward the front while the latest U > limit or anything is degraded; toward the
+// end while all five intervals are at or below limit and nothing is degraded. Returns the index moved.
+std::optional<std::size_t> tune_step(std::vector<TuneParameter>& parameters, const IntervalLoads& loads,
+                                     bool degraded, double limit = kDegradeLimit);
