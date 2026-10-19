@@ -1962,6 +1962,8 @@ struct PolicyDoc {
   std::vector<int> ceiling_cpus;  // sorted; empty means no ceiling
   bool degrade = false;
   double degrade_limit = kDegradeLimit;
+  // Group level U is read from when no ceiling is set. policies.md uses the NUMA node.
+  ResourceLevel degrade_level = ResourceLevel::Node;
   std::vector<DegradeComponent> components;
   bool tune = false;
   double tune_limit = kDegradeLimit;
@@ -2081,6 +2083,22 @@ std::vector<int> cpus_outside(const std::vector<int>& cpus, const std::vector<in
   return out;
 }
 
+std::optional<ResourceLevel> parse_level(const std::string& text) {
+  if (text == "socket") {
+    return ResourceLevel::Socket;
+  }
+  if (text == "node") {
+    return ResourceLevel::Node;
+  }
+  if (text == "l3") {
+    return ResourceLevel::L3;
+  }
+  if (text == "core") {
+    return ResourceLevel::Core;
+  }
+  return std::nullopt;
+}
+
 bool fraction(const JsonValue* value, double& out, bool allow_one_plus = false) {
   if (value == nullptr) {
     return true;
@@ -2190,6 +2208,12 @@ std::string parse_policy_doc(const JsonValue& body, PolicyDoc& doc, bool& empty)
         if (!fraction(&value, doc.degrade_limit)) {
           return "degrade.limit must be in (0, 1]";
         }
+      } else if (key == "level") {
+        const auto level = value.is_string() ? parse_level(value.text) : std::nullopt;
+        if (!level) {
+          return "degrade.level must be socket, node, l3, or core";
+        }
+        doc.degrade_level = *level;
       } else if (key == "components") {
         if (!value.is_array()) {
           return "degrade.components must be a list";
@@ -2593,9 +2617,9 @@ void policy_pass(const std::vector<ResourceGroupInfo>& tree, const std::vector<i
     if (!doc.ceiling.empty()) {
       parts.push_back(&loads_of(doc.ceiling));
     } else {
-      for (const auto* node : nodes) {
-        if (!cpus_inside(cpusets[daemon_id], node->linux_cpus).empty()) {
-          parts.push_back(&loads_of(node->name));
+      for (const auto& group : tree) {
+        if (group.level == doc.degrade_level && !cpus_inside(cpusets[daemon_id], group.linux_cpus).empty()) {
+          parts.push_back(&loads_of(group.name));
         }
       }
     }
