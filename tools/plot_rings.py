@@ -11,7 +11,9 @@ after 2026-10-19, the cpuset size ("cores"). Plotted per daemon:
   pressure  pressure / gap: share of the gap in which at least one thread waited for a CPU
             (unmet demand; it does not say how many threads waited)
 The top panel sums used and cores over the daemons on one 10 ms grid. Archives can hold several
-runs (Mercury appends); only the run that holds the newest sample is used, cut at gaps over 2 s.
+runs (Mercury appends); only the run that holds the newest sample is used, cut at gaps over
+--run-gap (10 s: a /kill pauses every daemon's sampling for up to about 2.5 s, runs are further apart),
+or exactly the samples between --since-ns and --until-ns (CLOCK_MONOTONIC, as dsb_ab.sh passes them).
 Prints, per daemon: core-seconds allocated and used, utilisation, and the share of time under
 pressure (>= 0.10, saturate's add threshold) while every allocated core was busy (>= 0.85).
 """
@@ -26,7 +28,7 @@ import numpy as np
 MAGIC = b"MRING1\0\0"
 HEADER = 40
 STEP_NS = 10_000_000
-RUN_GAP_NS = 2_000_000_000
+RUN_GAP_NS = 10_000_000_000
 
 
 def read_mring(path):
@@ -48,9 +50,9 @@ def read_mring(path):
     return names, ts, {name: values[:, i] for i, name in enumerate(names)}
 
 
-def last_run(ts):
+def last_run(ts, gap_ns):
     """Index range of the run holding the newest sample."""
-    breaks = np.flatnonzero(np.diff(ts) > RUN_GAP_NS)
+    breaks = np.flatnonzero(np.diff(ts) > gap_ns)
     start = int(breaks[-1]) + 1 if len(breaks) else 0
     return start, len(ts)
 
@@ -74,13 +76,19 @@ def on_grid(idx, values, n):
     return np.nan_to_num(filled)
 
 
-def load(rings_dir, prefix):
+def load(rings_dir, prefix, gap_ns, since_ns=None, until_ns=None):
     daemons = {}
     for path in sorted(glob.glob(os.path.join(rings_dir, prefix + "*.mring"))):
         names, ts, cols = read_mring(path)
         if len(ts) < 2:
             continue
-        lo, hi = last_run(ts)
+        if since_ns is not None or until_ns is not None:
+            keep = np.flatnonzero((ts >= (since_ns or 0)) & (ts <= (until_ns or np.iinfo(np.int64).max)))
+            if len(keep) < 2:
+                continue
+            lo, hi = int(keep[0]), int(keep[-1]) + 1
+        else:
+            lo, hi = last_run(ts, gap_ns)
         daemons[os.path.basename(path)[:-len(".mring")]] = (names, ts[lo:hi], {k: v[lo:hi] for k, v in cols.items()})
     return daemons
 
@@ -94,14 +102,18 @@ def main():
     ap.add_argument("--smooth", type=float, default=0, help="moving mean in ms (0: raw 10 ms samples)")
     ap.add_argument("--out", default=None, help="PNG path (default RINGS_DIR/alloc_vs_use.png)")
     ap.add_argument("--show", action="store_true", help="open an interactive window to zoom in")
+    ap.add_argument("--run-gap", type=float, default=RUN_GAP_NS / 1e9, help="seconds without samples that separate runs")
+    ap.add_argument("--since-ns", type=int, default=None, help="only samples at or after this CLOCK_MONOTONIC ns")
+    ap.add_argument("--until-ns", type=int, default=None, help="only samples at or before this CLOCK_MONOTONIC ns")
     args = ap.parse_args()
 
-    daemons = load(args.rings_dir, args.prefix)
+    gap_ns = int(args.run_gap * 1e9)
+    daemons = load(args.rings_dir, args.prefix, gap_ns, args.since_ns, args.until_ns)
     if not daemons:
         sys.exit(f"no {args.prefix}*.mring with samples in {args.rings_dir}")
     # The window is the newest run; daemons from older runs (ending before it starts) are dropped.
     end = max(ts[-1] for _, ts, _ in daemons.values())
-    start = min(ts[0] for _, ts, _ in daemons.values() if ts[-1] > end - RUN_GAP_NS * 30)
+    start = min(ts[0] for _, ts, _ in daemons.values() if ts[-1] > end - gap_ns)
     daemons = {d: v for d, v in daemons.items() if v[1][-1] >= start}
     t_from = start + int((args.t_from or 0) * 1e9)
     t_to = start + int(args.t_to * 1e9) if args.t_to is not None else end

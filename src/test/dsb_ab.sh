@@ -67,8 +67,10 @@ for r in $(seq 1 $REPS); do for pol in ${POLICIES:-saturate gnn}; do
         taskset -c $TRACE_CPUS sudo -n $M/build/threadtrace $d --interval-ms $iv --duration-s 900 --out $D/trace-$d.jsonl 2>/dev/null & done; wait ) &
   fi
   echo "$(date +%T) run $r $NAME"
+  T0=$(python3 -c 'import time; print(time.monotonic_ns())')
   (cd $WD && taskset -c $OP_CPU $OP -mercury 127.0.0.1:$PORT -cpu 2 -gen-cpu $GEN_CPU -client mercury $PARGS -placement least_loaded -gen-out $D/loadgen.out $EXTRA ${SVC_ARGS:-} autoscale) > $D/operate.out 2> $D/operate.err
   echo "  operator exit $? routes=$(grep -c ^route $D/operate.out)"
+  T1=$(python3 -c 'import time; print(time.monotonic_ns())')
   kill $SPID; SPID=""
   if [ -n "${MPID:-}" ]; then
     sudo -n kill -TERM $MPID; for i in $(seq 50); do kill -0 $MPID 2>/dev/null || break; sleep 0.2; done; MPID=""
@@ -78,7 +80,7 @@ for r in $(seq 1 $REPS); do for pol in ${POLICIES:-saturate gnn}; do
   # The external mercury appends every run to the same archives; plot_rings.py keeps the newest run.
   [ -n "${EXTERNAL:-}" ] && { mkdir -p $D/rings; sudo -n cp $XRINGS/$PFX*.mring $D/rings/ 2>/dev/null; sudo -n chown -R $(id -u):$(id -g) $D/rings; }
   # 10 ms cores-vs-use per daemon from this run's ring archives (tools/plot_rings.py).
-  python3 $M/tools/plot_rings.py $D/rings --prefix $PFX --out $D/alloc_vs_use.png > $D/alloc_vs_use.txt 2>&1 \
+  python3 $M/tools/plot_rings.py $D/rings --prefix $PFX --since-ns $T0 --until-ns $T1 --out $D/alloc_vs_use.png > $D/alloc_vs_use.txt 2>&1 \
     && echo "  $(tail -1 $D/alloc_vs_use.txt)"
   echo "  numa_balancing=$(cat /proc/sys/kernel/numa_balancing)"
   sleep 3
