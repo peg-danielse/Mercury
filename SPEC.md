@@ -149,11 +149,11 @@ Shutdown: a normal return from `main` (including an exception, such as a port th
 
 Files: `src/http.cpp`, `src/http.hpp`.
 
-`serve` calls `listen_on`, which binds `127.0.0.1` with backlog 16, then `serve_fd`. `serve_fd` accepts one connection and calls `handle_client` on the same thread. `handle_client` calls `read_request`, then the `route` function, then `send_all`, then closes the socket. `read_request` stops at 64 KiB. `request_target` and `http_target` parse the request line.
+`serve` binds `127.0.0.1` with backlog 16, accepts one connection and calls `handle_client` on the same thread. `handle_client` calls `read_request`, then the `route` function, then `send_all`, then closes the socket. `read_request` stops at 64 KiB. `request_target` and `http_target` parse the request line.
 
 This accept thread is a control-flow section. `launch`, `migrate_route`, and `kill_route` run inside it, so a placement wait, a cpuset wait, or a kill wait delays the next request. No second route runs until `handle_client` returns.
 
-`Arrivals` and `Arrivals::mu` count requests inside `handle_client`. `/arrivals` reads that count. Daemon routes do not take this lock. `ping_route` answers `ping` and `GET /ping`. `relay_route` and `ping_reply` belong to the hello-server relay and are not on the `mercury` route list.
+`ping_route` answers `ping` and `GET /ping` with `pong`. (The `/arrivals` request counter and the hello-server relay were removed with their tests on 2026-10-19.)
 
 ### Daemon table
 
@@ -274,7 +274,7 @@ Phase 1 is built. It records the controller's inputs and ground-truth labels. On
   - keeps the cgroup files and each thread's `/proc/<tid>/stat` and `schedstat` open and re-reads them with `pread` at offset 0 (5 fds per thread: 3 perf + 2 proc). The first version opened an `ifstream` per read and cost about 100 µs per thread.
   - reports its own cost as `read_ns` per tick. On dtn-01 at a 10 ms tick, median (p99): 2 threads 0.41 ms (0.46), 8: 0.60 (0.62), 16: 0.86 (0.88), 32: 1.40 (1.42), 64: 2.47 (2.51), 128: 5.4 (5.5), 256: 6.3 (6.4) ms. A new thread's first tick also opens its perf group and proc files, so the first tick of a fresh daemon takes 25-80 ms. The 10 ms interval holds (median 10.00 ms) up to 128 threads; at 256 threads with the earlier reader it slipped to 13.9 ms.
   - keeps only the previous value of each counter and returns deltas. Perf groups are capped at `max_perf_threads` (3 fds each); past the cap, or when `perf_event_open` fails (for example `EMFILE`), a thread is read from schedstat only, with `perf` false. `raise_nofile_limit` lifts the soft fd limit to the hard limit.
-- `open_software(pid)` is new in `src/counters.{hpp,cpp}`. `open_counters` and `open_clock` are unchanged.
+- `open_software(pid)` is new in `src/counters.{hpp,cpp}`. It is now the only opener there: `open_counters` (hardware group with a software fallback) and `open_clock` were never called and were removed on 2026-10-19.
 - `threadtrace` (`src/threadtrace.cpp`, `build/threadtrace`) is a standalone recorder that attaches to a running daemon's cgroup. It needs root (Mercury daemons run as root). Usage: `threadtrace <daemon_id | cgroup dir> [--interval-ms 1000] [--duration-s 0] [--out FILE] [--max-perf 1024] [--format jsonl|csv]`. A bare `daemon_id` means `/sys/fs/cgroup/mercury/<daemon_id>`. Ticks are on absolute `CLOCK_MONOTONIC` deadlines. It stops at the duration, when the cgroup disappears, or on SIGINT/SIGTERM.
   - JSONL: one object per tick: `ts_ns`, `tick`, `interval_ns`, `cgroup{cpu_ok, usage_ns, user_ns, system_ns, psi, some_ns, full_ns, cpuset_cpus, cpuset}`, `exited`, `perf_open`, `read_ns`, `threads[{tid, comm, fresh, perf, task_clock_ns, context_switches, cpu_migrations, run_ns, wait_ns, timeslices, cpu, node}]`.
   - CSV: one row per thread per tick, the same fields, with the cgroup values repeated.
@@ -497,8 +497,7 @@ The `gnn` policy is built and selectable per daemon through `/scale`.`/scale` pi
 
 ### Code facts this design depends on
 
-- `src/counters.cpp` has `open_counters` and `open_clock`, but nothing in `daemons.cpp` calls them; the record keeps no per-thread rings. Phase 1 added `open_software` (the software trio as one group), used only by `threadstat`/`threadtrace`, not by `mercury`.
-- `open_counters` opens the hardware group first and the software group (`task-clock`, `page-faults`, `context-switches`, `cpu-migrations`) only as a fallback. When the hardware group is used, `task-clock` is a separate fd outside the group. `kMaxCounters` is 8.
+- `src/counters.cpp` has one opener, `open_software` (the software trio as one group), used by `threadstat`, so by `threadtrace` and the gnn controller in `mercury`. The daemon record keeps no per-thread rings. `kMaxCounters` is 8.
 - `sched_setaffinity` is used by `pin_to` (the worker CPU, `src/mercury.cpp`), `pin_pid`, the pin or `widen_to_online` in the start child (`src/daemons.cpp`), and since phase 1b by `GnnController` (per-tid pins and the all-CPU reset, `src/gnn.cpp`).
 
 ### Proposed: phase 2, NUMA/memory-aware scaling for distributed memory demand
@@ -507,7 +506,7 @@ The `gnn` policy is built and selectable per daemon through `/scale`.`/scale` pi
 
 Candidate signals, and what dtn-01 actually exposes (checked on 2026-10-17: AMD EPYC 7301, 8 NUMA nodes of 4 cores/8 CPUs, kernel 6.12.107+deb13-amd64; `perf` is not installed, so this is from sysfs):
 
-- Core PMU (`cpu`, perf type 4): `cpu-cycles`, `instructions`, `cache-references`, `cache-misses`, `branch-*`, `stalled-cycles-frontend/backend`, plus raw events (`event` config:0-7,32-35, `umask` 8-15, `cmask`, `edge`, `inv`). These are per thread, through the same `open_group` path. `open_counters`' hardware group already opens most of them. Miss rate per instruction is a locality proxy.
+- Core PMU (`cpu`, perf type 4): `cpu-cycles`, `instructions`, `cache-references`, `cache-misses`, `branch-*`, `stalled-cycles-frontend/backend`, plus raw events (`event` config:0-7,32-35, `umask` 8-15, `cmask`, `edge`, `inv`). These are per thread, through the same `open_group` path (the removed `open_counters` opened most of them as a hardware group; it is in git history). Miss rate per instruction is a locality proxy.
 - `amd_l3` (type 11): L3 PMU, per CCX (cpumask 0,2,...,30). Format `event`, `umask`, `slicemask`, `threadmask`. There are no named events in sysfs, so raw codes from the Zen 1 PPR are needed (for example L3 accesses and misses). Counted per CCX, not per thread.
 - `amd_df` (type 10): Data Fabric PMU, one counter set per die (cpumask 0,4,...,28). Format `event` (config:0-7,32-35,59-60), `umask`. No named events. DRAM channel and remote-link traffic need raw Zen 1 DF event codes. This is the per-node memory bandwidth signal, system-wide per die, not per daemon.
 - There is no `amd_umc` PMU (that is Zen 4 and later) and no `ibs_op`/`ibs_fetch` PMU on this kernel, so there is no per-access sampling of remote accesses.
