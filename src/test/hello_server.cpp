@@ -10,7 +10,9 @@
 #include <cerrno>
 #include <condition_variable>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <ctime>
 #include <iostream>
 #include <mutex>
@@ -46,6 +48,44 @@ std::int64_t monotonic_ns() {
 void burn_cpu() {
   std::uint64_t x = 0x9E3779B97F4A7C15ULL;
   for (int i = 0; i < 20000000; ++i) {
+    x = x * 6364136223846793005ULL + 1;
+  }
+  g_sink = x;
+}
+
+// Optional component for the degrade policy (policies.md "Application"). When MERCURY_POLICY names a
+// policy file, /cpu does an extra half burn while component "extra" is enabled. Without the variable
+// /cpu is unchanged. The file is re-read at most every 200 ms.
+bool extra_enabled() {
+  static const char* path = std::getenv("MERCURY_POLICY");
+  if (path == nullptr || path[0] == '\0') {
+    return false;
+  }
+  static std::mutex mu;
+  static std::int64_t read_ns = 0;
+  static bool enabled = true;
+  std::lock_guard lock(mu);
+  const auto now = monotonic_ns();
+  if (now - read_ns > 200000000LL) {
+    read_ns = now;
+    std::ifstream file(path);
+    std::stringstream text;
+    text << file.rdbuf();
+    const auto body = text.str();
+    const auto at = body.find("\"name\":\"extra\"");
+    if (at != std::string::npos) {
+      constexpr std::string_view off = "\"name\":\"extra\",\"enabled\":false";
+      enabled = body.compare(at, off.size(), off) != 0;
+    } else {
+      enabled = true;
+    }
+  }
+  return enabled;
+}
+
+void burn_extra() {
+  std::uint64_t x = 0x9E3779B97F4A7C15ULL;
+  for (int i = 0; i < 10000000; ++i) {
     x = x * 6364136223846793005ULL + 1;
   }
   g_sink = x;
@@ -166,6 +206,10 @@ std::string dispatch(const std::string& request, Arrivals* arrivals) {
   }
   if (target == "/cpu") {
     burn_cpu();
+    if (extra_enabled()) {
+      burn_extra();
+      return keep_alive("cpu extra\n");
+    }
     return keep_alive("cpu\n");
   }
   if (target == "/sleep") {

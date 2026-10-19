@@ -1954,6 +1954,9 @@ struct PolicyDoc {
   std::uint64_t generation = 0;
   bool shift = false;
   ShiftRule rule;
+  // Groups a shift moves between. policies.md uses NUMA nodes; l3 or core lets a
+  // single-node host exercise the same rule.
+  ResourceLevel shift_level = ResourceLevel::Node;
   std::string level = "core";
   std::string ceiling;
   std::vector<int> ceiling_cpus;  // sorted; empty means no ceiling
@@ -2133,6 +2136,21 @@ std::string parse_policy_doc(const JsonValue& body, PolicyDoc& doc, bool& empty)
           if (!fraction(&value, doc.rule.mean_theta)) {
             return "shift.theta must be in (0, 1]";
           }
+        } else if (key == "level") {
+          if (!value.is_string()) {
+            return "shift.level must be socket, node, l3, or core";
+          }
+          if (value.text == "node") {
+            doc.shift_level = ResourceLevel::Node;
+          } else if (value.text == "socket") {
+            doc.shift_level = ResourceLevel::Socket;
+          } else if (value.text == "l3") {
+            doc.shift_level = ResourceLevel::L3;
+          } else if (value.text == "core") {
+            doc.shift_level = ResourceLevel::Core;
+          } else {
+            return "shift.level must be socket, node, l3, or core";
+          }
         } else {
           return "unknown field shift." + key;
         }
@@ -2258,6 +2276,7 @@ std::string doc_state_json(const std::string& daemon_id, const PolicyDoc& doc) {
   std::ostringstream out;
   out << "{\"daemon_id\":\"" << json_escape(daemon_id) << "\",\"pid\":" << doc.pid
       << ",\"shift\":" << (doc.shift ? "true" : "false") << ",\"trigger\":\"" << trigger_name(doc.rule.trigger)
+      << "\",\"shift_level\":\"" << resource_level_name(doc.shift_level)
       << "\",\"util\":" << fmt_double(doc.rule.hot_util) << ",\"theta\":" << fmt_double(doc.rule.mean_theta)
       << ",\"level\":\"" << doc.level << "\",\"ceiling\":\"" << json_escape(doc.ceiling) << "\",\"degrade_limit\":"
       << fmt_double(doc.degrade_limit) << ",\"components\":[";
@@ -2464,7 +2483,11 @@ void policy_pass(const std::vector<ResourceGroupInfo>& tree, const std::vector<i
   // 3. shift: one daemon leaves a hot node per five intervals.
   static std::map<std::string, std::int64_t> node_left_tick;
   const std::int64_t since_ns = end_ns - kIntervalNs;
-  for (const auto* node : nodes) {
+  std::vector<const ResourceGroupInfo*> shift_groups;
+  for (const auto& group : tree) {
+    shift_groups.push_back(&group);
+  }
+  for (const auto* node : shift_groups) {
     if (tick - (node_left_tick.count(node->name) ? node_left_tick[node->name] : -1000000) < kPolicyIntervals) {
       continue;
     }
@@ -2474,7 +2497,7 @@ void policy_pass(const std::vector<ResourceGroupInfo>& tree, const std::vector<i
     };
     std::vector<Candidate> candidates;
     for (const auto& [daemon_id, doc] : docs) {
-      if (!doc.shift || tick - doc.attached_tick < kPolicyIntervals || tick - doc.shifted_tick < kPolicyIntervals) {
+      if (!doc.shift || doc.shift_level != node->level || tick - doc.attached_tick < kPolicyIntervals || tick - doc.shifted_tick < kPolicyIntervals) {
         continue;
       }
       const auto& cpus = cpusets[daemon_id];
@@ -2499,7 +2522,10 @@ void policy_pass(const std::vector<ResourceGroupInfo>& tree, const std::vector<i
       auto& doc = docs[candidate.daemon_id];
       const auto& cpus = cpusets[candidate.daemon_id];
       std::vector<NodeCandidate> options;
-      for (const auto* other : nodes) {
+      for (const auto* other : shift_groups) {
+        if (other->level != node->level) {
+          continue;
+        }
         NodeCandidate option;
         option.name = other->name;
         const auto& other_loads = loads_of(other->name);
@@ -2516,7 +2542,8 @@ void policy_pass(const std::vector<ResourceGroupInfo>& tree, const std::vector<i
                      node->name + " is hot; no legal node to move to\"");
         continue;
       }
-      const auto dest = std::find_if(nodes.begin(), nodes.end(), [&](const ResourceGroupInfo* g) { return g->name == *destination; });
+      const auto dest = std::find_if(shift_groups.begin(), shift_groups.end(),
+                                     [&](const ResourceGroupInfo* g) { return g->name == *destination; });
       std::vector<int> exclude = cpus_outside(allocatable, (*dest)->linux_cpus);
       std::vector<int> chosen;
       while (chosen.size() < cpus.size()) {
