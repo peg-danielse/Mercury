@@ -10,6 +10,9 @@
 # CPU, in POOL (default 60). OP_CPU: the operator (61). TRACE_CPUS: threadtrace (62,63). SAMPLE_CPU:
 # dsb_sample.py (63). The last three stay outside POOL. PORT: Mercury's port (default 8080).
 # Each run dir gets rings/ (Mercury's 10 ms archives) and alloc_vs_use.{png,txt} from tools/plot_rings.py.
+# EXTERNAL=1: use the mercury already listening on PORT instead of starting and stopping one per run.
+#   GEN_CPU and CPU 2 must be in its pool; its log stays its own; gnn@model tokens are refused (the
+#   model is that process's environment). Its ring archives are copied into each run dir.
 set -u
 SYS=$1; OUT=$2; REPS=$3; EXTRA=$4; TRACE=${5:-}
 B=${DSB_ROOT:-/home/paul/Benchmarks}; M=$(cd "$(dirname "$(readlink -f "$0")")/../.." && pwd)
@@ -23,6 +26,17 @@ OUT=$(realpath -m $OUT); RUN=$OUT/$(date +%Y%m%d-%H%M%S); mkdir -p $RUN
 killcg() { for c in /sys/fs/cgroup/mercury/$PFX*; do [ -d $c ] && echo 1 | sudo -n tee $c/cgroup.kill >/dev/null; done; sleep 1; for c in /sys/fs/cgroup/mercury/$PFX*; do [ -d $c ] && sudo -n rmdir $c 2>/dev/null; done; }
 cleanup() { killcg; [ -n "${SPID:-}" ] && kill $SPID 2>/dev/null; [ -n "${MPID:-}" ] && sudo -n kill -TERM $MPID 2>/dev/null; sleep 2; }
 trap cleanup EXIT
+if [ -n "${EXTERNAL:-}" ]; then
+  curl -s -m 2 127.0.0.1:$PORT/ping | grep -q pong || { echo "no mercury answering on port $PORT"; exit 1; }
+  XPID=$(sudo -n ss -ltnpH "sport = :$PORT" | grep -o 'pid=[0-9]*' | head -1 | cut -d= -f2)
+  XCWD=$(sudo -n readlink /proc/$XPID/cwd)
+  XRINGS=$(sudo -n cat /proc/$XPID/environ | tr '\0' '\n' | sed -n 's/^MERCURY_RINGS=//p')
+  XRINGS=${XRINGS:-rings}; case $XRINGS in /*) ;; *) XRINGS=$XCWD/$XRINGS;; esac
+  ALLOC=$(curl -s -m 2 127.0.0.1:$PORT/map | grep -o '"allocatable":\[[0-9,]*\]' | head -1)
+  for c in 2 $GEN_CPU; do echo "$ALLOC" | grep -qE "[\[,]$c[],]" || { echo "cpu $c is not in the pool of mercury on $PORT ($ALLOC)"; exit 1; }; done
+  case " ${POLICIES:-} " in *@*) echo "EXTERNAL=1 cannot switch gnn models per run"; exit 1;; esac
+  echo "using mercury pid $XPID on port $PORT, rings in $XRINGS"
+fi
 # POLICIES: space-separated list; gnn-nopin = gnn with -pin=false. Default "saturate gnn".
 #   A token may carry a model: gnn@/abs/model.json or gnn-nopin@/abs/model.json (MERCURY_GNN_MODEL for
 #   that run's mercury; the run dir is named <policy>-<model file stem>).
@@ -34,10 +48,14 @@ for r in $(seq 1 $REPS); do for pol in ${POLICIES:-saturate gnn}; do
   case $pol in *@*) MODEL=${pol#*@}; pol=${pol%%@*}; NAME=$pol-$(basename $MODEL .json);; esac
   case $pol in gnn-nopin) PARGS="-policy gnn -pin=false";; *) PARGS="-policy $pol";; esac
   D=$RUN/$r-$NAME; mkdir -p $D
-  ss -ltnH | grep -q ":$PORT " && { echo "port $PORT busy"; exit 1; }
-  (cd $WD && exec sudo -n env MERCURY_RINGS=$D/rings ${MODEL:+MERCURY_GNN_MODEL=$MODEL} $M/build/mercury $PORT 0 $POOL) > $D/mercury.log 2>&1 &
-  sleep 1; MPID=$(pgrep -f "^$M/build/mercury $PORT 0" | head -1)
-  for i in $(seq 50); do curl -s -m 1 127.0.0.1:$PORT/ping >/dev/null && break; sleep 0.2; done
+  if [ -n "${EXTERNAL:-}" ]; then
+    echo "external mercury pid $XPID port $PORT from $(date +%T); its log is its own output" > $D/mercury.log
+  else
+    ss -ltnH | grep -q ":$PORT " && { echo "port $PORT busy"; exit 1; }
+    (cd $WD && exec sudo -n env MERCURY_RINGS=$D/rings ${MODEL:+MERCURY_GNN_MODEL=$MODEL} $M/build/mercury $PORT 0 $POOL) > $D/mercury.log 2>&1 &
+    sleep 1; MPID=$(pgrep -f "^$M/build/mercury $PORT 0" | head -1)
+    for i in $(seq 50); do curl -s -m 1 127.0.0.1:$PORT/ping >/dev/null && break; sleep 0.2; done
+  fi
   taskset -c $SAMPLE_CPU python3 $M/src/test/dsb_sample.py --prefix $PFX --out $D/sample.jsonl & SPID=$!
   if [ "$TRACE" = --trace ] && [ $r = 1 ] && [ $pol = saturate ] && [ -z "${NOTRACE:-}" ]; then
     ( sleep 20; for d in $TR; do taskset -c ${TRACE_CPUS%%,*} sudo -n $M/build/threadtrace $d --interval-ms 50 --duration-s 240 --out $D/trace-$d.jsonl 2>/dev/null & done; wait ) &
@@ -52,9 +70,13 @@ for r in $(seq 1 $REPS); do for pol in ${POLICIES:-saturate gnn}; do
   (cd $WD && taskset -c $OP_CPU $OP -mercury 127.0.0.1:$PORT -cpu 2 -gen-cpu $GEN_CPU -client mercury $PARGS -placement least_loaded -gen-out $D/loadgen.out $EXTRA ${SVC_ARGS:-} autoscale) > $D/operate.out 2> $D/operate.err
   echo "  operator exit $? routes=$(grep -c ^route $D/operate.out)"
   kill $SPID; SPID=""
-  sudo -n kill -TERM $MPID; for i in $(seq 50); do kill -0 $MPID 2>/dev/null || break; sleep 0.2; done; MPID=""
+  if [ -n "${MPID:-}" ]; then
+    sudo -n kill -TERM $MPID; for i in $(seq 50); do kill -0 $MPID 2>/dev/null || break; sleep 0.2; done; MPID=""
+  fi
   sudo -n pkill -x threadtrace 2>/dev/null
   killcg
+  # The external mercury appends every run to the same archives; plot_rings.py keeps the newest run.
+  [ -n "${EXTERNAL:-}" ] && { mkdir -p $D/rings; sudo -n cp $XRINGS/$PFX*.mring $D/rings/ 2>/dev/null; sudo -n chown -R $(id -u):$(id -g) $D/rings; }
   # 10 ms cores-vs-use per daemon from this run's ring archives (tools/plot_rings.py).
   python3 $M/tools/plot_rings.py $D/rings --prefix $PFX --out $D/alloc_vs_use.png > $D/alloc_vs_use.txt 2>&1 \
     && echo "  $(tail -1 $D/alloc_vs_use.txt)"
