@@ -6,6 +6,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 find_package(Threads REQUIRED)
+enable_testing()
 
 add_library(mercury_http STATIC src/http.cpp)
 target_include_directories(mercury_http PUBLIC ${CMAKE_SOURCE_DIR}/src)
@@ -46,3 +47,9 @@ mercury_test(map_test src/test/map.cpp)
 target_include_directories(resources_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_link_libraries(resources_test PRIVATE Threads::Threads)
 target_compile_definitions(daemon_test PRIVATE DAEMONS_TXT="${CMAKE_SOURCE_DIR}/src/test/daemons.txt")
+mercury_test(policy_test src/test/policies.cpp src/policy.cpp)
+target_include_directories(policy_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+# Unprivileged unit test of the pure policy decisions. The other tests need root and a large host.
+add_test(NAME policy_test COMMAND policy_test)
+mercury_test(burn src/test/burn.cpp)
+target_link_libraries(burn PRIVATE Threads::Threads)

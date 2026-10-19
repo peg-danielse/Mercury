@@ -2,6 +2,7 @@
 
 #include "counters.hpp"
 #include "http.hpp"
+#include "json.hpp"
 #include "policy.hpp"
 #include "resources.hpp"
 #include "ring.hpp"
@@ -21,6 +22,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <cerrno>
 #include <chrono>
@@ -29,9 +31,12 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <map>
+#include <set>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -78,6 +83,8 @@ struct ScaleState {
   int max_cores = kDefaultMaxCores;
   std::shared_ptr<Policy> policy;
   std::int64_t added_at_ns = 0;
+  // Allocatable CPUs outside the policy ceiling (policies.md). add_core never returns these.
+  std::vector<int> outside;
 };
 
 struct Daemon {
@@ -1069,7 +1076,8 @@ int cpuset_cores(const std::string& daemon_id) {
   return static_cast<int>(have->size());
 }
 
-bool add_core(const std::string& daemon_id, int max_cores, int& cores_after, std::string& spec_after) {
+bool add_core(const std::string& daemon_id, int max_cores, const std::vector<int>& outside, int& cores_after,
+              std::string& spec_after) {
   const auto dir = ensure_daemon_cpuset(daemon_id);
   if (!dir) {
     return false;
@@ -1079,7 +1087,9 @@ bool add_core(const std::string& daemon_id, int max_cores, int& cores_after, std
     return false;
   }
   // Least-loaded core. Another daemon may already run on the CPU it returns.
-  auto next = request_cpu(*have);
+  std::vector<int> exclude = *have;
+  exclude.insert(exclude.end(), outside.begin(), outside.end());
+  auto next = request_cpu(exclude);
   if (!next) {
     return false;
   }
@@ -1344,7 +1354,7 @@ void monitor_daemon(const std::string& daemon_id, pid_t root) {
       int after = 0;
       std::string spec;
       const bool changed = decision == Decision::AddCore
-                               ? add_core(daemon_id, scale.max_cores, after, spec)
+                               ? add_core(daemon_id, scale.max_cores, scale.outside, after, spec)
                                : remove_core(daemon_id, scale.min_cores, after, spec);
       if (!changed) {
         continue;
@@ -1923,4 +1933,825 @@ std::optional<std::string> kill_route(const std::string& request) {
     return http_response(200, "OK", ok_json(false), kJson);
   }
   return http_response(200, "OK", kill_json(*daemon->finished), kJson);
+}
+
+// ---------------------------------------------------------------------------
+// Resource and application policies (policies.md): POST/GET /policies and policy_loop.
+// The decisions are the pure functions in src/policy.cpp. This section only gathers
+// ring data, applies cpuset writes, and writes rings/<daemon_id>.policy.
+// ---------------------------------------------------------------------------
+namespace {
+
+constexpr int kEventCap = 2000;
+
+struct TuneValue {
+  std::string text;
+  bool number = false;
+};
+
+struct PolicyDoc {
+  pid_t pid = -1;
+  std::uint64_t generation = 0;
+  bool shift = false;
+  ShiftRule rule;
+  std::string level = "core";
+  std::string ceiling;
+  std::vector<int> ceiling_cpus;  // sorted; empty means no ceiling
+  bool degrade = false;
+  double degrade_limit = kDegradeLimit;
+  std::vector<DegradeComponent> components;
+  bool tune = false;
+  double tune_limit = kDegradeLimit;
+  std::vector<TuneParameter> parameters;
+  std::vector<std::vector<TuneValue>> raw_values;
+  std::int64_t attached_tick = 0;
+  std::int64_t shifted_tick = -1000000;
+  std::int64_t degrade_tick = -1000000;
+  std::int64_t tune_tick = -1000000;
+  std::string path;
+};
+
+std::mutex policies_mu;
+std::map<std::string, PolicyDoc> policy_docs;
+std::vector<std::string> policy_events;
+std::map<std::string, IntervalLoads> latest_group_loads;
+std::uint64_t policy_generation = 0;
+std::atomic<std::int64_t> policy_tick{0};
+
+const char* trigger_name(ShiftTrigger trigger) {
+  switch (trigger) {
+    case ShiftTrigger::Hotspot:
+      return "hotspot";
+    case ShiftTrigger::Mean:
+      return "mean";
+    case ShiftTrigger::Either:
+      return "either";
+  }
+  return "hotspot";
+}
+
+std::string fmt_double(double value) {
+  std::ostringstream out;
+  out << std::setprecision(6) << value;
+  const auto text = out.str();
+  if (text.find("nan") != std::string::npos || text.find("inf") != std::string::npos) {
+    return "0";
+  }
+  return text;
+}
+
+void record_event(std::string json_fields) {
+  std::ostringstream out;
+  out << "{\"tick\":" << policy_tick.load() << ",\"t_ms\":" << now_ms() << "," << json_fields << "}";
+  std::cout << "policy " << out.str() << std::endl;
+  std::lock_guard lock(policies_mu);
+  policy_events.push_back(out.str());
+  if (policy_events.size() > static_cast<std::size_t>(kEventCap)) {
+    policy_events.erase(policy_events.begin(), policy_events.begin() + (kEventCap / 4));
+  }
+}
+
+bool valid_policy_name(const std::string& name) { return valid_env_name(name); }
+
+std::string policy_file_json(const PolicyDoc& doc) {
+  std::ostringstream out;
+  out << "{\"components\":[";
+  for (std::size_t i = 0; i < doc.components.size(); ++i) {
+    if (i != 0) {
+      out << ',';
+    }
+    out << "{\"name\":\"" << doc.components[i].name << "\",\"enabled\":" << (doc.components[i].enabled ? "true" : "false")
+        << '}';
+  }
+  out << "],\"parameters\":{";
+  for (std::size_t i = 0; i < doc.parameters.size(); ++i) {
+    if (i != 0) {
+      out << ',';
+    }
+    const auto& value = doc.raw_values[i][doc.parameters[i].index];
+    out << '"' << doc.parameters[i].name << "\":";
+    if (value.number) {
+      out << value.text;
+    } else {
+      out << '"' << json_escape(value.text) << '"';
+    }
+  }
+  out << "}}";
+  return out.str();
+}
+
+bool write_policy_file(const PolicyDoc& doc) {
+  if (doc.path.empty()) {
+    return false;
+  }
+  const auto tmp = doc.path + ".tmp";
+  {
+    std::ofstream file(tmp, std::ios::trunc);
+    if (!file) {
+      return false;
+    }
+    file << policy_file_json(doc) << "\n";
+    if (!file) {
+      return false;
+    }
+  }
+  return std::rename(tmp.c_str(), doc.path.c_str()) == 0;
+}
+
+std::vector<int> cpus_inside(const std::vector<int>& cpus, const std::vector<int>& sorted_group) {
+  std::vector<int> out;
+  for (const int cpu : cpus) {
+    if (std::binary_search(sorted_group.begin(), sorted_group.end(), cpu)) {
+      out.push_back(cpu);
+    }
+  }
+  return out;
+}
+
+std::vector<int> cpus_outside(const std::vector<int>& cpus, const std::vector<int>& sorted_group) {
+  std::vector<int> out;
+  for (const int cpu : cpus) {
+    if (!std::binary_search(sorted_group.begin(), sorted_group.end(), cpu)) {
+      out.push_back(cpu);
+    }
+  }
+  return out;
+}
+
+bool fraction(const JsonValue* value, double& out, bool allow_one_plus = false) {
+  if (value == nullptr) {
+    return true;
+  }
+  if (!value->is_number() || !(value->number > 0) || (!allow_one_plus && value->number > 1.0)) {
+    return false;
+  }
+  out = value->number;
+  return true;
+}
+
+// Parse a policies.md document into doc. Returns an error string, empty on success.
+std::string parse_policy_doc(const JsonValue& body, PolicyDoc& doc, bool& empty) {
+  static const std::set<std::string> known = {"daemon_id", "exec_path", "shift", "restrict", "widen", "degrade", "tune"};
+  empty = true;
+  for (const auto& [key, _] : body.fields) {
+    if (known.count(key) == 0) {
+      return "unknown field " + key;
+    }
+    if (key != "daemon_id" && key != "exec_path") {
+      empty = false;
+    }
+  }
+  if (body.get("widen") != nullptr) {
+    // Planned: grant widening by least_allocated (policies.md "Adding a group"). The decision
+    // least_allocated is in src/policy.cpp; the grant bookkeeping is not built on this branch.
+    return "widen is not implemented on this branch";
+  }
+  if (const auto* shift = body.get("shift")) {
+    if (shift->is_bool()) {
+      doc.shift = shift->boolean;
+    } else if (shift->is_object()) {
+      doc.shift = true;
+      for (const auto& [key, value] : shift->fields) {
+        if (key == "trigger") {
+          if (!value.is_string()) {
+            return "shift.trigger must be a string";
+          }
+          if (value.text == "hotspot") {
+            doc.rule.trigger = ShiftTrigger::Hotspot;
+          } else if (value.text == "mean") {
+            doc.rule.trigger = ShiftTrigger::Mean;
+          } else if (value.text == "either") {
+            doc.rule.trigger = ShiftTrigger::Either;
+          } else {
+            return "shift.trigger must be hotspot, mean, or either";
+          }
+        } else if (key == "util") {
+          if (!fraction(&value, doc.rule.hot_util)) {
+            return "shift.util must be in (0, 1]";
+          }
+        } else if (key == "theta") {
+          if (!fraction(&value, doc.rule.mean_theta)) {
+            return "shift.theta must be in (0, 1]";
+          }
+        } else {
+          return "unknown field shift." + key;
+        }
+      }
+    } else {
+      return "shift must be true, false, or an object";
+    }
+  }
+  if (const auto* restrict = body.get("restrict")) {
+    if (!restrict->is_object()) {
+      return "restrict must be an object";
+    }
+    for (const auto& [key, value] : restrict->fields) {
+      if (key == "level") {
+        if (!value.is_string() ||
+            (value.text != "core" && value.text != "l3" && value.text != "node" && value.text != "socket")) {
+          return "restrict.level must be core, l3, node, or socket";
+        }
+        doc.level = value.text;
+      } else if (key == "ceiling") {
+        if (!value.is_string()) {
+          return "restrict.ceiling must be a group name";
+        }
+        doc.ceiling = value.text;
+      } else {
+        return "unknown field restrict." + key;
+      }
+    }
+  }
+  if (const auto* degrade = body.get("degrade")) {
+    if (!degrade->is_object()) {
+      return "degrade must be an object";
+    }
+    doc.degrade = true;
+    for (const auto& [key, value] : degrade->fields) {
+      if (key == "limit") {
+        if (!fraction(&value, doc.degrade_limit)) {
+          return "degrade.limit must be in (0, 1]";
+        }
+      } else if (key == "components") {
+        if (!value.is_array()) {
+          return "degrade.components must be a list";
+        }
+        for (const auto& item : value.items) {
+          const auto* name = item.get("name");
+          const auto* cost = item.get("cost");
+          if (!item.is_object() || item.fields.size() != 2 || name == nullptr || !name->is_string() ||
+              !valid_policy_name(name->text) || cost == nullptr) {
+            return "degrade.components entries are {name, cost}";
+          }
+          DegradeComponent component;
+          component.name = name->text;
+          if (!fraction(cost, component.cost)) {
+            return "degrade cost must be in (0, 1]";
+          }
+          for (const auto& other : doc.components) {
+            if (other.name == component.name) {
+              return "duplicate component " + component.name;
+            }
+          }
+          doc.components.push_back(component);
+        }
+      } else {
+        return "unknown field degrade." + key;
+      }
+    }
+  }
+  if (const auto* tune = body.get("tune")) {
+    if (!tune->is_object()) {
+      return "tune must be an object";
+    }
+    doc.tune = true;
+    for (const auto& [key, value] : tune->fields) {
+      if (key == "limit") {
+        if (!fraction(&value, doc.tune_limit)) {
+          return "tune.limit must be in (0, 1]";
+        }
+      } else if (key == "parameters") {
+        if (!value.is_array()) {
+          return "tune.parameters must be a list";
+        }
+        for (const auto& item : value.items) {
+          const auto* name = item.get("name");
+          const auto* values = item.get("values");
+          if (!item.is_object() || item.fields.size() != 2 || name == nullptr || !name->is_string() ||
+              !valid_policy_name(name->text) || values == nullptr || !values->is_array() ||
+              values->items.size() < 2) {
+            return "tune.parameters entries are {name, values} with at least two values";
+          }
+          TuneParameter parameter;
+          parameter.name = name->text;
+          std::vector<TuneValue> raw;
+          for (const auto& entry : values->items) {
+            if (entry.is_number()) {
+              std::ostringstream text;
+              text << std::setprecision(15) << entry.number;
+              raw.push_back(TuneValue{text.str(), true});
+            } else if (entry.is_string()) {
+              raw.push_back(TuneValue{entry.text, false});
+            } else {
+              return "tune values are numbers or strings";
+            }
+            parameter.values.push_back(raw.back().text);
+          }
+          parameter.index = parameter.values.size() - 1;
+          for (const auto& other : doc.parameters) {
+            if (other.name == parameter.name) {
+              return "duplicate parameter " + parameter.name;
+            }
+          }
+          doc.parameters.push_back(std::move(parameter));
+          doc.raw_values.push_back(std::move(raw));
+        }
+      } else {
+        return "unknown field tune." + key;
+      }
+    }
+  }
+  return {};
+}
+
+std::string doc_state_json(const std::string& daemon_id, const PolicyDoc& doc) {
+  std::ostringstream out;
+  out << "{\"daemon_id\":\"" << json_escape(daemon_id) << "\",\"pid\":" << doc.pid
+      << ",\"shift\":" << (doc.shift ? "true" : "false") << ",\"trigger\":\"" << trigger_name(doc.rule.trigger)
+      << "\",\"util\":" << fmt_double(doc.rule.hot_util) << ",\"theta\":" << fmt_double(doc.rule.mean_theta)
+      << ",\"level\":\"" << doc.level << "\",\"ceiling\":\"" << json_escape(doc.ceiling) << "\",\"degrade_limit\":"
+      << fmt_double(doc.degrade_limit) << ",\"components\":[";
+  for (std::size_t i = 0; i < doc.components.size(); ++i) {
+    if (i != 0) {
+      out << ',';
+    }
+    out << "{\"name\":\"" << doc.components[i].name << "\",\"cost\":" << fmt_double(doc.components[i].cost)
+        << ",\"enabled\":" << (doc.components[i].enabled ? "true" : "false") << '}';
+  }
+  out << "],\"parameters\":[";
+  for (std::size_t i = 0; i < doc.parameters.size(); ++i) {
+    if (i != 0) {
+      out << ',';
+    }
+    out << "{\"name\":\"" << doc.parameters[i].name << "\",\"index\":" << doc.parameters[i].index << ",\"value\":\""
+        << json_escape(doc.parameters[i].values[doc.parameters[i].index]) << "\"}";
+  }
+  out << "],\"path\":\"" << json_escape(doc.path) << "\"}";
+  return out.str();
+}
+
+std::string policies_state_json() {
+  std::ostringstream out;
+  std::lock_guard lock(policies_mu);
+  out << "{\"tick\":" << policy_tick.load() << ",\"interval_ms\":1000,\"daemons\":[";
+  bool first = true;
+  for (const auto& [daemon_id, doc] : policy_docs) {
+    if (!first) {
+      out << ',';
+    }
+    first = false;
+    out << doc_state_json(daemon_id, doc);
+  }
+  out << "],\"groups\":[";
+  first = true;
+  for (const auto& [name, loads] : latest_group_loads) {
+    if (!first) {
+      out << ',';
+    }
+    first = false;
+    out << "{\"name\":\"" << name << "\",\"loads\":[";
+    for (std::size_t i = 0; i < loads.size(); ++i) {
+      if (i != 0) {
+        out << ',';
+      }
+      out << (loads[i] ? fmt_double(*loads[i]) : std::string("null"));
+    }
+    out << "]}";
+  }
+  out << "],\"events\":[";
+  for (std::size_t i = 0; i < policy_events.size(); ++i) {
+    if (i != 0) {
+      out << ',';
+    }
+    out << policy_events[i];
+  }
+  out << "]}";
+  return out.str();
+}
+
+std::string bad_policy(const std::string& why) {
+  std::cerr << "policies " << why << std::endl;
+  return http_response(400, "Bad Request", "{\"ok\":false,\"error\":\"" + json_escape(why) + "\"}", kJson);
+}
+
+std::vector<int> read_cpuset_of(const std::string& daemon_id) {
+  const auto text = trimmed(read_file("/sys/fs/cgroup/mercury/" + daemon_id + "/cpuset.cpus"));
+  if (auto cpus = parse_cpuset(text)) {
+    return *cpus;
+  }
+  return {};
+}
+
+bool write_daemon_cpuset(const std::string& daemon_id, const std::vector<int>& want) {
+  const auto dir = ensure_daemon_cpuset(daemon_id);
+  if (!dir) {
+    return false;
+  }
+  if (!write_sysfs(*dir + "/cpuset.cpus", format_cpuset(want))) {
+    return false;
+  }
+  for (int attempt = 0; attempt < 50; ++attempt) {
+    if (cpuset_applied(*dir, want)) {
+      return true;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  return false;
+}
+
+IntervalLoads max_loads(const std::vector<const IntervalLoads*>& parts) {
+  IntervalLoads out(static_cast<std::size_t>(kPolicyIntervals));
+  for (const auto* loads : parts) {
+    for (std::size_t i = 0; i < out.size() && i < loads->size(); ++i) {
+      if ((*loads)[i] && (!out[i] || *(*loads)[i] > *out[i])) {
+        out[i] = (*loads)[i];
+      }
+    }
+  }
+  return out;
+}
+
+struct LiveDaemon {
+  std::string daemon_id;
+  pid_t pid = -1;
+  std::vector<std::shared_ptr<Ring>> rings;
+};
+
+std::uint64_t recent_task_clock(const std::vector<std::shared_ptr<Ring>>& rings, std::int64_t since_ns,
+                                bool& seen) {
+  std::uint64_t total = 0;
+  for (const auto& ring : rings) {
+    if (!ring) {
+      continue;
+    }
+    std::optional<std::size_t> index;
+    for (std::size_t i = 0; i < ring->names().size(); ++i) {
+      if (ring->names()[i] == "task-clock") {
+        index = i;
+        break;
+      }
+    }
+    if (!index) {
+      continue;
+    }
+    for (const auto& sample : ring->recent(static_cast<std::size_t>(kIntervalNs / 1000000 / kSampleMs) + 1)) {
+      if (sample.timestamp_ns > since_ns && static_cast<int>(*index) < sample.nvalues) {
+        total += sample.value[*index];
+        seen = true;
+      }
+    }
+  }
+  return total;
+}
+
+void policy_pass(const std::vector<ResourceGroupInfo>& tree, const std::vector<int>& allocatable) {
+  const std::int64_t tick = ++policy_tick;
+
+  // 1. Interval loads per group from the resource rings.
+  const auto views = resource_rings(static_cast<std::size_t>(kPolicyIntervals + 1) * 1000 / kSampleMs);
+  std::int64_t end_ns = 0;
+  for (const auto& view : views) {
+    if (!view.samples.empty()) {
+      end_ns = std::max(end_ns, view.samples.back().timestamp_ns);
+    }
+  }
+  std::map<std::string, IntervalLoads> loads;
+  for (const auto& view : views) {
+    loads[view.name] = interval_loads(view.counters, view.samples, end_ns);
+  }
+
+  // 2. Running daemons and their documents.
+  std::vector<LiveDaemon> live;
+  {
+    std::lock_guard lock(daemons_mu);
+    for (const auto& daemon : daemons) {
+      if (!daemon.running) {
+        continue;
+      }
+      LiveDaemon row{daemon.daemon_id, daemon.pid, {}};
+      for (const auto& thread : daemon.threads) {
+        row.rings.push_back(thread.ring);
+      }
+      live.push_back(std::move(row));
+    }
+  }
+  std::map<std::string, PolicyDoc> docs;
+  {
+    std::lock_guard lock(policies_mu);
+    latest_group_loads = loads;
+    for (auto it = policy_docs.begin(); it != policy_docs.end();) {
+      const auto found = std::find_if(live.begin(), live.end(), [&](const LiveDaemon& d) {
+        return d.daemon_id == it->first && d.pid == it->second.pid;
+      });
+      if (found == live.end()) {
+        it = policy_docs.erase(it);
+        continue;
+      }
+      docs[it->first] = it->second;
+      ++it;
+    }
+  }
+  if (docs.empty()) {
+    return;
+  }
+  std::map<std::string, std::vector<int>> cpusets;
+  for (const auto& [daemon_id, _] : docs) {
+    cpusets[daemon_id] = read_cpuset_of(daemon_id);
+  }
+  std::vector<const ResourceGroupInfo*> nodes;
+  for (const auto& group : tree) {
+    if (group.level == ResourceLevel::Node) {
+      nodes.push_back(&group);
+    }
+  }
+  auto loads_of = [&](const std::string& name) -> const IntervalLoads& {
+    static const IntervalLoads none(static_cast<std::size_t>(kPolicyIntervals));
+    const auto it = loads.find(name);
+    return it == loads.end() ? none : it->second;
+  };
+  std::set<std::string> changed;
+
+  // 3. shift: one daemon leaves a hot node per five intervals.
+  static std::map<std::string, std::int64_t> node_left_tick;
+  const std::int64_t since_ns = end_ns - kIntervalNs;
+  for (const auto* node : nodes) {
+    if (tick - (node_left_tick.count(node->name) ? node_left_tick[node->name] : -1000000) < kPolicyIntervals) {
+      continue;
+    }
+    struct Candidate {
+      std::string daemon_id;
+      std::uint64_t rank = 0;
+    };
+    std::vector<Candidate> candidates;
+    for (const auto& [daemon_id, doc] : docs) {
+      if (!doc.shift || tick - doc.attached_tick < kPolicyIntervals || tick - doc.shifted_tick < kPolicyIntervals) {
+        continue;
+      }
+      const auto& cpus = cpusets[daemon_id];
+      if (cpus.empty() || cpus_inside(cpus, node->linux_cpus).empty()) {
+        continue;
+      }
+      if (!shift_triggered(loads_of(node->name), doc.rule)) {
+        continue;
+      }
+      const auto daemon = std::find_if(live.begin(), live.end(), [&](const LiveDaemon& d) { return d.daemon_id == daemon_id; });
+      bool seen = false;
+      const auto rank = recent_task_clock(daemon->rings, since_ns, seen);
+      if (!seen) {
+        continue;
+      }
+      candidates.push_back(Candidate{daemon_id, rank});
+    }
+    std::sort(candidates.begin(), candidates.end(), [](const Candidate& a, const Candidate& b) {
+      return a.rank != b.rank ? a.rank > b.rank : a.daemon_id < b.daemon_id;
+    });
+    for (const auto& candidate : candidates) {
+      auto& doc = docs[candidate.daemon_id];
+      const auto& cpus = cpusets[candidate.daemon_id];
+      std::vector<NodeCandidate> options;
+      for (const auto* other : nodes) {
+        NodeCandidate option;
+        option.name = other->name;
+        const auto& other_loads = loads_of(other->name);
+        option.load = other_loads.empty() || !other_loads.back() ? 0.0 : *other_loads.back();
+        option.lowest_cpu = other->linux_cpus.empty() ? 0 : other->linux_cpus.front();
+        option.hot = shift_triggered(other_loads, doc.rule);
+        option.inside_ceiling = doc.ceiling_cpus.empty() || cpus_outside(other->linux_cpus, doc.ceiling_cpus).empty();
+        option.allocatable = static_cast<int>(cpus_inside(allocatable, other->linux_cpus).size());
+        options.push_back(option);
+      }
+      const auto destination = shift_destination(node->name, options, static_cast<int>(cpus.size()));
+      if (!destination) {
+        record_event("\"daemon_id\":\"" + json_escape(candidate.daemon_id) + "\",\"action\":\"none\",\"policy\":\"shift\",\"reason\":\"" +
+                     node->name + " is hot; no legal node to move to\"");
+        continue;
+      }
+      const auto dest = std::find_if(nodes.begin(), nodes.end(), [&](const ResourceGroupInfo* g) { return g->name == *destination; });
+      std::vector<int> exclude = cpus_outside(allocatable, (*dest)->linux_cpus);
+      std::vector<int> chosen;
+      while (chosen.size() < cpus.size()) {
+        const auto next = request_cpu(exclude);
+        if (!next) {
+          break;
+        }
+        chosen.push_back(*next);
+        exclude.push_back(*next);
+      }
+      if (chosen.size() < cpus.size()) {
+        continue;
+      }
+      std::sort(chosen.begin(), chosen.end());
+      if (!write_daemon_cpuset(candidate.daemon_id, chosen)) {
+        std::cerr << "policy shift daemon_id=" << candidate.daemon_id << " cpuset did not take effect" << std::endl;
+        continue;
+      }
+      {
+        std::lock_guard lock(daemons_mu);
+        if (auto* daemon = find_daemon(candidate.daemon_id); daemon != nullptr && daemon->pid == doc.pid) {
+          daemon->cpu = chosen.front();
+          daemon->scale.added_at_ns = monotonic_ns();
+        }
+      }
+      doc.shifted_tick = tick;
+      node_left_tick[node->name] = tick;
+      cpusets[candidate.daemon_id] = chosen;
+      changed.insert(candidate.daemon_id);
+      const auto& source_loads = loads_of(node->name);
+      record_event("\"daemon_id\":\"" + json_escape(candidate.daemon_id) +
+                   "\",\"action\":\"move\",\"policy\":\"shift\",\"trigger\":\"" + trigger_name(doc.rule.trigger) +
+                   "\",\"from\":\"" + node->name + "\",\"to\":\"" + *destination + "\",\"cpus\":\"" +
+                   format_cpuset(chosen) + "\",\"source_load\":" +
+                   fmt_double(source_loads.back() ? *source_loads.back() : 0.0) + ",\"reason\":\"hotspot " + node->name +
+                   " moved to least-loaded node " + *destination + "\"");
+      break;
+    }
+  }
+
+  // 4. degrade and tune, then one file write per changed daemon.
+  for (auto& [daemon_id, doc] : docs) {
+    if ((!doc.degrade && !doc.tune) || tick - doc.attached_tick < kPolicyIntervals) {
+      continue;
+    }
+    std::vector<const IntervalLoads*> parts;
+    if (!doc.ceiling.empty()) {
+      parts.push_back(&loads_of(doc.ceiling));
+    } else {
+      for (const auto* node : nodes) {
+        if (!cpus_inside(cpusets[daemon_id], node->linux_cpus).empty()) {
+          parts.push_back(&loads_of(node->name));
+        }
+      }
+    }
+    if (parts.empty()) {
+      continue;
+    }
+    const auto u = max_loads(parts);
+    bool wrote = false;
+    if (doc.degrade && tick - doc.degrade_tick >= kPolicyIntervals) {
+      if (const auto index = degrade_step(doc.components, u, doc.degrade_limit)) {
+        doc.degrade_tick = tick;
+        wrote = true;
+        const auto& component = doc.components[*index];
+        record_event("\"daemon_id\":\"" + json_escape(daemon_id) + "\",\"action\":\"" +
+                     (component.enabled ? "restore" : "degrade") + "\",\"policy\":\"degrade\",\"component\":\"" +
+                     component.name + "\",\"load\":" + fmt_double(u.back() ? *u.back() : 0.0) + ",\"limit\":" +
+                     fmt_double(doc.degrade_limit) + ",\"reason\":\"load against limit with brownout cost " +
+                     fmt_double(component.cost) + "\"");
+      }
+    }
+    if (doc.tune && tick - doc.tune_tick >= kPolicyIntervals) {
+      bool degraded = false;
+      for (const auto& component : doc.components) {
+        degraded = degraded || !component.enabled;
+      }
+      std::vector<std::size_t> before;
+      for (const auto& parameter : doc.parameters) {
+        before.push_back(parameter.index);
+      }
+      if (const auto index = tune_step(doc.parameters, u, degraded, doc.tune_limit)) {
+        doc.tune_tick = tick;
+        wrote = true;
+        const auto& parameter = doc.parameters[*index];
+        record_event("\"daemon_id\":\"" + json_escape(daemon_id) + "\",\"action\":\"tune\",\"policy\":\"tune\",\"parameter\":\"" +
+                     parameter.name + "\",\"value\":\"" + json_escape(parameter.values[parameter.index]) +
+                     "\",\"direction\":\"" + (parameter.index < before[*index] ? "down" : "up") + "\"");
+      }
+    }
+    if (wrote) {
+      write_policy_file(doc);
+      changed.insert(daemon_id);
+    }
+  }
+
+  // 5. Publish state back unless the document was replaced meanwhile.
+  if (changed.empty()) {
+    return;
+  }
+  std::lock_guard lock(policies_mu);
+  for (const auto& daemon_id : changed) {
+    auto it = policy_docs.find(daemon_id);
+    if (it != policy_docs.end() && it->second.generation == docs[daemon_id].generation) {
+      it->second = docs[daemon_id];
+    }
+  }
+}
+
+void policy_loop() {
+  // The topology is fixed after init_resources.
+  while (!resources_ready()) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  }
+  const auto tree = resource_groups();
+  const auto pool = [] {
+    auto cpus = allocatable_cpus();
+    std::sort(cpus.begin(), cpus.end());
+    return cpus;
+  }();
+  auto next = std::chrono::steady_clock::now();
+  while (true) {
+    next += std::chrono::seconds(1);
+    std::this_thread::sleep_until(next);
+    try {
+      policy_pass(tree, pool);
+    } catch (const std::exception& error) {
+      std::cerr << "policy_loop " << error.what() << std::endl;
+    }
+  }
+}
+
+}  // namespace
+
+void start_policy_loop() { std::thread(policy_loop).detach(); }
+
+std::optional<std::string> policies_route(const std::string& request) {
+  const auto target = request_target(request);
+  if (target != "/policies") {
+    return std::nullopt;
+  }
+  if (request.rfind("GET ", 0) == 0) {
+    return http_response(200, "OK", policies_state_json(), kJson);
+  }
+  const auto parsed = parse_json(request_body(request));
+  if (!parsed || !parsed->is_object()) {
+    return bad_policy("body is not a JSON object");
+  }
+  const auto* id_value = parsed->get("daemon_id");
+  if (id_value == nullptr || !id_value->is_string() || !safe_daemon_id(id_value->text)) {
+    return bad_policy("daemon_id is missing or unsafe");
+  }
+  const std::string daemon_id = id_value->text;
+  PolicyDoc doc;
+  bool empty = true;
+  if (const auto why = parse_policy_doc(*parsed, doc, empty); !why.empty()) {
+    if (why.rfind("widen", 0) == 0) {
+      return http_response(501, "Not Implemented", "{\"ok\":false,\"error\":\"" + why + "\"}", kJson);
+    }
+    return bad_policy(why);
+  }
+  if (!resources_ready()) {
+    return http_response(500, "Internal Server Error", ok_json(false), kJson);
+  }
+  pid_t pid = -1;
+  {
+    std::lock_guard lock(daemons_mu);
+    const auto* daemon = find_daemon(daemon_id);
+    if (daemon == nullptr || !daemon->running) {
+      return bad_policy("daemon " + daemon_id + " is not running");
+    }
+    if (const auto* exec_path = parsed->get("exec_path")) {
+      if (!exec_path->is_string() || exec_path->text != daemon->exec_path) {
+        return bad_policy("exec_path does not match the running daemon");
+      }
+    }
+    pid = daemon->pid;
+  }
+  const auto path = rings_dir() + "/" + archive_name(daemon_id) + ".policy";
+  std::vector<int> outside;
+  if (!doc.ceiling.empty()) {
+    const auto groups = resource_groups();
+    const auto found = std::find_if(groups.begin(), groups.end(), [&](const ResourceGroupInfo& g) { return g.name == doc.ceiling; });
+    if (found == groups.end()) {
+      return bad_policy("unknown ceiling " + doc.ceiling);
+    }
+    doc.ceiling_cpus = found->linux_cpus;
+    std::sort(doc.ceiling_cpus.begin(), doc.ceiling_cpus.end());
+    if (!cpus_outside(read_cpuset_of(daemon_id), doc.ceiling_cpus).empty()) {
+      return bad_policy("cpuset sticks out of ceiling " + doc.ceiling);
+    }
+    outside = cpus_outside(allocatable_cpus(), doc.ceiling_cpus);
+  }
+  {
+    std::lock_guard lock(daemons_mu);
+    if (auto* daemon = find_daemon(daemon_id); daemon != nullptr && daemon->pid == pid) {
+      daemon->scale.outside = outside;
+    }
+  }
+  if (empty) {
+    {
+      std::lock_guard lock(policies_mu);
+      policy_docs.erase(daemon_id);
+    }
+    std::remove(path.c_str());
+    record_event("\"daemon_id\":\"" + json_escape(daemon_id) + "\",\"action\":\"detach\"");
+    return http_response(200, "OK", "{\"ok\":true}", kJson);
+  }
+  doc.pid = pid;
+  doc.attached_tick = policy_tick.load();
+  bool wrote = false;
+  if (doc.degrade || doc.tune) {
+    std::filesystem::create_directories(rings_dir());
+    doc.path = path;
+    wrote = write_policy_file(doc);
+    if (!wrote) {
+      std::cerr << "policies daemon_id=" << daemon_id << " could not write " << path << std::endl;
+      doc.path.clear();
+    }
+  } else {
+    std::remove(path.c_str());
+  }
+  {
+    std::lock_guard lock(policies_mu);
+    doc.generation = ++policy_generation;
+    policy_docs[daemon_id] = doc;
+  }
+  record_event("\"daemon_id\":\"" + json_escape(daemon_id) + "\",\"action\":\"attach\",\"shift\":" +
+               (doc.shift ? "true" : "false") + ",\"trigger\":\"" + trigger_name(doc.rule.trigger) +
+               "\",\"ceiling\":\"" + json_escape(doc.ceiling) + "\",\"components\":" +
+               std::to_string(doc.components.size()) + ",\"parameters\":" + std::to_string(doc.parameters.size()));
+  std::string body = "{\"ok\":true";
+  if (wrote) {
+    body += ",\"path\":\"" + json_escape(path) + "\"";
+  }
+  body += "}";
+  return http_response(200, "OK", body, kJson);
 }

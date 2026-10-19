@@ -127,6 +127,9 @@ std::string route(const std::string& request) {
   if (auto response = scale_route(request)) {
     return *response;
   }
+  if (auto response = policies_route(request)) {
+    return *response;
+  }
   if (auto response = map_route(request)) {
     return *response;
   }
@@ -181,6 +184,7 @@ int main(int argc, char** argv) {
     std::cout << std::endl;
     set_daemon_cpus(daemon_cpus);
     init_resources(std::move(daemon_cpus));
+    start_policy_loop();
     serve(static_cast<std::uint16_t>(port_number), "mercury", route);
   } catch (const std::exception& error) {
     std::cerr << error.what() << std::endl;

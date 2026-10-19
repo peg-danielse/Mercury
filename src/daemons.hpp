@@ -16,3 +16,8 @@ std::optional<std::string> scale_route(const std::string& request);
 std::optional<std::string> map_route(const std::string& request);
 std::optional<std::string> rings_route(const std::string& request);
 std::optional<std::string> kill_route(const std::string& request);
+
+// policies.md: POST attaches a resource/application policy document, GET reports state and events.
+std::optional<std::string> policies_route(const std::string& request);
+// Detach policy_loop, which wakes once a second and runs shift, degrade, and tune.
+void start_policy_loop();
