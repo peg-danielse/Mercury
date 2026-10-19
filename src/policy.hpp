@@ -16,9 +16,11 @@ inline constexpr double kAddPressure = 0.10;
 inline constexpr double kRemoveMargin = 0.05;
 inline constexpr double kRemovePressure = 0.02;
 inline constexpr double kRunnableAddMargin = 0.5;
-// Cgroup ring layout: task-clock, user, system, then pressure (or runnable in the fallback).
+// Cgroup ring layout: task-clock, user, system, then pressure (or runnable in the fallback), then
+// cores (the cpuset size at that sample).
 inline constexpr int kCgroupTaskClock = 0;
 inline constexpr int kCgroupPressure = 3;
+inline constexpr int kCgroupCores = 4;
 
 enum class Decision { Hold, AddCore, RemoveCore };
 

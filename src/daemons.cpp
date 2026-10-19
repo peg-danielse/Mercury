@@ -1258,12 +1258,25 @@ std::uint64_t usec_delta_ns(std::uint64_t after, std::uint64_t before) {
 void monitor_daemon(const std::string& daemon_id, pid_t root) {
   // PSI decides the fourth counter for the life of this daemon: pressure, or runnable without PSI.
   const bool use_psi = read_cgroup_pressure(daemon_id).has_value();
-  const std::vector<std::string> daemon_names{"task-clock", "user", "system", use_psi ? "pressure" : "runnable"};
+  // cores is the cpuset size when the sample was taken, so the archive shows allocation beside use.
+  const std::vector<std::string> daemon_names{"task-clock", "user", "system", use_psi ? "pressure" : "runnable", "cores"};
   std::shared_ptr<RingArchive> archive;
+  const auto archive_path = rings_dir() + "/" + archive_name(daemon_id) + ".mring";
   try {
-    archive = std::make_shared<RingArchive>(rings_dir() + "/" + archive_name(daemon_id) + ".mring", daemon_names);
-  } catch (const std::exception& error) {
-    std::cerr << "ring archive daemon_id=" << daemon_id << " " << error.what() << std::endl;
+    archive = std::make_shared<RingArchive>(archive_path, daemon_names);
+  } catch (const std::exception& first) {
+    // An archive with other counters (an older layout, or the runnable fallback) is moved aside to
+    // <id>.mring.<unix seconds> so this daemon is still recorded.
+    const auto aside = archive_path + "." + std::to_string(std::time(nullptr));
+    try {
+      if (std::rename(archive_path.c_str(), aside.c_str()) != 0) {
+        throw;
+      }
+      std::cout << "ring archive daemon_id=" << daemon_id << " " << first.what() << ", moved to " << aside << std::endl;
+      archive = std::make_shared<RingArchive>(archive_path, daemon_names);
+    } catch (const std::exception& error) {
+      std::cerr << "ring archive daemon_id=" << daemon_id << " " << error.what() << std::endl;
+    }
   }
   auto daemon_ring = std::make_shared<Ring>(kRingSlots, daemon_names, archive);
   std::cout << "counters daemon_id=" << daemon_id << " cgroup " << daemon_names.back() << std::endl;
@@ -1285,11 +1298,12 @@ void monitor_daemon(const std::string& daemon_id, pid_t root) {
       if (previous_cpu && current_cpu && current_cpu->usage_usec >= previous_cpu->usage_usec && pressure_ok) {
         Sample total;
         total.timestamp_ns = monotonic_ns();
-        total.nvalues = 4;
+        total.nvalues = 5;
         total.value[0] = usec_delta_ns(current_cpu->usage_usec, previous_cpu->usage_usec);
         total.value[1] = usec_delta_ns(current_cpu->user_usec, previous_cpu->user_usec);
         total.value[2] = usec_delta_ns(current_cpu->system_usec, previous_cpu->system_usec);
         total.value[3] = use_psi ? usec_delta_ns(*current_pressure, *previous_pressure) : count_runnable(root);
+        total.value[kCgroupCores] = static_cast<std::uint64_t>(cpuset_cores(daemon_id));
         daemon_ring->push(total);
       }
       if (current_cpu) {
