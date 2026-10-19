@@ -49,7 +49,6 @@ Controller to worker, as HTTP JSON on the worker's listen port:
 - `POST /migrate` — `{daemon_id, cpu}` returns `{pid}`
 - `POST /cpus` — `{daemon_id, cpus}` returns `{ok}`
 - `POST /scale` — `{daemon_id, min?, max?, policy?}` returns `{ok, min, max, cores, threads}`
-- `POST /policies` — `{daemon_id, exec_path?, shift?, restrict?, widen?, degrade?}` returns `{ok, path?}` (see `policies.md`)
 - `POST /kill` — `{daemon_id}` returns `{ok, finished}`
 
 The worker also answers two reads for a page that draws where daemons sit:
@@ -81,7 +80,7 @@ When `cpu.pressure` cannot be read (PSI disabled in the kernel), the worker coun
 
 `saturate` is attached to every daemon when it starts, with `min` 1 and `max` 16. `scale` updates a running daemon: `min` defaults to 1 and `max` defaults to 16. `policy` defaults to `saturate`. An unknown policy is rejected. The policy name `none` detaches `saturate` from that daemon, for callers that hold a cpuset fixed; posting `saturate` again attaches it. Posting again updates the limits and the policy and does not clear the current window.
 
-`saturate` decides on the mean of the last `kScaleWindow` (64) samples, which is 640 ms. Every sample in the window is newer than the last change of the cpuset by `saturate`, `widen`, or `shift`.
+`saturate` decides on the mean of the last `kScaleWindow` (64) samples, which is 640 ms. Every sample in the window is newer than the last change of the cpuset by `saturate`.
 
 - If the cpuset has fewer CPUs than `min`, add one immediately. If it has more than `max`, remove one immediately.
 - Add one CPU when the mean occupancy is at least 0.85, the mean pressure is at least 0.10, and the cpuset is still under `max`.
@@ -92,9 +91,9 @@ After any add or remove, the next decision waits for a fresh full window of 64 s
 
 With the `runnable` fallback, the pressure test is replaced by the mean runnable count: add when it is at least `cores + 0.5`, remove when it is at most `cores - 1` and the occupancy passes the margin or the relaxed rule.
 
-`scale` also takes an optional `placement`, the rule for the CPU `add_core` adds: `least_loaded` (the default, described next) or `nearest_first`. Omitting it keeps the daemon's current placement; an unknown name is rejected with 400. The response carries `placement`. A daemon starts with `least_loaded`. Placement is per daemon only: there is no worker-wide CLI or environment default, so one Mercury can run both and an experiment names the placement in the request. `widen` and `shift` (`policies.md`) choose their CPUs by their own rules regardless of placement.
+`scale` also takes an optional `placement`, the rule for the CPU `add_core` adds: `least_loaded` (the default, described next) or `nearest_first`. Omitting it keeps the daemon's current placement; an unknown name is rejected with 400. The response carries `placement`. A daemon starts with `least_loaded`. Placement is per daemon only: there is no worker-wide CLI or environment default, so one Mercury can run both and an experiment names the placement in the request.
 
-`nearest_first` (`request_cpu_nearest`, `src/resources.cpp`) takes the allocatable CPU outside the cpuset and the exclude list that is closest to the current cpuset: a CPU on the same physical core as a held CPU (SMT sibling), else in the same L3, else the same NUMA node, else the same socket, else anywhere. Within a tier the lower `load_of` of the candidate's core group wins, then the lower Linux CPU, the same tie break as `least_loaded`. An empty cpuset falls back to `request_cpu`. A grant restricts it through the exclude list exactly as for `least_loaded`. On dtn-01, a daemon on CPU 1 grows 1 → 33 → 32 (L3 0-1,32-33 with CPU 0 reserved), then within node 0, then node 1-3 on socket 0, and only then onto socket 1.
+`nearest_first` (`request_cpu_nearest`, `src/resources.cpp`) takes the allocatable CPU outside the cpuset and the exclude list that is closest to the current cpuset: a CPU on the same physical core as a held CPU (SMT sibling), else in the same L3, else the same NUMA node, else the same socket, else anywhere. Within a tier the lower `load_of` of the candidate's core group wins, then the lower Linux CPU, the same tie break as `least_loaded`. An empty cpuset falls back to `request_cpu`. On dtn-01, a daemon on CPU 1 grows 1 → 33 → 32 (L3 0-1,32-33 with CPU 0 reserved), then within node 0, then node 1-3 on socket 0, and only then onto socket 1.
 
 `least_loaded`: the CPU added comes from `request_cpu` (`src/resources.cpp`). `request_cpu` calls `balanced_cpu`, which walks the group tree from the socket down through the node and the L3 to the core. At each level it keeps every group that still has an allocatable Linux CPU outside `exclude`, and only the children of the group chosen on the level above. The group with fewer of those excluded CPUs already in it wins, so sibling groups receive the same number of this daemon's CPUs before any sibling receives another. An equal count keeps the lower `load_of`, and an equal load keeps the group whose lowest Linux CPU is smaller. The CPU returned is the lowest allocatable Linux CPU on the chosen core that is not in `exclude`. A CPU another daemon already runs on is still offered. When every allocatable CPU is already in this cpuset, nothing is added. The CPU removed is the highest one in the cpuset.
 
@@ -144,7 +143,7 @@ Shutdown: a normal return from `main` (including an exception, such as a port th
 
 `daemon_cpus` and `mercury_linux_cpu` are written on this thread before any other thread starts. Later readers do not lock them. `main` passes `daemon_cpus` to `init_resources` (`src/resources.cpp`) before `serve`.
 
-`route` is the only dispatch. It tries `ping_route`, `stat_route`, `start_route`, `migrate_route`, `cpus_route`, `scale_route`, `policies_route`, `map_route`, `rings_route`, then `kill_route`. The first function that recognizes the target returns the response. Anything else is HTTP 404 from `http_response`.
+`route` is the only dispatch. It tries `ping_route`, `stat_route`, `start_route`, `migrate_route`, `cpus_route`, `scale_route`, `map_route`, `rings_route`, then `kill_route`. The first function that recognizes the target returns the response. Anything else is HTTP 404 from `http_response`.
 
 ### HTTP accept loop
 
@@ -202,7 +201,7 @@ Parent, after the child is waiting on the sync pipe: `pin_pid` on the child, the
 
 `migrate_route` reads the live pid and cpu under `daemons_mu`. The cpu must be in `daemon_cpus` and must differ from the recorded cpu. It does not fork. It writes `cpuset.cpus` through `ensure_daemon_cpuset`, `write_sysfs`, and `cpuset_applied`, polling for up to 50 times at 10 ms. On success it stores the new cpu on the same record and returns that pid.
 
-Every write of a daemon's `cpuset.cpus` goes through `write_cpus_and_mems` (start in `prepare_placement`, `migrate_route`, `cpus_route`, `add_core`, `remove_core`, and `write_cpuset` for `widen` and `shift`). It sets `cpuset.mems` to the NUMA nodes that contain at least one CPU of the new `cpuset.cpus` (`nodes_for_cpus`, from `/sys/devices/system/node/node<N>/cpulist`, read once). Order: first `cpuset.mems` is widened to the union of the old and the new nodes, then `cpuset.cpus` is written, then `cpuset.mems` is shrunk to the new nodes. Growing therefore widens mems before cpus, shrinking narrows mems after cpus, and no intermediate state has a CPU without its node. A failed `cpuset.mems` write is logged and does not fail the cpuset write; a failed `cpuset.cpus` write does. In cgroup v2 the kernel migrates the daemon's pages when `cpuset.mems` changes.
+Every write of a daemon's `cpuset.cpus` goes through `write_cpus_and_mems` (start in `prepare_placement`, `migrate_route`, `cpus_route`, `add_core`, and `remove_core`). It sets `cpuset.mems` to the NUMA nodes that contain at least one CPU of the new `cpuset.cpus` (`nodes_for_cpus`, from `/sys/devices/system/node/node<N>/cpulist`, read once). Order: first `cpuset.mems` is widened to the union of the old and the new nodes, then `cpuset.cpus` is written, then `cpuset.mems` is shrunk to the new nodes. Growing therefore widens mems before cpus, shrinking narrows mems after cpus, and no intermediate state has a CPU without its node. A failed `cpuset.mems` write is logged and does not fail the cpuset write; a failed `cpuset.cpus` write does. In cgroup v2 the kernel migrates the daemon's pages when `cpuset.mems` changes.
 
 `cpus_route` parses a Linux cpuset with `parse_cpuset`, rejects a set that contains `mercury_linux_cpu`, and rejects a set `resource_groups_see` does not know. It writes the set through `ensure_daemon_cpuset`, `write_sysfs`, and `cpuset_applied`. On success it logs the least-loaded socket, node, L3, and core that contain one of those CPUs, from `least_loaded_touching`, formatted by `resource_choice`. `add_core` and `remove_core` write that same `cpuset.cpus` from the monitor thread. Those three functions do not take `daemons_mu`. The accept thread and the monitor thread can both write one daemon's cpuset.
 
@@ -232,7 +231,7 @@ Thresholds are named constants in `src/policy.hpp`: `kScaleWindow` (64), `kAddOc
 
 Each monitor pass, after the sample, copies `ScaleState` under `daemons_mu`. It builds an `OccupancyWindow` with `cores` from `cpuset_cores`, the limits, the pressure source, and the cgroup samples from `Ring::recent(kScaleWindow + 1)` whose `timestamp_ns` is greater than `changed_at_ns`. `SaturatePolicy::decide` is a pure function of that window. It returns `AddCore` when `cores < min_cores` and `RemoveCore` when `cores > max_cores`. It returns `Hold` until the window holds 65 samples, so each of the 64 has a gap. A gap of zero or less returns `Hold`. Mean occupancy is the sum of `task-clock` over the sum of the gaps, divided by `cores`. Mean pressure is the sum of `pressure` over the sum of the gaps. The add and remove tests are the ones under Scaling above.
 
-Back in `monitor_daemon`, `Hold` does nothing. `AddCore` calls `add_core` and `RemoveCore` calls `remove_core`. Both poll `cpuset_applied`. After either succeeds, the monitor sets `changed_at_ns` under `daemons_mu`. `widen` and `shift` set the same field, so every cpuset change opens a fresh window.
+Back in `monitor_daemon`, `Hold` does nothing. `AddCore` calls `add_core` and `RemoveCore` calls `remove_core`. Both poll `cpuset_applied`. After either succeeds, the monitor sets `changed_at_ns` under `daemons_mu`. Every saturate change therefore opens a fresh window.
 
 `decide` is tested without a host: `policy_test` feeds it synthetic windows (including 6 busy threads on 7 CPUs, which must remove) and the recorded traces in `src/test/traces/` (CSV, `ts,task_clock,user,system,pressure`, header `# cores=N ... expect=X`; `TRACES_DIR` in CMake). Every sliding 65-sample window of a trace must give its expected decision. `src/test/record_traces.py` (root) re-records them with `spinner` in the cgroup `mercury/ptrec`. Acceptance on dtn-01: `spinner` with N busy threads started on one CPU settles at N CPUs and stays there for ten windows; `src/test/saturate_it.sh` checks N = 1, 3, 6 on the CPUs of NUMA nodes 0-2 (`saturate_integration` under `ctest`).
 
@@ -247,21 +246,7 @@ Test expectations that follow from saturate being attached at start:
 - `saturate_it.sh` takes `SAT_PLACEMENT` and `autoscale_test` takes `AUTOSCALE_PLACEMENT`; when set, the test posts that placement to `/scale` (test-side only).
 - `autoscale_least_loaded` still encodes the earlier 90% rule (`cores_for_clients`: 0.33 core per client) and does not match this rule.
 
-Policies beyond `saturate` are specified in `policies.md`. That file is the contract for moving a running daemon off a hot NUMA node, for restricting a daemon to resource groups and adding groups, and for application degradation. `make_policy` still returns only `SaturatePolicy`.
-
-In `policies.md`, the saturate add test that `widen` uses over the last 1 s is the add test above, taken over the samples of that second: mean occupancy at least 0.85 and mean pressure at least 0.10. `shift` still ranks daemons by the cgroup `task-clock` of the last 1 s. The statement there that saturate is always active is true because `arm_daemon` attaches it.
-
-### Policies
-
-Files: `src/daemons.cpp` (`policies_route`, `policy_loop`, `policy_tick`, `run_shift`, `run_widen`, `run_degrade`), `src/policy.cpp` and `src/policy.hpp` (`interval_loads`, `node_hot`, `least_allocated`, `degrade_set`), `src/resources.cpp` (`set_policy_loop`). The contract is `policies.md`.
-
-`main` calls `set_policy_loop(policy_loop)` before `init_resources`, and `init_resources` detaches that thread beside `sample_loop`, so `resources.cpp` does not link against the daemon table. `policies_route` is tried after `scale_route`. It parses the body with a small JSON tree (`JParser`), rejects unknown fields and shapes with HTTP 400 before touching the table, returns HTTP 500 when resource groups are missing, and stores a `PolicyState` on the `Daemon` under `daemons_mu`. Each post bumps a generation number; `policy_loop` stores a change only when the generation it copied is still current, so a re-post or an empty document wins over a decision that was in flight. The ceiling must be a known group whose level is the grant level or above it. `widen` accepts an object (`{max_groups?}`) or `true`.
-
-`Daemon::cgroup_ring` is the cgroup `cpu.stat` ring that `monitor_daemon` publishes under `daemons_mu`. `policy_loop` uses its `task-clock` over the last 1 s for the `shift` rank and for the `widen` saturate test (the saturate add test over that second), because the record keeps no per-thread rings. The `widen` test is `saturated_last_second`: `window_means` and `saturate_add_test` over the samples of that second.
-
-`monitor_daemon` copies the grant with `ScaleState`, and `add_core` takes the grant CPUs as an optional argument: the exclude list is then the cpuset plus every allocatable CPU outside the grant. `policy_loop` writes cpusets through `write_cpuset` (`ensure_daemon_cpuset`, `write_sysfs`, `cpuset_applied`) without holding `daemons_mu`, and sets `ScaleState::changed_at_ns` after a successful shift or widen. `cpus_route` and `migrate_route` do not write it. The policy file is written by `write_policy_file`, a temp file in `rings_dir()` renamed into place under `policy_file_mu`; the path in the response is absolute.
-
-Tests: `policy_test` (`src/test/policy.cpp`) covers the pure decisions. `src/test/policies_it.sh` starts `mercury` on a free port in 18180-18199 with the CPUs of NUMA nodes 0-2, uses `spinner` (`src/test/spinner.cpp`) as daemons and as external load, and checks attach validation, shift, widen with `max_groups` and with a ceiling, degrade, and the empty document. Both run under `ctest` in `build/`.
+The reactive policies `shift`, `restrict`/`widen` (the grant) and `degrade`, with `POST /policies`, `policy_loop` and `policies.md`, were removed on 2026-10-19. They were cluster baselines ported onto one host; gnn is to be compared against the best fixed allocation on the system instead (the daemon alone, with as many CPUs as possible).
 
 
 ## gnn policy (per-thread GNN placement controller)
@@ -270,7 +255,7 @@ Tests: `policy_test` (`src/test/policy.cpp`) covers the pure decisions. `src/tes
 
 ### Purpose
 
-`gnn` is a second core policy beside `saturate`. A daemon gets it per daemon, the same way it gets `saturate` or `none` (through `/scale` `policy`, or through a `POST /policies` field), so the two can be A/B tested on the same host. `saturate` only sets the size of the cgroup cpuset and lets CFS/EEVDF place threads inside it, and the kernel scheduler can then stack busy threads in ways nobody intended. `gnn` makes the placement decision itself: it picks a target CPU for each thread and derives the cpuset from those choices.
+`gnn` is a second core policy beside `saturate`. A daemon gets it per daemon, the same way it gets `saturate` or `none` (through `/scale` `policy`), so the two can be A/B tested on the same host. `saturate` only sets the size of the cgroup cpuset and lets CFS/EEVDF place threads inside it, and the kernel scheduler can then stack busy threads in ways nobody intended. `gnn` makes the placement decision itself: it picks a target CPU for each thread and derives the cpuset from those choices.
 
 ### Tick and signals
 
@@ -312,7 +297,7 @@ Phase 1 is built. It records the controller's inputs and ground-truth labels. On
 
 ### Phase 1b (implemented): closed-loop gnn policy
 
-The `gnn` policy is built and selectable per daemon through `/scale`. It is not part of `POST /policies`: that document holds shift, the grant and degrade, while `/scale` picks the core policy (`saturate`, `gnn` or `none`).
+The `gnn` policy is built and selectable per daemon through `/scale`.`/scale` picks the core policy (`saturate`, `gnn` or `none`).
 
 - Enable: `POST /scale {"daemon_id":"<id>","policy":"gnn"}`, with optional `"min"`, `"max"` (defaults 1 and 16) and `"tick_ms"` (default 10, at least `kSampleMs`, rounded down to a multiple of it). The response adds `"policy":"gnn","tick_ms":N` and the placement. `"placement"` works as for saturate (`least_loaded` | `nearest_first`); for gnn it **defaults to `least_loaded`**, Mercury's resource hand-out policy, when omitted (changed 2026-10-18; it was forced to nearest-first). The gnn branch of `monitor_daemon` calls `add_core(..., scale.placement)`, which goes through `request_cpu_for(placement, ...)`: `least_loaded` → `request_cpu` (least-loaded resource group walk), `nearest_first` → `request_cpu_nearest`. Posting `saturate` or `none` detaches gnn. A start still attaches `saturate`, as before. `"pin"` (default `true`; added 2026-10-18): with `"pin":false` the controller only sizes the cpuset (add/remove cores, breaker, hold) and never pins threads; each tick calls `GnnController::restore()` instead of `pin()`, so every thread keeps the cpuset-wide mask and the kernel places it. The response adds `"pin":true|false`. The DSB operators take `-pin=false` (sent only with `-policy gnn`).
 - Model: `weights.json` exported by `gnn-example/mercury/train_gnn.py`, read from `$MERCURY_GNN_MODEL` or else `<dir of the mercury binary>/../models/gnn_v3.json` (that is, `~/Mercury/models/gnn_v3.json`). `gnn_weights` loads it once and reloads it when its mtime changes. `/scale` answers 500 when gnn is asked for and the model cannot be loaded. `make_policy("gnn")` returns `GnnPolicy`, whose `decide()` only holds; the work is done in `monitor_daemon`.
@@ -328,14 +313,13 @@ The `gnn` policy is built and selectable per daemon through `/scale`. It is not 
   3. Infer per-thread demand: the model output, with no general wait-as-demand. The earlier run+wait safety floor (in every form tried: always, in near-full FFD bins, on saturated shared CPUs) inflated demand and flapped, and was removed. **Stacking breaker** (the only exception): a group is two or more busy threads (prediction ≥ 0.1) whose last CPU is the same and which each waited ≥ 0.2 of the tick. When the same group (same CPU, same tids) persists for K = 5 consecutive ticks (50 ms), its threads get demand ≥ 0.51 for 50 ticks, so FFD cannot put them in one bin. That grants each extra thread its own CPU once. The group is then disarmed until it dissolves. One group is counted at a time. `breaks=1` in the log marks a firing. This replaces the floor's purpose: without it, two threads pinned to one CPU each run about 0.5, the model reads about 0.5, and the stacking holds itself in place.
   4. First-fit-decreasing bin packing of the thread demands (plus the aggregate's measured run+wait) into unit cores gives the required core count, clamped to `min`/`max`.
   5. Hysteresis: scale up immediately to the required count. **Scale-down hold:** remove one core only after the required count has been below the cpuset size for 20 consecutive ticks (200 ms); the count then restarts, so at most one core goes per hold. A tick at or above the cpuset size resets it.
-  6. Change the cpuset one CPU at a time with the existing `add_core` (the daemon's `scale.placement`, default `least_loaded`, no grant) and `remove_core`, and set `changed_at_ns`.
+  6. Change the cpuset one CPU at a time with the existing `add_core` (the daemon's `scale.placement`, default `least_loaded`) and `remove_core`, and set `changed_at_ns`.
   7. Pin: each FFD bin holding a thread with demand ≥ 0.1 gets one CPU of the cpuset. A bin keeps a CPU one of its threads is already pinned to; otherwise it takes the next free CPU in cpuset order. Only when cores are exhausted do bins share CPUs. Threads in a bin are pinned with `sched_setaffinity(tid, {cpu})`. Every other thread (idle threads, the aggregate, threads not seen before, which may have inherited a pin) gets the all-CPU mask, so the cpuset alone decides.
 - Restore: "wide" is the all-CPU mask (the kernel intersects it with the cpuset, so later cpuset changes apply in full).
   - The controller's destructor widens every thread it pinned, on detach and when the daemon stops.
   - Pinned tids are also kept in a lock-free table that `gnn_restore_all_affinity_raw` (async-signal-safe) walks. `mercury` now installs its SIGINT/SIGTERM handler whether or not it owns `numa_balancing`, and registers the restore with `atexit`.
   - `SIGKILL` of mercury cannot be caught: pins then remain until the threads exit or are re-pinned.
   - Checked on dtn-01: pinned after attach, all back to the cpuset after `policy saturate`, pinned again after `policy gnn`, all back after SIGTERM of mercury.
-- `shift` and `widen` skip daemons with `scale.gnn`. `degrade` is unaffected.
 - Log: one `gnn daemon_id=… cores=… required=… target=… demand=… pred=… breaks=… nodes=… threads=… ticks=… mean_us read=… infer=… cpuset=… act=…` line per second and on every cpuset change.
 - `gnn_dataset.sh --workload stressng` (2026-10-18): runs `src/test/wrappers/stressng` (env-driven, Python; Mercury execs it with no arguments) as the daemon. `--threads` are stress-ng worker counts; `--patterns` are `steps` (20/50/80/100/50/20 % cpu-load, `--step-s` each), `ramp` (10→100 % over `--ramp-s`, 1 s steps), `vm` (`--vm N --vm-bytes 1G`) or `stream` (`--stream N`). stress-ng cannot change `--cpu-load` while running, so each step is a new `stress-ng --cpu N --cpu-load L --cpu-method int64` run: workers are new processes per step. Labels (`labels.csv`, header `# spans=1`) give each step's worker tids demand L/100 from their start and 0 at the step end; `result.json` has bogo-ops per step. Other new flags: `--placement` (now default `least_loaded`, sent for both policies), `--max N` (/scale max, default 16), `--fixed-cpus SPEC` (policy none plus `POST /cpus`, for fixed-placement runs). Every case also saves `numastat.before/after` (all nodes).
 - `gnn_dataset.sh` takes `--policy gnn|saturate` and `--tick-ms`, and saves each case's `gnn`/`scale` log lines as `controller.log`. It passes `MERCURY_GNN_MODEL`, `MERCURY_GNN_HOLD_TICKS` and `MERCURY_GNN_STACK_K` through its `sudo` re-exec (process environment only, for experiments; recorded in `meta.txt`). `GnnController` reads the last two as overrides of `hold_ticks`/`stack_k`.
@@ -482,7 +466,7 @@ The `gnn` policy is built and selectable per daemon through `/scale`. It is not 
 - Actuation, in two steps. First, the cgroup cpuset is set to the outer bound through the existing `add_core`/`remove_core`/`write_cpuset` path, with `cpuset.mems` following as today. Second, each thread is pinned inside that cpuset with `sched_setaffinity(tid, ...)`.
 - Safety: Mercury clamps and validates every output before applying it:
   - core counts stay within `min_cores`/`max_cores`;
-  - CPUs come only from the grant, or else from the allocatable pool, and never include the worker CPU;
+  - CPUs come only from the allocatable pool and never include the worker CPU;
   - two busy threads are never pinned on one CPU unless cores are exhausted.
 - Clean state: when the policy is detached, the daemon stops, or Mercury shuts down, every thread's affinity is reset to the full cpuset. No hidden pinning is left behind.
 - New and exited threads: a new tid keeps the cpuset-wide affinity it inherits until the next tick. An exited tid (`ESRCH`, or gone from `cgroup.threads`) has its fds closed and its state dropped.
@@ -512,7 +496,6 @@ The `gnn` policy is built and selectable per daemon through `/scale`. It is not 
 
 - Node granularity: the per-daemon cap on per-thread nodes, and when to fall back to cgroup-level nodes.
 - How an aggregate node maps to CPUs (shared remainder of the cpuset, or its own CPU).
-- Interaction with `shift` and `widen`: probably both are disabled for a daemon while `gnn` is active, because they rewrite the cpuset and reset `changed_at_ns`.
 - Pinning and NUMA balancing: Mercury sets `kernel.numa_balancing` to 0 by default (`--numa-balancing=keep` opts out). It is open how per-thread pinning behaves when balancing is kept on.
 
 ### Code facts this design depends on
@@ -546,11 +529,3 @@ Actuations:
 Synthetic memory workloads (a `gnnload` sibling, still to be built): a configurable working set per thread, a local-vs-remote access ratio (memory bound with `mbind` to chosen nodes), streaming vs random (pointer-chase) access, threads per node, and a labels file with the ground truth (bytes per second per thread per node) as in phase 1.
 
 Open: there is no named event list for `amd_df`/`amd_l3` on this kernel, so the raw codes must be validated against a known STREAM-like load before they are used as features.
-
-## Notes: policies.md staleness
-
-`policies.md` is not edited here. Against the current code:
-
-- `policies.md` (Concurrency) says `monitor_daemon` runs `saturate` "on its 100 ms window". It samples every 10 ms (`kSampleMs`) and decides on 64 samples, 640 ms (`kScaleWindow`). The 100 ms figure is `kLoadWindow` in `load_of`.
-- `policies.md` (shift) ranks by `task-clock` "on the daemon's thread rings". The code ranks by `clock_last_second` on the cgroup ring, whose value[0] is `cpu.stat` `usage_usec` in ns, not perf task-clock. The Policies subsection above already states this.
-- `policies.md` says "The loop, the grant, and `POST /policies` are not built yet". `policy_loop`, `run_shift`, `run_widen`, `run_degrade`, the grant and `POST /policies` are in `src/daemons.cpp`.

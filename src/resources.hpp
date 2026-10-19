@@ -110,7 +110,3 @@ struct ResourceRingView {
 
 // count is how many of the newest samples to copy. Zero copies every sample stored.
 std::vector<ResourceRingView> resource_rings(std::size_t count);
-
-// policy_loop (src/daemons.cpp) is registered here so init_resources can detach it beside
-// sample_loop without resources.cpp depending on the daemon table. Call before init_resources.
-void set_policy_loop(void (*loop)());

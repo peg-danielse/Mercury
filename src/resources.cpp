@@ -63,7 +63,6 @@ struct MetricTarget {
 constexpr std::size_t kLoadWindow = 10;
 
 bool ready = false;
-void (*policy_thread)() = nullptr;
 std::vector<Group> groups;
 std::vector<char> known;
 std::vector<char> allocatable;
@@ -627,13 +626,8 @@ void init_resources(std::vector<int> allocatable_linux_cpus) {
   ready = !groups.empty();
   if (ready) {
     std::thread(sample_loop, std::move(targets)).detach();
-    if (policy_thread != nullptr) {
-      std::thread(policy_thread).detach();
-    }
   }
 }
-
-void set_policy_loop(void (*loop)()) { policy_thread = loop; }
 
 bool resources_ready() { return ready; }
 

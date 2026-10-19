@@ -67,11 +67,10 @@ mercury_executable(gnnreplay src/gnnreplay.cpp src/gnn.cpp src/threadstat.cpp sr
 mercury_test(gnnload src/test/workloads/gnnload.cpp)
 target_link_libraries(gnnload PRIVATE Threads::Threads)
 
-# ctest: the pure policy decisions, and the policies.md integration run on a partial CPU share
-# (src/test/policies_it.sh re-executes itself with sudo -n for cgroup writes).
+# ctest: the saturate decisions, and the saturate integration run on a partial CPU share
+# (src/test/saturate_it.sh re-executes itself with sudo -n for cgroup writes).
 enable_testing()
 add_test(NAME policy_test COMMAND policy_test)
-add_test(NAME policies_integration COMMAND ${CMAKE_SOURCE_DIR}/src/test/policies_it.sh)
 add_test(NAME saturate_integration COMMAND ${CMAKE_SOURCE_DIR}/src/test/saturate_it.sh)
-set_tests_properties(policies_integration saturate_integration PROPERTIES
+set_tests_properties(saturate_integration PROPERTIES
   ENVIRONMENT "MERCURY_BIN=$<TARGET_FILE:mercury>;SPIN_BIN=$<TARGET_FILE:spinner>" TIMEOUT 600)
