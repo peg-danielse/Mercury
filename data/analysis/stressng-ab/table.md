@@ -1,0 +1,24 @@
+| metric | saturate | gnn_v3 |
+|---|---|---|
+| cases | 16 | 16 |
+| ticks | 26217 | 26182 |
+| under_% | 46.062 | 32.075 |
+| over_% | 23.000 | 25.445 |
+| deficit_mean | 2.531 | 1.964 |
+| excess_mean | 0.756 | 0.447 |
+| core_s_alloc/req | 0.784 | 0.815 |
+| up_lag_med_s | 0.640 | 0.135 |
+| up_lag_p90_s | 5.591 | 3.161 |
+| up_never | 16 | 7 |
+| up_n | 30 | 40 |
+| down_lag_med_s | 2.210 | 0.805 |
+| down_lag_p90_s | 2.994 | 1.742 |
+| down_never | 10 | 1 |
+| down_n | 3 | 14 |
+| stacked_busy_% | 26.049 | 27.633 |
+| demand_met_% | 73.467 | 77.986 |
+| changes_per_s | 0.766 | 1.988 |
+| bogo_ops_per_core_s | 1762.499 | 1791.937 |
+| ctl_read_us | n/a | 423.511 |
+| ctl_infer_us | n/a | 98.125 |
+| ctl_act_us | n/a | 285.323 |

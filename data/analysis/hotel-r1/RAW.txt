@@ -1,0 +1,1 @@
+training cases: r0 + data/dsb/hotel-cases/r1 (DAgger: hotel-r0 in control, gnn pin=false; dtn-01:~/Mercury/data/dsb/hotel-dagger1/20261018-122925), r1 labels = run share on uncontended thread-ticks only (selflabel uncontended). Fixed test cases = r0's: --test-cases hotel-11212,hotel-frontend,hotel-recommendation,hotel-reservation

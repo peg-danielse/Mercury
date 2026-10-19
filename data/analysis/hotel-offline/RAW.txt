@@ -1,0 +1,1 @@
+cases = held-out daemons of the generous-allocation recording, dtn-01:~/Mercury/data/dsb/hotel-record/20261018-122034; models results/{v3-nocpuset,hotel-r0,hotel-r1}/model.pt (local only, gitignored; weights.json committed)

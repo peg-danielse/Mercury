@@ -1,0 +1,177 @@
+{
+ "tick_ms": 9.999838,
+ "params": 1633,
+ "train_cases": [
+  "data/dsb/hotel-cases/r1/hotel-11213",
+  "data/dsb/hotel-cases/r0/hotel-11213",
+  "data/dsb/hotel-cases/r0/hotel-search",
+  "data/dsb/hotel-cases/r1/hotel-profile",
+  "data/dsb/hotel-cases/r0/hotel-rate",
+  "data/dsb/hotel-cases/r1/hotel-11214",
+  "data/dsb/hotel-cases/r1/hotel-11211",
+  "data/dsb/hotel-cases/r1/hotel-attractions",
+  "data/dsb/hotel-cases/r1/hotel-review",
+  "data/dsb/hotel-cases/r1/hotel-rate",
+  "data/dsb/hotel-cases/r0/hotel-review",
+  "data/dsb/hotel-cases/r1/hotel-search",
+  "data/dsb/hotel-cases/r1/hotel-geo",
+  "data/dsb/hotel-cases/r0/hotel-profile",
+  "data/dsb/hotel-cases/r0/hotel-attractions",
+  "data/dsb/hotel-cases/r1/hotel-user",
+  "data/dsb/hotel-cases/r0/hotel-11211",
+  "data/dsb/hotel-cases/r0/hotel-geo",
+  "data/dsb/hotel-cases/r0/hotel-11214",
+  "data/dsb/hotel-cases/r0/hotel-user"
+ ],
+ "test_cases": [
+  "data/dsb/hotel-cases/r0/hotel-11212",
+  "data/dsb/hotel-cases/r0/hotel-frontend",
+  "data/dsb/hotel-cases/r0/hotel-recommendation",
+  "data/dsb/hotel-cases/r0/hotel-reservation",
+  "data/dsb/hotel-cases/r1/hotel-11212",
+  "data/dsb/hotel-cases/r1/hotel-frontend",
+  "data/dsb/hotel-cases/r1/hotel-recommendation",
+  "data/dsb/hotel-cases/r1/hotel-reservation"
+ ],
+ "features": [
+  "task_clock",
+  "run",
+  "wait",
+  "ctx_switch_k",
+  "migrations_100",
+  "cg_occupancy",
+  "cg_pressure",
+  "cpuset_16",
+  "is_aggregate",
+  "node0",
+  "node1",
+  "node2",
+  "node3",
+  "node4",
+  "node5",
+  "node6",
+  "node7"
+ ],
+ "per_case": {
+  "data/dsb/hotel-cases/r0/hotel-11212": {
+   "thr_gnn": 0.0130792478911194,
+   "thr_runwait": 0.040944802369900224,
+   "thr_tc": 0.00084611292282763,
+   "cores_gnn_ffd": 0.019277869953385478,
+   "cores_gnn_u075": 0.01931737378525717,
+   "cores_saturate": 7.014418898633167,
+   "cores_runwait_u075": 0.5182507703247214,
+   "cores_runwait_ffd": 0.31235679860946514
+  },
+  "data/dsb/hotel-cases/r0/hotel-frontend": {
+   "thr_gnn": 0.03718806845113506,
+   "thr_runwait": 0.08108578302162579,
+   "thr_tc": 0.0027932868089760752,
+   "cores_gnn_ffd": 0.09094141350294316,
+   "cores_gnn_u075": 0.0910204242879153,
+   "cores_saturate": 6.972267214474776,
+   "cores_runwait_u075": 1.7133093667285584,
+   "cores_runwait_ffd": 1.1456958874886423
+  },
+  "data/dsb/hotel-cases/r0/hotel-recommendation": {
+   "thr_gnn": 0.05129323637592639,
+   "thr_runwait": 0.15668769290536863,
+   "thr_tc": 0.004233072391852971,
+   "cores_gnn_ffd": 0.2012282091917591,
+   "cores_gnn_u075": 0.20059429477020602,
+   "cores_saturate": 6.96081616481775,
+   "cores_runwait_u075": 3.1275752773375594,
+   "cores_runwait_ffd": 2.353050713153724
+  },
+  "data/dsb/hotel-cases/r0/hotel-reservation": {
+   "thr_gnn": 0.048002197641763236,
+   "thr_runwait": 0.15190643409320942,
+   "thr_tc": 0.00788564971782336,
+   "cores_gnn_ffd": 0.569441700580821,
+   "cores_gnn_u075": 0.5852068434153859,
+   "cores_saturate": 6.49974317436485,
+   "cores_runwait_u075": 6.383025801098423,
+   "cores_runwait_ffd": 3.716187917341657
+  },
+  "data/dsb/hotel-cases/r1/hotel-11212": {
+   "thr_gnn": 0.013092532296486938,
+   "thr_runwait": 0.0009738878741855976,
+   "thr_tc": 0.0001543223947558377,
+   "cores_gnn_ffd": 0.024356580336120807,
+   "cores_gnn_u075": 0.028497198993261346,
+   "cores_saturate": 0.017902086547048793,
+   "cores_runwait_u075": 0.013436713485426646,
+   "cores_runwait_ffd": 0.00811886011204027
+  },
+  "data/dsb/hotel-cases/r1/hotel-frontend": {
+   "thr_gnn": 0.01717682828547439,
+   "thr_runwait": 0.013926793656993735,
+   "thr_tc": 0.000852296159707087,
+   "cores_gnn_ffd": 0.07659036193740563,
+   "cores_gnn_u075": 0.09217774513404334,
+   "cores_saturate": 0.06255355612682091,
+   "cores_runwait_u075": 0.55641245358469,
+   "cores_runwait_ffd": 0.319908597543559
+  },
+  "data/dsb/hotel-cases/r1/hotel-recommendation": {
+   "thr_gnn": 0.02204065938931768,
+   "thr_runwait": 0.02139067221359296,
+   "thr_tc": 0.0018536321644164213,
+   "cores_gnn_ffd": 0.32594135424324105,
+   "cores_gnn_u075": 0.33994935881728333,
+   "cores_saturate": 0.29784366576819404,
+   "cores_runwait_u075": 6.693008249612023,
+   "cores_runwait_ffd": 5.104957935146614
+  },
+  "data/dsb/hotel-cases/r1/hotel-reservation": {
+   "thr_gnn": 0.016790133548961313,
+   "thr_runwait": 0.010233428746399336,
+   "thr_tc": 0.002334272348100556,
+   "cores_gnn_ffd": 0.3089335067468704,
+   "cores_gnn_u075": 0.32421557470330026,
+   "cores_saturate": 0.25373922939359456,
+   "cores_runwait_u075": 14.157494716306292,
+   "cores_runwait_ffd": 7.405747033002764
+  }
+ },
+ "test_mae": {
+  "thr_gnn_contended": 0.0912776497124781,
+  "thr_runwait_contended": 0.2703631123076795,
+  "thr_tc_contended": 0.009162115645931772,
+  "thr_gnn": 0.026395674578351597,
+  "thr_runwait": 0.0557100795234317,
+  "thr_tc": 0.002666836972815796,
+  "cores_gnn_ffd": 0.20229981896322596,
+  "cores_gnn_u075": 0.2102684459422187,
+  "cores_saturate": 3.55932840873189,
+  "cores_runwait_u075": 4.128034622656176,
+  "cores_runwait_ffd": 2.5355328549148224
+ },
+ "latency": {
+  "3": {
+   "torch_us_median": 53.6005,
+   "torch_us_p99": 61.08408,
+   "numpy_us_median": 21.343,
+   "numpy_us_p99": 24.686049999999998
+  },
+  "9": {
+   "torch_us_median": 55.426500000000004,
+   "torch_us_p99": 62.1976,
+   "numpy_us_median": 24.3735,
+   "numpy_us_p99": 27.49426
+  },
+  "17": {
+   "torch_us_median": 57.2245,
+   "torch_us_p99": 62.8652,
+   "numpy_us_median": 27.757,
+   "numpy_us_p99": 30.52518
+  },
+  "65": {
+   "torch_us_median": 75.38550000000001,
+   "torch_us_p99": 92.08662999999999,
+   "numpy_us_median": 53.8655,
+   "numpy_us_p99": 56.54779
+  }
+ },
+ "drop_cpuset": true
+}

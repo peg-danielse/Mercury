@@ -1,0 +1,36 @@
+margin 0.10: windows x daemons 1260, mean label 2.26 cores, fallback to largest (k=3) 44.3 %, label 1: 18.3 %, label 2: 37.4 %
+daemon                       mean label  %at k3 used mean used p95
+hotel-11211                        2.35    48.8     0.112    0.188
+hotel-11212                        2.35    48.8     0.096    0.132
+hotel-11213                        2.35    48.8     0.250    0.383
+hotel-11214                        2.35    48.8     0.173    0.257
+hotel-attractions                  2.36    40.5     0.879    1.014
+hotel-frontend                     2.18    39.3     0.357    0.492
+hotel-geo                          2.12    38.1     0.798    0.955
+hotel-mongod                       2.35    48.8     2.034    2.913
+hotel-profile                      2.38    52.4     0.885    1.039
+hotel-rate                         2.33    45.2     1.007    1.355
+hotel-recommendation               2.25    46.4     0.686    0.869
+hotel-reservation                  2.14    40.5     0.915    1.133
+hotel-review                       2.11    39.3     0.855    1.023
+hotel-search                       2.12    33.3     0.449    0.581
+hotel-user                         2.18    45.2     0.683    0.864
+margin 0.05: windows x daemons 1260, mean label 2.61 cores, fallback to largest (k=3) 69.1 %, label 1: 8.2 %, label 2: 22.7 %
+(a) margin 0.10: no fixed-k run within margin (fallback to largest) in 15.5 % of daemon-windows; projected mean label if k=8 were the largest: 3.03
+(a) margin 0.05: no fixed-k run within margin (fallback to largest) in 35.2 % of daemon-windows; projected mean label if k=8 were the largest: 4.37
+    p95 values: 103 distinct over 3 runs; median ratio between neighbouring values 1.087 (log-bucketed)
+(b) hotel k3 768u: clients/route -> throughput req/s (sum of routes, mean of 4 windows), median p95 ms, Little latency ms (pop/thr)
+    1:14.0k/1.5/0.7  2:21.4k/2.8/0.9  4:25.7k/5.8/1.6  8:29.6k/11.0/2.7  16:31.9k/24.1/5.0  32:40.3k/39.8/7.9  64:46.0k/60.8/13.9  128:50.4k/96.5/25.4  256:46.3k/192.9/55.3  512:51.7k/335.5/99.0  768:57.3k/369.1/134.0
+(b) hotel k1 768u: clients/route -> throughput req/s (sum of routes, mean of 4 windows), median p95 ms, Little latency ms (pop/thr)
+    1:15.1k/1.5/0.7  2:23.1k/2.5/0.9  4:30.4k/6.0/1.3  8:31.0k/13.1/2.6  16:31.0k/33.6/5.2  32:37.7k/48.2/8.5  64:44.6k/71.3/14.3  128:49.8k/96.5/25.7  256:55.9k/159.4/45.8  512:56.4k/276.8/90.8  768:61.9k/402.7/124.0
+(b) hotel saturate 1024u: clients/route -> throughput req/s (sum of routes, mean of 4 windows), median p95 ms, Little latency ms (pop/thr)
+    1:16.2k/1.3/0.6  2:25.8k/2.1/0.8  4:32.8k/3.7/1.2  8:33.0k/8.1/2.4  16:32.1k/21.0/5.0  32:39.0k/39.8/8.2  64:46.2k/58.7/13.9  128:50.8k/83.9/25.2  256:51.9k/159.4/49.3  512:50.7k/285.2/100.9  1024:54.5k/671.1/187.8
+(b) social saturate 1024u: clients/route -> throughput req/s (sum of routes, mean of 4 windows), median p95 ms, Little latency ms (pop/thr)
+    1:2.2k/5.2/1.9  2:3.0k/5.5/2.6  4:5.2k/6.3/3.1  8:7.3k/9.4/4.4  16:9.6k/15.7/6.7  32:9.9k/41.9/13.0  64:9.7k/104.9/26.4  128:9.3k/218.1/54.8  256:9.8k/469.8/104.7  512:9.1k/805.3/224.5  1024:19.3k/1476.4/212.4
+(c) hotel-v5/1-gnn-nopin-gnn_v3       mean cores (sum over daemons)  62.8  wait/slice all daemons  369.5 us  median daemon  277.9 us
+(c) hotel-v5/1-gnn-nopin-gnn_v4       mean cores (sum over daemons)  45.2  wait/slice all daemons  468.5 us  median daemon  396.8 us
+(c) hotel-v5/1-gnn-nopin-gnn_v5       mean cores (sum over daemons)  59.4  wait/slice all daemons  358.2 us  median daemon  270.6 us
+(c) hotel-v5/1-saturate               mean cores (sum over daemons)  28.1  wait/slice all daemons  405.5 us  median daemon  189.4 us
+(c) social-v5/1-gnn-nopin-gnn_v3       mean cores (sum over daemons)  73.1  wait/slice all daemons  355.4 us  median daemon  278.3 us
+(c) social-v5/1-gnn-nopin-gnn_v5       mean cores (sum over daemons)  73.6  wait/slice all daemons  382.4 us  median daemon  299.6 us
+(c) social-v5/1-saturate               mean cores (sum over daemons)  29.0  wait/slice all daemons  482.3 us  median daemon  236.6 us

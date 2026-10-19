@@ -1,0 +1,356 @@
+{
+ "saturate": {
+  "steps": [
+   {
+    "users": 1,
+    "thr": 2065.75,
+    "p99_worst": 9.961500000000001
+   },
+   {
+    "users": 2,
+    "thr": 3845.25,
+    "p99_worst": 11.5343
+   },
+   {
+    "users": 4,
+    "thr": 6016.75,
+    "p99_worst": 14.1558
+   },
+   {
+    "users": 8,
+    "thr": 7944.0,
+    "p99_worst": 19.92295
+   },
+   {
+    "users": 16,
+    "thr": 8206.0,
+    "p99_worst": 39.84585
+   },
+   {
+    "users": 32,
+    "thr": 10114.75,
+    "p99_worst": 52.4288
+   },
+   {
+    "users": 64,
+    "thr": 10189.25,
+    "p99_worst": 83.8861
+   },
+   {
+    "users": 32,
+    "thr": 10273.25,
+    "p99_worst": 60.817449999999994
+   },
+   {
+    "users": 16,
+    "thr": 10881.5,
+    "p99_worst": 37.7487
+   },
+   {
+    "users": 8,
+    "thr": 9657.25,
+    "p99_worst": 20.9715
+   },
+   {
+    "users": 4,
+    "thr": 7041.0,
+    "p99_worst": 13.6315
+   },
+   {
+    "users": 2,
+    "thr": 4637.5,
+    "p99_worst": 11.01005
+   },
+   {
+    "users": 1,
+    "thr": 2725.0,
+    "p99_worst": 9.4372
+   }
+  ],
+  "total_thr": 7199.788461538462,
+  "wake_2u_up": {
+   "all_us_per_slice": 70.43733275436394,
+   "wait_core_s": 32.523734026,
+   "per_daemon_us": {
+    "social-11311": 4.314858100732887,
+    "social-11312": 9.344800206051817,
+    "social-11313": 0.0,
+    "social-ComposePostService": 11.017268301144906,
+    "social-HomeTimelineService": 17.26636686864801,
+    "social-MediaService": 0.13179578863726657,
+    "social-PostStorageService": 89.7523441543438,
+    "social-SocialGraphService": 24.2899559877175,
+    "social-TextService": 11.865719944979368,
+    "social-UniqueIdService": 0.4392109436954798,
+    "social-UrlShortenService": 7.469940649017934,
+    "social-UserMentionService": 6.682707547169811,
+    "social-UserService": 67.38525359032502,
+    "social-UserTimelineService": 8.740349210895655,
+    "social-WriteHomeTimelineService": 0.0,
+    "social-mongod": 178.02958506981037,
+    "social-rabbitmq-server": 15.144981452859351,
+    "social-redis-server": 0.1777040888590704
+   }
+  },
+  "wake_2u_down": {
+   "all_us_per_slice": 128.88849775343832,
+   "wait_core_s": 145.895592809,
+   "per_daemon_us": {
+    "social-11311": 62.65292347220687,
+    "social-11312": 19.066074434797024,
+    "social-11313": 0.0,
+    "social-ComposePostService": 82.0568463580295,
+    "social-HomeTimelineService": 30.219202449438377,
+    "social-MediaService": 32.77928160755148,
+    "social-PostStorageService": 105.76722979099205,
+    "social-SocialGraphService": 219.29377708883237,
+    "social-TextService": 36.664355070667,
+    "social-UniqueIdService": 120.94046604759141,
+    "social-UrlShortenService": 106.13993172753578,
+    "social-UserMentionService": 8.267054507452835,
+    "social-UserService": 129.22055309418323,
+    "social-UserTimelineService": 108.76781540404902,
+    "social-WriteHomeTimelineService": 46.072,
+    "social-mongod": 310.6262050707885,
+    "social-rabbitmq-server": 64.26462717219589,
+    "social-redis-server": 0.06825284772182255
+   }
+  }
+ },
+ "gnn": {
+  "steps": [
+   {
+    "users": 1,
+    "thr": 1682.0,
+    "p99_worst": 11.53435
+   },
+   {
+    "users": 2,
+    "thr": 3001.0,
+    "p99_worst": 12.0586
+   },
+   {
+    "users": 4,
+    "thr": 5135.5,
+    "p99_worst": 19.92295
+   },
+   {
+    "users": 8,
+    "thr": 6029.5,
+    "p99_worst": 29.3601
+   },
+   {
+    "users": 16,
+    "thr": 6781.5,
+    "p99_worst": 54.52595
+   },
+   {
+    "users": 32,
+    "thr": 7591.25,
+    "p99_worst": 60.81745
+   },
+   {
+    "users": 64,
+    "thr": 7713.0,
+    "p99_worst": 104.85759999999999
+   },
+   {
+    "users": 32,
+    "thr": 7696.25,
+    "p99_worst": 62.9146
+   },
+   {
+    "users": 16,
+    "thr": 7902.25,
+    "p99_worst": 52.4288
+   },
+   {
+    "users": 8,
+    "thr": 5446.75,
+    "p99_worst": 44.04015
+   },
+   {
+    "users": 4,
+    "thr": 3810.75,
+    "p99_worst": 31.457250000000002
+   },
+   {
+    "users": 2,
+    "thr": 2668.5,
+    "p99_worst": 17.3015
+   },
+   {
+    "users": 1,
+    "thr": 1317.75,
+    "p99_worst": 11.5343
+   }
+  ],
+  "total_thr": 5136.615384615385,
+  "wake_2u_up": {
+   "all_us_per_slice": 114.21109468260039,
+   "wait_core_s": 50.911080199,
+   "per_daemon_us": {
+    "social-11311": 4.264513951890034,
+    "social-11312": 6.592183546683915,
+    "social-11313": 22.29898245614035,
+    "social-ComposePostService": 9.226086158713418,
+    "social-HomeTimelineService": 18.779166834380096,
+    "social-MediaService": 16.707074788902293,
+    "social-PostStorageService": 320.3445277664397,
+    "social-SocialGraphService": 30.43619548856804,
+    "social-TextService": 12.483257132538823,
+    "social-UniqueIdService": 0.314049356969065,
+    "social-UrlShortenService": 47.44598768297036,
+    "social-UserMentionService": 11.059857069408741,
+    "social-UserService": 81.14302474576272,
+    "social-UserTimelineService": 22.923035532501217,
+    "social-WriteHomeTimelineService": 1544.74,
+    "social-mongod": 226.0652970532488,
+    "social-rabbitmq-server": 15.076791130185981,
+    "social-redis-server": 0.34893142834713664
+   }
+  },
+  "wake_2u_down": {
+   "all_us_per_slice": 242.0954474283241,
+   "wait_core_s": 138.153945934,
+   "per_daemon_us": {
+    "social-11311": 196.2531360856269,
+    "social-11312": 298.86841012897224,
+    "social-11313": 50.01078571428572,
+    "social-ComposePostService": 42.04521719412077,
+    "social-HomeTimelineService": 74.06577595366412,
+    "social-MediaService": 102.12886555607696,
+    "social-PostStorageService": 512.7533786638807,
+    "social-SocialGraphService": 312.5517613327904,
+    "social-TextService": 84.09901673487285,
+    "social-UniqueIdService": 69.24352219074599,
+    "social-UrlShortenService": 37.630915471859616,
+    "social-UserMentionService": 96.35014111302524,
+    "social-UserService": 28.67224592796513,
+    "social-UserTimelineService": 82.10828528601675,
+    "social-WriteHomeTimelineService": 0.0,
+    "social-mongod": 347.9793565327006,
+    "social-rabbitmq-server": 41.726706870229,
+    "social-redis-server": 11.456890541313504
+   }
+  }
+ },
+ "gnn-nopin": {
+  "steps": [
+   {
+    "users": 1,
+    "thr": 1837.25,
+    "p99_worst": 13.631499999999999
+   },
+   {
+    "users": 2,
+    "thr": 2607.75,
+    "p99_worst": 15.20435
+   },
+   {
+    "users": 4,
+    "thr": 3279.0,
+    "p99_worst": 16.2529
+   },
+   {
+    "users": 8,
+    "thr": 6702.25,
+    "p99_worst": 22.0201
+   },
+   {
+    "users": 16,
+    "thr": 7731.25,
+    "p99_worst": 37.7487
+   },
+   {
+    "users": 32,
+    "thr": 8506.25,
+    "p99_worst": 48.23445
+   },
+   {
+    "users": 64,
+    "thr": 8515.5,
+    "p99_worst": 83.8861
+   },
+   {
+    "users": 32,
+    "thr": 9017.75,
+    "p99_worst": 60.81745
+   },
+   {
+    "users": 16,
+    "thr": 8525.5,
+    "p99_worst": 37.7487
+   },
+   {
+    "users": 8,
+    "thr": 5396.25,
+    "p99_worst": 28.31155
+   },
+   {
+    "users": 4,
+    "thr": 5052.25,
+    "p99_worst": 19.92295
+   },
+   {
+    "users": 2,
+    "thr": 3315.0,
+    "p99_worst": 14.6801
+   },
+   {
+    "users": 1,
+    "thr": 1735.25,
+    "p99_worst": 10.4858
+   }
+  ],
+  "total_thr": 5555.4807692307695,
+  "wake_2u_up": {
+   "all_us_per_slice": 125.17786261911833,
+   "wait_core_s": 51.006599215,
+   "per_daemon_us": {
+    "social-11311": 5.643323769338959,
+    "social-11312": 8.294158034738826,
+    "social-11313": 4.076491228070176,
+    "social-ComposePostService": 17.186299802863665,
+    "social-HomeTimelineService": 10.977455901794144,
+    "social-MediaService": 50.70974689826303,
+    "social-PostStorageService": 308.4181465778456,
+    "social-SocialGraphService": 12.036337685417752,
+    "social-TextService": 13.802793405779205,
+    "social-UniqueIdService": 0.8051128349788435,
+    "social-UrlShortenService": 8.06155938989514,
+    "social-UserMentionService": 4.6803542849597255,
+    "social-UserService": 23.941915650052284,
+    "social-UserTimelineService": 9.81852431866612,
+    "social-WriteHomeTimelineService": 0.0,
+    "social-mongod": 283.06261076045934,
+    "social-rabbitmq-server": 16.531769456681353,
+    "social-redis-server": 0.44701014565967834
+   }
+  },
+  "wake_2u_down": {
+   "all_us_per_slice": 156.88706055193282,
+   "wait_core_s": 113.654634598,
+   "per_daemon_us": {
+    "social-11311": 169.49971772569864,
+    "social-11312": 157.47505224511895,
+    "social-11313": 89.29983928571428,
+    "social-ComposePostService": 55.649601687943694,
+    "social-HomeTimelineService": 109.86605052352829,
+    "social-MediaService": 126.9755216831258,
+    "social-PostStorageService": 434.1481336533603,
+    "social-SocialGraphService": 140.21811228481207,
+    "social-TextService": 182.57963568668774,
+    "social-UniqueIdService": 30.617888909988608,
+    "social-UrlShortenService": 203.26387349197566,
+    "social-UserMentionService": 110.24322419978895,
+    "social-UserService": 51.67411654373024,
+    "social-UserTimelineService": 81.21148012901931,
+    "social-WriteHomeTimelineService": 15.556,
+    "social-mongod": 141.2894244126509,
+    "social-rabbitmq-server": 27.29115677966102,
+    "social-redis-server": 18.552896431701516
+   }
+  }
+ }
+}

@@ -1,0 +1,1 @@
+raw: dtn-01:~/Mercury/data/gnn/stressng/mem-*

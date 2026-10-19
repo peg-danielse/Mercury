@@ -1,0 +1,10 @@
+gnn-slo-v1 estimate (written 10:19 CEST 2026-10-19; preliminary, from the non-Jaeger slo-v2 timings: 80 s per -users 32 run,
+~150 s per 1024 run; Jaeger adds a few s per run, refined after the warm-up run)
+Hotel sweep with Jaeger (collect3.sh, started 10:18:41 CEST): 72 runs
+  1 warm-up (discarded) + 2 passes x (G + 10 heavy services x k=1/2/4 + light-all-at-1 + mid-pass G) = 66 + final G = 1
+  + hotel eval references: G x2 at -users 24, G x2 at 1024 = 4
+  measured: 86 s per -users 32 run with Jaeger (warm-up 10:18:41-10:20:06) -> 68 x 86 s + 4 refs ~8 min = ~105 min -> done ~12:05 CEST
+Training (PC, hotel only, lambda grid 4 + 3 fits): ~20-30 min -> ~12:30
+Hotel eval (saturate, v3, gnn-slo-v1 x 2 repeats, at -users 24 and 1024, Jaeger on): 12 runs ~= 6x1.4 + 6x2.6 = ~24 min -> ~12:55
+Social reference (G x2 at -users 12, x2 at 1024) + social eval (12 runs): 4 + 12 runs ~= 8 + 24 = ~32 min -> ~13:30
+Whole sequence: ~3 h 10 min from 10:18 -> ~13:30 CEST (+ analysis/plots ~20 min)

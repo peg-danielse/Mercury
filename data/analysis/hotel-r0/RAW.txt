@@ -1,0 +1,1 @@
+training cases: data/dsb/hotel-cases/r0 (symlinks to data/dsb/hotel-record/20261018-122034/1-saturate/trace-*.jsonl; dtn-01:~/Mercury/data/dsb/hotel-record/20261018-122034), labels = own run share (selflabel runshare). Script: train_gnn.py, diag/dsb_cases.py, mdata.load_self

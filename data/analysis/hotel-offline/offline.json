@@ -1,0 +1,148 @@
+{
+ "cases": [
+  "data/dsb/hotel-cases/r0/hotel-11212",
+  "data/dsb/hotel-cases/r0/hotel-frontend",
+  "data/dsb/hotel-cases/r0/hotel-recommendation",
+  "data/dsb/hotel-cases/r0/hotel-reservation"
+ ],
+ "mae": {
+  "v3": {
+   "thr": 0.07643778492035377,
+   "thr_cont": 0.09085520519553714,
+   "thr_busy": 0.15412827664697848,
+   "cores_ffd": 0.70684747370918,
+   "cores_sum": 0.8961613505802912
+  },
+  "hotel-r0": {
+   "thr": 0.041143862969899206,
+   "thr_cont": 0.09039967076769959,
+   "thr_busy": 0.2246794807038013,
+   "cores_ffd": 0.2368447062544477,
+   "cores_sum": 0.5704101369360419
+  },
+  "hotel-r1": {
+   "thr": 0.038509150786407494,
+   "thr_cont": 0.0919212377968084,
+   "thr_busy": 0.22565691067886112,
+   "cores_ffd": 0.22022021032655967,
+   "cores_sum": 0.562557933933636
+  },
+  "run+wait": {
+   "thr": 0.11246786126450296,
+   "thr_cont": 0.3154642796265141,
+   "thr_busy": 0.3064987833770523,
+   "cores_ffd": 1.8813947971851033,
+   "cores_sum": 1.7715622343816058
+  },
+  "saturate": {
+   "cores_ffd": 6.8617557523523365
+  }
+ },
+ "per_case": {
+  "data/dsb/hotel-cases/r0/hotel-11212": {
+   "v3": {
+    "thr": 0.08200077032656844,
+    "cores_ffd": 0.745634826578178,
+    "pred_sum_mean": 1.2402222156524658,
+    "label_sum_mean": 0.1465194776769678
+   },
+   "hotel-r0": {
+    "thr": 0.017405774510204412,
+    "cores_ffd": 0.023307260804298017,
+    "pred_sum_mean": 0.2089872807264328,
+    "label_sum_mean": 0.1465194776769678
+   },
+   "hotel-r1": {
+    "thr": 0.01307924789126492,
+    "cores_ffd": 0.019277869953385478,
+    "pred_sum_mean": 0.08874490112066269,
+    "label_sum_mean": 0.1465194776769678
+   },
+   "run+wait": {
+    "thr": 0.040944802369900224,
+    "cores_ffd": 0.31235679860946514,
+    "pred_sum_mean": 0.7195480327926872,
+    "label_sum_mean": 0.1465194776769678
+   }
+  },
+  "data/dsb/hotel-cases/r0/hotel-frontend": {
+   "v3": {
+    "thr": 0.08277648603353646,
+    "cores_ffd": 0.6014300952079958,
+    "pred_sum_mean": 0.9754797220230103,
+    "label_sum_mean": 0.48837224506264
+   },
+   "hotel-r0": {
+    "thr": 0.03959917377398606,
+    "cores_ffd": 0.10709911902974756,
+    "pred_sum_mean": 0.09205211699008942,
+    "label_sum_mean": 0.48837224506264
+   },
+   "hotel-r1": {
+    "thr": 0.03718806845100807,
+    "cores_ffd": 0.09094141350294316,
+    "pred_sum_mean": 0.04207172244787216,
+    "label_sum_mean": 0.48837224506264
+   },
+   "run+wait": {
+    "thr": 0.08108578302162579,
+    "cores_ffd": 1.1456958874886423,
+    "pred_sum_mean": 1.623912492974856,
+    "label_sum_mean": 0.48837224506264
+   }
+  },
+  "data/dsb/hotel-cases/r0/hotel-recommendation": {
+   "v3": {
+    "thr": 0.06254568598968434,
+    "cores_ffd": 0.34683042789223456,
+    "pred_sum_mean": 0.4469057023525238,
+    "label_sum_mean": 0.6352119118734825
+   },
+   "hotel-r0": {
+    "thr": 0.05333465122024259,
+    "cores_ffd": 0.21596671949286847,
+    "pred_sum_mean": 0.08665676414966583,
+    "label_sum_mean": 0.6352119118734825
+   },
+   "hotel-r1": {
+    "thr": 0.051293236375986366,
+    "cores_ffd": 0.2012282091917591,
+    "pred_sum_mean": 0.046830471605062485,
+    "label_sum_mean": 0.6352119118734825
+   },
+   "run+wait": {
+    "thr": 0.15668769290536863,
+    "cores_ffd": 2.353050713153724,
+    "pred_sum_mean": 2.6702972861577035,
+    "label_sum_mean": 0.6352119118734825
+   }
+  },
+  "data/dsb/hotel-cases/r0/hotel-reservation": {
+   "v3": {
+    "thr": 0.0770492349385264,
+    "cores_ffd": 1.1325220277371686,
+    "pred_sum_mean": 1.5826008319854736,
+    "label_sum_mean": 1.001979299764865
+   },
+   "hotel-r0": {
+    "thr": 0.050052034701272924,
+    "cores_ffd": 0.6010114978861275,
+    "pred_sum_mean": 0.12863689661026,
+    "label_sum_mean": 1.001979299764865
+   },
+   "hotel-r1": {
+    "thr": 0.048002197641744355,
+    "cores_ffd": 0.569441700580821,
+    "pred_sum_mean": 0.06951561570167542,
+    "label_sum_mean": 1.001979299764865
+   },
+   "run+wait": {
+    "thr": 0.15190643409320942,
+    "cores_ffd": 3.716187917341657,
+    "pred_sum_mean": 4.343610771370636,
+    "label_sum_mean": 1.001979299764865
+   }
+  }
+ },
+ "n_ticks": 101176
+}

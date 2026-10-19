@@ -1,0 +1,19 @@
+| metric | gnn | saturate |
+|---|---|---|
+| repeats | 3 | 3 |
+| throughput_req_s | 5847.996 | 8384.857 |
+| p95_med_ms | 29.360 | 23.069 |
+| p99_med_ms | 41.943 | 31.457 |
+| p99_peak_med_ms | 671.089 | 553.648 |
+| p99_p90_over_windows_ms | 402.653 | 301.990 |
+| errors | 0.000 | 0.000 |
+| core_s_alloc | 11000.044 | 7002.398 |
+| core_s_used | 2398.669 | 3042.800 |
+| used/alloc | 0.219 | 0.434 |
+| changes_per_s | 6.915 | 0.153 |
+| collision_%_samples | 0.000 | 0.000 |
+| collision_threads_mean | 0.000 | 0.000 |
+| cpu0_util_% | 71.588 | 31.341 |
+| gnn_read_us | 703.216 | n/a |
+| gnn_infer_us | 137.543 | n/a |
+| gnn_act_us | 4090.593 | n/a |
