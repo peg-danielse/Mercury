@@ -41,7 +41,7 @@ fi
 #   A token may carry a model: gnn@/abs/model.json or gnn-nopin@/abs/model.json (MERCURY_GNN_MODEL for
 #   that run's mercury; the run dir is named <policy>-<model file stem>).
 # TRACEALL=MS: threadtrace every $PFX daemon at MS ms in every run, from the load generator start
-#   (TRACE_SLOW daemons at 50 ms).
+#   (TRACE_SLOW daemons at 50 ms). TRACE_ONLY="hotel-geo hotel-rate": trace only these daemons.
 # SVC_ARGS: extra operator args per run appended verbatim (e.g. "-svc-min 4 -svc-max 4").
 for r in $(seq 1 $REPS); do for pol in ${POLICIES:-saturate gnn}; do
   MODEL=""; NAME=$pol
@@ -63,6 +63,7 @@ for r in $(seq 1 $REPS); do for pol in ${POLICIES:-saturate gnn}; do
   if [ -n "${TRACEALL:-}" ]; then
     ( for i in $(seq 300); do [ -d /sys/fs/cgroup/mercury/${PFX}loadgen ] && break; sleep 1; done  # services are all up once the load generator starts
       for c in /sys/fs/cgroup/mercury/$PFX*; do d=$(basename $c); iv=$TRACEALL
+        [ -n "${TRACE_ONLY:-}" ] && case " $TRACE_ONLY " in *" $d "*) ;; *) continue;; esac
         case " ${TRACE_SLOW:-} " in *" $d "*) iv=50;; esac
         taskset -c $TRACE_CPUS sudo -n $M/build/threadtrace $d --interval-ms $iv --duration-s 900 --out $D/trace-$d.jsonl 2>/dev/null & done; wait ) &
   fi
