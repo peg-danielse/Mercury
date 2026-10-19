@@ -742,8 +742,10 @@ int main(int argc, char** argv) {
   double watch = 0;
   bool once = false;
   std::vector<App> apps;
+  const std::string home = std::getenv("HOME") != nullptr ? std::getenv("HOME") : ".";
   std::string runs = std::getenv("SPECULATOR_RUNS") != nullptr ? std::getenv("SPECULATOR_RUNS")
-                     : std::string(std::getenv("HOME") != nullptr ? std::getenv("HOME") : ".") + "/Benchmarks/demo/runs";
+                     : std::filesystem::is_directory(home + "/Documents/Benchmarks/demo/runs") ? home + "/Documents/Benchmarks/demo/runs"
+                                                                                                : home + "/Benchmarks/demo/runs";
   for (int i = 2; i < argc; ++i) {
     const std::string arg = argv[i];
     if (arg == "--watch" && i + 1 < argc) {
