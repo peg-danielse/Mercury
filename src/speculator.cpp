@@ -4,15 +4,20 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cctype>
 #include <cmath>
 #include <cstdint>
+#include <fstream>
+#include <map>
+#include <set>
 #include <iomanip>
 #include <iostream>
 #include <sstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -109,10 +114,16 @@ struct Group {
   std::vector<std::string> daemons;
 };
 
+struct Daemon {
+  std::string id;
+  std::vector<int> cpus;
+};
+
 struct MapView {
   int mercury_cpu = -1;
   std::vector<int> allocatable;
   std::vector<Group> groups;
+  std::vector<Daemon> daemons;
 };
 
 class Cursor {
@@ -293,6 +304,31 @@ class Cursor {
   std::size_t at_ = 0;
 };
 
+Daemon parse_daemon(Cursor& cursor) {
+  Daemon daemon;
+  cursor.expect('{');
+  if (cursor.peek() == '}') {
+    cursor.get();
+    return daemon;
+  }
+  while (true) {
+    const auto key = cursor.parse_string();
+    cursor.expect(':');
+    if (key == "daemon_id") {
+      daemon.id = cursor.parse_string();
+    } else if (key == "cpus") {
+      daemon.cpus = cursor.parse_ints();
+    } else {
+      cursor.skip_value();
+    }
+    if (cursor.peek() == '}') {
+      cursor.get();
+      return daemon;
+    }
+    cursor.expect(',');
+  }
+}
+
 Group parse_group(Cursor& cursor) {
   Group group;
   cursor.expect('{');
@@ -345,6 +381,18 @@ MapView parse_map(const std::string& json) {
       if (cursor.peek() != ']') {
         while (true) {
           map.groups.push_back(parse_group(cursor));
+          if (cursor.peek() == ']') {
+            break;
+          }
+          cursor.expect(',');
+        }
+      }
+      cursor.expect(']');
+    } else if (key == "daemons") {
+      cursor.expect('[');
+      if (cursor.peek() != ']') {
+        while (true) {
+          map.daemons.push_back(parse_daemon(cursor));
           if (cursor.peek() == ']') {
             break;
           }
@@ -451,22 +499,144 @@ void print_tree(std::ostream& out, const MapView& map) {
   }
 }
 
+// Per-app view: daemons are grouped by the longest --app name they start with
+// (hotel-a-geo with --app hotel-a), else by the id prefix before the first '-'
+// (hotel-geo, social-mongod). cores = distinct CPUs in the app's cpusets,
+// core_sum = sum of cpuset sizes (cpusets may overlap).
+void print_apps(std::ostream& out, const MapView& map, const std::vector<std::string>& names) {
+  std::map<std::string, std::pair<std::set<int>, std::pair<int, int>>> apps;  // prefix -> (cpus, (daemons, core_sum))
+  for (const auto& daemon : map.daemons) {
+    const auto dash = daemon.id.find('-');
+    std::string key = dash == std::string::npos ? daemon.id : daemon.id.substr(0, dash);
+    for (const auto& name : names) {
+      if (daemon.id.rfind(name + "-", 0) == 0 && name.size() > key.size()) {
+        key = name;
+      }
+    }
+    auto& app = apps[key];
+    app.first.insert(daemon.cpus.begin(), daemon.cpus.end());
+    app.second.first += 1;
+    app.second.second += static_cast<int>(daemon.cpus.size());
+  }
+  if (apps.empty()) {
+    return;
+  }
+  out << "\napps\n";
+  for (const auto& [name, app] : apps) {
+    std::string label = "  " + name;
+    label.append(label.size() < 12 ? 12 - label.size() : 1, ' ');
+    out << label << "daemons " << app.second.first << "  cores " << app.first.size() << "  core_sum " << app.second.second
+        << "  cpus " << format_cpus(std::vector<int>(app.first.begin(), app.first.end())) << '\n';
+  }
+}
+
+// --status FILE: the "key value" lines an operator rewrites every window
+// (operate/goperate -status-file, demoload.go).
+void print_status(std::ostream& out, const std::vector<std::string>& files) {
+  if (files.empty()) {
+    return;
+  }
+  out << "\ndemo (operator status files)\n";
+  const auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                          std::chrono::system_clock::now().time_since_epoch())
+                          .count();
+  for (const auto& file : files) {
+    std::ifstream in(file);
+    if (!in) {
+      out << "  " << file << ": no status yet\n";
+      continue;
+    }
+    std::unordered_map<std::string, std::string> kv;
+    std::vector<std::string> cps;
+    std::string line;
+    while (std::getline(in, line)) {
+      const auto space = line.find(' ');
+      if (space == std::string::npos) {
+        continue;
+      }
+      const auto key = line.substr(0, space);
+      if (key == "cp") {
+        cps.push_back(line.substr(space + 1));
+      } else {
+        kv[key] = line.substr(space + 1);
+      }
+    }
+    const auto get = [&](const char* key) { return kv.count(key) ? kv[key] : std::string("?"); };
+    double age = -1;
+    try {
+      age = static_cast<double>(now_ms - std::stoll(get("unix_ms"))) / 1000.0;
+    } catch (const std::exception&) {
+    }
+    std::string label = "  " + get("app");
+    label.append(label.size() < 12 ? 12 - label.size() : 1, ' ');
+    auto p95 = get("p95_ms_max");  // "4.10 search": worst route's p95 and its name
+    if (const auto space = p95.find(' '); space != std::string::npos) {
+      p95 = p95.substr(0, space) + " ms (" + p95.substr(space + 1) + ")";
+    } else {
+      p95 += " ms";
+    }
+    out << label << "users " << get("target_users") << "  rate " << get("rate") << "/s  p95 " << p95
+        << "  wmean " << get("p95_ms_wmean") << " ms  cores " << get("cores") << " (sum " << get("core_sum")
+        << ", gen " << get("gen_cores") << ")  errors " << get("errors") << "  window " << get("window") << "  t "
+        << get("t_s") << " s  age " << std::setprecision(1) << age << " s\n";
+    for (const auto& cp : cps) {
+      out << "              cp " << cp << '\n';
+    }
+  }
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
-  if (argc != 2) {
-    std::cerr << "usage: speculator <port>\n";
+  const char* usage = "usage: speculator <port> [--watch SECONDS] [--status FILE]... [--app NAME]...\n";
+  if (argc < 2) {
+    std::cerr << usage;
     return 1;
   }
+  double watch = 0;
+  std::vector<std::string> status_files;
+  std::vector<std::string> app_names;
+  for (int i = 2; i < argc; ++i) {
+    const std::string arg = argv[i];
+    if (arg == "--watch" && i + 1 < argc) {
+      watch = std::stod(argv[++i]);
+    } else if (arg == "--status" && i + 1 < argc) {
+      status_files.emplace_back(argv[++i]);
+    } else if (arg == "--app" && i + 1 < argc) {
+      app_names.emplace_back(argv[++i]);
+    } else {
+      std::cerr << usage;
+      return 1;
+    }
+  }
+  int port_number = 0;
   try {
-    const int port_number = std::stoi(argv[1]);
+    port_number = std::stoi(argv[1]);
     if (port_number < 1 || port_number > 65535) {
       throw std::runtime_error("invalid port");
     }
-    const auto map = parse_map(fetch_map(static_cast<std::uint16_t>(port_number)));
-    print_tree(std::cout, map);
   } catch (const std::exception& error) {
     std::cerr << error.what() << std::endl;
     return 1;
+  }
+  while (true) {
+    std::ostringstream frame;
+    bool ok = true;
+    try {
+      const auto map = parse_map(fetch_map(static_cast<std::uint16_t>(port_number)));
+      print_tree(frame, map);
+      print_apps(frame, map, app_names);
+    } catch (const std::exception& error) {
+      ok = false;
+      frame << "mercury :" << port_number << ": " << error.what() << '\n';
+    }
+    frame << std::fixed << std::setprecision(2);
+    print_status(frame, status_files);
+    if (watch <= 0) {
+      (ok ? std::cout : std::cerr) << frame.str();
+      return ok ? 0 : 1;
+    }
+    std::cout << "\033[H\033[2J" << frame.str() << std::flush;
+    std::this_thread::sleep_for(std::chrono::milliseconds(static_cast<long>(watch * 1000)));
   }
 }
