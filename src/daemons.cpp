@@ -1,6 +1,7 @@
 #include "daemons.hpp"
 
-#include "counters.hpp"
+#include "gnn.hpp"
+
 #include "http.hpp"
 #include "policy.hpp"
 #include "resources.hpp"
@@ -67,17 +68,49 @@ constexpr std::string_view kJson = "application/json";
 std::vector<int> daemon_cpus;
 int mercury_linux_cpu = -1;
 
-struct ThreadRing {
-  pid_t tid = -1;
-  std::shared_ptr<Ring> ring;
-};
-
+// arm_daemon attaches saturate (min 1, max 16) to every daemon it starts. /scale updates it.
 struct ScaleState {
   bool enabled = false;
   int min_cores = 1;
   int max_cores = kDefaultMaxCores;
   std::shared_ptr<Policy> policy;
-  std::int64_t added_at_ns = 0;
+  std::int64_t changed_at_ns = 0;
+  // CPU choice for add_core. shift and widen keep their own rules.
+  CpuPlacement placement = CpuPlacement::LeastLoaded;
+  // gnn policy (SPEC.md): monitor_daemon runs a GnnController every gnn_tick_ms instead of saturate.
+  bool gnn = false;
+  int gnn_tick_ms = 10;
+  bool gnn_pin = true;  // false: gnn only sizes the cpuset; every thread keeps the cpuset-wide mask
+};
+
+}  // namespace
+// Defined beside scale_json (outside the anonymous namespace).
+std::shared_ptr<const GnnWeights> gnn_weights(std::string& error);
+namespace {
+
+struct PolicyDoc {
+  bool shift = false;
+  bool grant_on = false;
+  bool widen = false;
+  ResourceLevel level = ResourceLevel::Core;
+  std::string ceiling;
+  int max_groups = 0;  // 0 means the default: every group at the level inside the ceiling
+  std::vector<DegradeComponent> components;
+};
+
+struct PolicyState {
+  bool attached = false;
+  std::uint64_t generation = 0;
+  PolicyDoc doc;
+  std::vector<std::string> grant;
+  // Parallel to grant: when the cpuset was first seen holding none of that group's CPUs (0 = holds some).
+  std::vector<std::int64_t> grant_empty_since;
+  std::vector<std::string> disabled;
+  std::int64_t attached_at_ns = 0;
+  std::int64_t shifted_at_ns = 0;
+  std::int64_t widened_at_ns = 0;
+  std::int64_t degraded_at_ns = 0;
+  std::string path;
 };
 
 struct Daemon {
@@ -88,18 +121,22 @@ struct Daemon {
   int exit_code = -1;
   std::string log;
   std::optional<std::int64_t> finished;
-  std::vector<ThreadRing> threads;
   ScaleState scale;
   int cpu = 0;
   int listen_fd = -1;
   bool counters_done = false;
   // Extra environment for the exec'd process. Empty keeps the inherited environment.
   std::vector<std::pair<std::string, std::string>> env;
+  // policies.md document attached through POST /policies. Default is no document.
+  PolicyState policy;
+  // cgroup cpu.stat ring published by monitor_daemon; read by policy_loop outside daemons_mu.
+  std::shared_ptr<Ring> cgroup_ring;
 };
 
 std::mutex daemons_mu;
 std::condition_variable daemons_cv;
 std::vector<Daemon> daemons;
+std::uint64_t policy_generation = 0;  // under daemons_mu
 
 std::int64_t now_ms() {
   using namespace std::chrono;
@@ -258,6 +295,307 @@ bool valid_env_name(const std::string& name) {
   return true;
 }
 
+// Minimal JSON tree for the nested /policies document.
+struct JNode {
+  enum class Type { Null, Bool, Number, String, Array, Object };
+  Type type = Type::Null;
+  bool boolean = false;
+  double number = 0;
+  std::string text;
+  std::vector<JNode> items;
+  std::vector<std::pair<std::string, JNode>> fields;
+
+  const JNode* get(std::string_view key) const {
+    for (const auto& [name, value] : fields) {
+      if (name == key) {
+        return &value;
+      }
+    }
+    return nullptr;
+  }
+};
+
+class JParser {
+ public:
+  explicit JParser(const std::string& json) : json_(json) {}
+
+  bool parse(JNode& out) {
+    if (!value(out, 0)) {
+      return false;
+    }
+    skip();
+    return at_ == json_.size();
+  }
+
+ private:
+  void skip() {
+    while (at_ < json_.size() && std::isspace(static_cast<unsigned char>(json_[at_])) != 0) {
+      ++at_;
+    }
+  }
+
+  bool literal(std::string_view word) {
+    if (json_.compare(at_, word.size(), word) != 0) {
+      return false;
+    }
+    at_ += word.size();
+    return true;
+  }
+
+  bool value(JNode& out, int depth) {
+    if (depth > 16) {
+      return false;
+    }
+    skip();
+    if (at_ >= json_.size()) {
+      return false;
+    }
+    const char c = json_[at_];
+    if (c == '"') {
+      std::size_t close = 0;
+      out.type = JNode::Type::String;
+      if (!read_json_string(json_, at_, out.text, close)) {
+        return false;
+      }
+      at_ = close + 1;
+      return true;
+    }
+    if (c == '{') {
+      out.type = JNode::Type::Object;
+      ++at_;
+      skip();
+      if (at_ < json_.size() && json_[at_] == '}') {
+        ++at_;
+        return true;
+      }
+      while (true) {
+        skip();
+        std::string key;
+        std::size_t close = 0;
+        if (!read_json_string(json_, at_, key, close)) {
+          return false;
+        }
+        at_ = close + 1;
+        skip();
+        if (at_ >= json_.size() || json_[at_] != ':') {
+          return false;
+        }
+        ++at_;
+        JNode child;
+        if (!value(child, depth + 1)) {
+          return false;
+        }
+        for (const auto& field : out.fields) {
+          if (field.first == key) {
+            return false;  // duplicate key
+          }
+        }
+        out.fields.emplace_back(std::move(key), std::move(child));
+        skip();
+        if (at_ < json_.size() && json_[at_] == ',') {
+          ++at_;
+          continue;
+        }
+        if (at_ < json_.size() && json_[at_] == '}') {
+          ++at_;
+          return true;
+        }
+        return false;
+      }
+    }
+    if (c == '[') {
+      out.type = JNode::Type::Array;
+      ++at_;
+      skip();
+      if (at_ < json_.size() && json_[at_] == ']') {
+        ++at_;
+        return true;
+      }
+      while (true) {
+        JNode child;
+        if (!value(child, depth + 1)) {
+          return false;
+        }
+        out.items.push_back(std::move(child));
+        skip();
+        if (at_ < json_.size() && json_[at_] == ',') {
+          ++at_;
+          continue;
+        }
+        if (at_ < json_.size() && json_[at_] == ']') {
+          ++at_;
+          return true;
+        }
+        return false;
+      }
+    }
+    if (literal("true")) {
+      out.type = JNode::Type::Bool;
+      out.boolean = true;
+      return true;
+    }
+    if (literal("false")) {
+      out.type = JNode::Type::Bool;
+      return true;
+    }
+    if (literal("null")) {
+      out.type = JNode::Type::Null;
+      return true;
+    }
+    const auto begin = at_;
+    while (at_ < json_.size() && (std::isdigit(static_cast<unsigned char>(json_[at_])) != 0 || json_[at_] == '-' ||
+                                  json_[at_] == '+' || json_[at_] == '.' || json_[at_] == 'e' || json_[at_] == 'E')) {
+      ++at_;
+    }
+    if (at_ == begin) {
+      return false;
+    }
+    try {
+      std::size_t used = 0;
+      const auto token = json_.substr(begin, at_ - begin);
+      out.number = std::stod(token, &used);
+      if (used != token.size()) {
+        return false;
+      }
+    } catch (const std::exception&) {
+      return false;
+    }
+    out.type = JNode::Type::Number;
+    return true;
+  }
+
+  const std::string& json_;
+  std::size_t at_ = 0;
+};
+
+bool level_from(const std::string& name, ResourceLevel& level) {
+  for (const auto candidate : {ResourceLevel::Core, ResourceLevel::L3, ResourceLevel::Node, ResourceLevel::Socket}) {
+    if (name == resource_level_name(candidate)) {
+      level = candidate;
+      return true;
+    }
+  }
+  return false;
+}
+
+// Parse the shape. Group names are checked later against the tree. Returns an error text or empty.
+std::string parse_policy_doc(const JNode& root, PolicyDoc& doc, bool& empty) {
+  empty = true;
+  for (const auto& [key, value] : root.fields) {
+    if (key == "daemon_id" || key == "exec_path") {
+      if (value.type != JNode::Type::String) {
+        return key + " is not a string";
+      }
+      continue;
+    }
+    if (key == "shift") {
+      if (value.type != JNode::Type::Bool) {
+        return "shift is not a boolean";
+      }
+      doc.shift = value.boolean;
+      empty = false;
+      continue;
+    }
+    if (key == "restrict") {
+      if (value.type != JNode::Type::Object) {
+        return "restrict is not an object";
+      }
+      empty = false;
+      doc.grant_on = true;
+      for (const auto& [rkey, rvalue] : value.fields) {
+        if (rkey == "level") {
+          if (rvalue.type != JNode::Type::String || !level_from(rvalue.text, doc.level)) {
+            return "unknown restrict.level";
+          }
+        } else if (rkey == "ceiling") {
+          if (rvalue.type != JNode::Type::String || rvalue.text.empty()) {
+            return "restrict.ceiling is not a group name";
+          }
+          doc.ceiling = rvalue.text;
+        } else {
+          return "unknown field restrict." + rkey;
+        }
+      }
+      continue;
+    }
+    if (key == "widen") {
+      empty = false;
+      if (value.type == JNode::Type::Bool) {
+        doc.widen = value.boolean;
+        doc.grant_on = doc.grant_on || value.boolean;
+        continue;
+      }
+      if (value.type != JNode::Type::Object) {
+        return "widen is not an object";
+      }
+      doc.widen = true;
+      doc.grant_on = true;
+      for (const auto& [wkey, wvalue] : value.fields) {
+        if (wkey != "max_groups") {
+          return "unknown field widen." + wkey;
+        }
+        if (wvalue.type != JNode::Type::Number || wvalue.number < 1 || wvalue.number > 4096 ||
+            wvalue.number != static_cast<double>(static_cast<int>(wvalue.number))) {
+          return "widen.max_groups is not a positive integer";
+        }
+        doc.max_groups = static_cast<int>(wvalue.number);
+      }
+      continue;
+    }
+    if (key == "degrade") {
+      empty = false;
+      if (value.type != JNode::Type::Object) {
+        return "degrade is not an object";
+      }
+      for (const auto& [dkey, dvalue] : value.fields) {
+        if (dkey != "components") {
+          return "unknown field degrade." + dkey;
+        }
+        if (dvalue.type != JNode::Type::Array) {
+          return "degrade.components is not an array";
+        }
+        for (const auto& item : dvalue.items) {
+          if (item.type != JNode::Type::Object) {
+            return "degrade component is not an object";
+          }
+          DegradeComponent component;
+          bool have_name = false;
+          bool have_cost = false;
+          for (const auto& [ckey, cvalue] : item.fields) {
+            if (ckey == "name") {
+              if (cvalue.type != JNode::Type::String || !valid_env_name(cvalue.text)) {
+                return "bad component name";
+              }
+              component.name = cvalue.text;
+              have_name = true;
+            } else if (ckey == "cost") {
+              if (cvalue.type != JNode::Type::Number || !(cvalue.number > 0) || cvalue.number > 1) {
+                return "component cost is outside (0, 1]";
+              }
+              component.cost = cvalue.number;
+              have_cost = true;
+            } else {
+              return "unknown component field " + ckey;
+            }
+          }
+          if (!have_name || !have_cost) {
+            return "component needs name and cost";
+          }
+          for (const auto& seen : doc.components) {
+            if (seen.name == component.name) {
+              return "duplicate component " + component.name;
+            }
+          }
+          doc.components.push_back(std::move(component));
+        }
+      }
+      continue;
+    }
+    return "unknown field " + key;
+  }
+  return {};
+}
+
 struct EnvRequest {
   bool present = false;
   bool ok = true;
@@ -379,29 +717,6 @@ std::string read_file(const std::string& path) {
   std::ostringstream text;
   text << in.rdbuf();
   return text.str();
-}
-
-std::vector<pid_t> child_pids(pid_t parent) {
-  std::vector<pid_t> kids;
-  const auto path = "/proc/" + std::to_string(parent) + "/task/" + std::to_string(parent) + "/children";
-  std::ifstream in(path);
-  pid_t pid = 0;
-  while (in >> pid) {
-    kids.push_back(pid);
-  }
-  return kids;
-}
-
-std::vector<pid_t> descendants(pid_t root) {
-  std::vector<pid_t> pending{root};
-  std::vector<pid_t> out;
-  for (std::size_t i = 0; i < pending.size(); ++i) {
-    for (const auto pid : child_pids(pending[i])) {
-      pending.push_back(pid);
-      out.push_back(pid);
-    }
-  }
-  return out;
 }
 
 std::string rings_dir() {
@@ -601,6 +916,77 @@ struct Placement {
   int pin_linux = -1;
 };
 
+std::string node_list(const std::vector<int>& nodes) {
+  std::string out;
+  for (const int node : nodes) {
+    if (!out.empty()) {
+      out += ",";
+    }
+    out += std::to_string(node);
+  }
+  return out;
+}
+
+// cpuset.mems follows cpuset.cpus: the NUMA nodes whose CPUs the cpuset uses.
+// Order keeps every intermediate state valid: mems grows to old|new before
+// cpus is written, and shrinks to new only after.
+const std::vector<std::pair<int, std::vector<int>>>& numa_node_cpus() {
+  static const std::vector<std::pair<int, std::vector<int>>> nodes = [] {
+    std::vector<std::pair<int, std::vector<int>>> out;
+    for (int node = 0; node < 1024; ++node) {
+      const auto text = trimmed(read_file("/sys/devices/system/node/node" + std::to_string(node) + "/cpulist"));
+      if (text.empty()) {
+        if (node > 64) {
+          break;
+        }
+        continue;
+      }
+      if (auto cpus = parse_cpuset(text)) {
+        out.emplace_back(node, *cpus);
+      }
+    }
+    return out;
+  }();
+  return nodes;
+}
+
+std::vector<int> nodes_for_cpus(const std::vector<int>& cpus) {
+  std::vector<int> nodes;
+  for (const auto& [node, node_cpus] : numa_node_cpus()) {
+    for (const int cpu : cpus) {
+      if (std::find(node_cpus.begin(), node_cpus.end(), cpu) != node_cpus.end()) {
+        nodes.push_back(node);
+        break;
+      }
+    }
+  }
+  return nodes;
+}
+
+bool write_cpus_and_mems(const std::string& dir, const std::string& cpus_spec) {
+  const auto want = parse_cpuset(trimmed(cpus_spec));
+  const auto nodes = want ? nodes_for_cpus(*want) : std::vector<int>{};
+  if (nodes.empty()) {
+    return write_sysfs(dir + "/cpuset.cpus", cpus_spec);
+  }
+  std::vector<int> grown = nodes;
+  if (const auto old = parse_cpuset(trimmed(read_file(dir + "/cpuset.mems")))) {
+    grown.insert(grown.end(), old->begin(), old->end());
+    std::sort(grown.begin(), grown.end());
+    grown.erase(std::unique(grown.begin(), grown.end()), grown.end());
+  }
+  if (!write_sysfs(dir + "/cpuset.mems", node_list(grown))) {
+    std::cerr << "cpuset.mems " << dir << " grow to " << node_list(grown) << " failed" << std::endl;
+  }
+  if (!write_sysfs(dir + "/cpuset.cpus", cpus_spec)) {
+    return false;
+  }
+  if (grown != nodes && !write_sysfs(dir + "/cpuset.mems", node_list(nodes))) {
+    std::cerr << "cpuset.mems " << dir << " shrink to " << node_list(nodes) << " failed" << std::endl;
+  }
+  return true;
+}
+
 // The cgroup is restricted before the new process is allowed to widen its mask.
 std::optional<Placement> prepare_placement(const std::string& daemon_id, int linux_cpu) {
   if (linux_cpu < 0 || linux_cpu == mercury_linux_cpu) {
@@ -612,7 +998,7 @@ std::optional<Placement> prepare_placement(const std::string& daemon_id, int lin
   }
   const auto current = trimmed(read_file(*dir + "/cpuset.cpus"));
   if (current.empty()) {
-    if (!write_sysfs(*dir + "/cpuset.cpus", std::to_string(linux_cpu))) {
+    if (!write_cpus_and_mems(*dir, std::to_string(linux_cpu))) {
       return std::nullopt;
     }
     const std::vector<int> want{linux_cpu};
@@ -919,125 +1305,6 @@ static std::int64_t monotonic_ns() {
   return static_cast<std::int64_t>(now.tv_sec) * 1000000000LL + now.tv_nsec;
 }
 
-std::uint64_t cpu_ticks(pid_t tid) {
-  std::ifstream in("/proc/" + std::to_string(tid) + "/stat");
-  std::string line;
-  if (!in || !std::getline(in, line)) {
-    return 0;
-  }
-  const auto paren = line.rfind(')');
-  if (paren == std::string::npos) {
-    return 0;
-  }
-  std::istringstream rest(line.substr(paren + 1));
-  std::string state;
-  unsigned long skip = 0;
-  unsigned long utime = 0;
-  unsigned long stime = 0;
-  rest >> state;
-  for (int i = 0; i < 10; ++i) {
-    rest >> skip;
-  }
-  rest >> utime >> stime;
-  if (!rest) {
-    return 0;
-  }
-  return static_cast<std::uint64_t>(utime) + static_cast<std::uint64_t>(stime);
-}
-
-std::vector<pid_t> busiest_threads(const std::vector<pid_t>& want, const std::vector<pid_t>& already,
-                                   std::unordered_map<pid_t, std::uint64_t>& seen, std::size_t cap) {
-  struct Rank {
-    pid_t tid = -1;
-    std::uint64_t delta = 0;
-  };
-  std::vector<Rank> ranked;
-  ranked.reserve(want.size());
-  for (const auto tid : want) {
-    const auto now = cpu_ticks(tid);
-    const auto previous = seen.find(tid);
-    const auto delta = previous == seen.end() ? 0 : now - previous->second;
-    seen[tid] = now;
-    ranked.push_back(Rank{tid, delta});
-  }
-  for (auto it = seen.begin(); it != seen.end();) {
-    if (std::find(want.begin(), want.end(), it->first) == want.end()) {
-      it = seen.erase(it);
-    } else {
-      ++it;
-    }
-  }
-  const auto by_delta = [](const Rank& a, const Rank& b) {
-    if (a.delta != b.delta) {
-      return a.delta > b.delta;
-    }
-    return a.tid < b.tid;
-  };
-  std::sort(ranked.begin(), ranked.end(), by_delta);
-  std::vector<Rank> members;
-  std::vector<Rank> outsiders;
-  members.reserve(std::min(already.size(), cap));
-  for (const auto& rank : ranked) {
-    if (std::find(already.begin(), already.end(), rank.tid) != already.end()) {
-      members.push_back(rank);
-    } else {
-      outsiders.push_back(rank);
-    }
-  }
-  if (members.size() > cap) {
-    members.resize(cap);
-  }
-  for (const auto& outsider : outsiders) {
-    if (members.size() < cap) {
-      members.push_back(outsider);
-      continue;
-    }
-    // Equal CPU time keeps the thread already open, so the boundary does not flap.
-    if (outsider.delta <= members.back().delta) {
-      break;
-    }
-    members.back() = outsider;
-    std::sort(members.begin(), members.end(), by_delta);
-  }
-  std::vector<pid_t> keep;
-  keep.reserve(members.size());
-  for (const auto& member : members) {
-    keep.push_back(member.tid);
-  }
-  std::sort(keep.begin(), keep.end());
-  return keep;
-}
-
-std::vector<pid_t> task_ids(pid_t pid) {
-  std::vector<pid_t> ids;
-  const auto path = "/proc/" + std::to_string(pid) + "/task";
-  DIR* dir = ::opendir(path.c_str());
-  if (dir == nullptr) {
-    return ids;
-  }
-  while (const auto* entry = ::readdir(dir)) {
-    if (entry->d_name[0] >= '1' && entry->d_name[0] <= '9') {
-      ids.push_back(static_cast<pid_t>(std::atoi(entry->d_name)));
-    }
-  }
-  ::closedir(dir);
-  return ids;
-}
-
-std::vector<pid_t> daemon_tasks(pid_t root) {
-  std::vector<pid_t> procs{root};
-  const auto kids = descendants(root);
-  procs.insert(procs.end(), kids.begin(), kids.end());
-  std::vector<pid_t> tids;
-  for (const auto pid : procs) {
-    const auto tasks = task_ids(pid);
-    tids.insert(tids.end(), tasks.begin(), tasks.end());
-  }
-  std::sort(tids.begin(), tids.end());
-  tids.erase(std::unique(tids.begin(), tids.end()), tids.end());
-  return tids;
-}
-
 std::string format_cpuset(const std::vector<int>& cpus) {
   std::string out;
   for (std::size_t i = 0; i < cpus.size();) {
@@ -1069,7 +1336,10 @@ int cpuset_cores(const std::string& daemon_id) {
   return static_cast<int>(have->size());
 }
 
-bool add_core(const std::string& daemon_id, int max_cores, int& cores_after, std::string& spec_after) {
+// grant_cpus, when set, is every CPU of the daemon's granted groups (policies.md). The exclude list is
+// then the cpuset plus every allocatable CPU outside the grant.
+bool add_core(const std::string& daemon_id, int max_cores, int& cores_after, std::string& spec_after,
+              const std::vector<int>* grant_cpus = nullptr, CpuPlacement placement = CpuPlacement::LeastLoaded) {
   const auto dir = ensure_daemon_cpuset(daemon_id);
   if (!dir) {
     return false;
@@ -1079,14 +1349,22 @@ bool add_core(const std::string& daemon_id, int max_cores, int& cores_after, std
     return false;
   }
   // Least-loaded core. Another daemon may already run on the CPU it returns.
-  auto next = request_cpu(*have);
+  std::vector<int> exclude;
+  if (grant_cpus != nullptr) {
+    for (const int cpu : allocatable_cpus()) {
+      if (!std::binary_search(grant_cpus->begin(), grant_cpus->end(), cpu)) {
+        exclude.push_back(cpu);
+      }
+    }
+  }
+  auto next = request_cpu_for(placement, *have, exclude);
   if (!next) {
     return false;
   }
   have->push_back(*next);
   std::sort(have->begin(), have->end());
   const auto spec = format_cpuset(*have);
-  if (!write_sysfs(*dir + "/cpuset.cpus", spec)) {
+  if (!write_cpus_and_mems(*dir, spec)) {
     return false;
   }
   for (int attempt = 0; attempt < 50; ++attempt) {
@@ -1111,7 +1389,7 @@ bool remove_core(const std::string& daemon_id, int min_cores, int& cores_after, 
   }
   have->pop_back();
   const auto spec = format_cpuset(*have);
-  if (!write_sysfs(*dir + "/cpuset.cpus", spec)) {
+  if (!write_cpus_and_mems(*dir, spec)) {
     return false;
   }
   for (int attempt = 0; attempt < 50; ++attempt) {
@@ -1125,34 +1403,7 @@ bool remove_core(const std::string& daemon_id, int min_cores, int& cores_after, 
   return false;
 }
 
-struct LiveThread {
-  pid_t tid = -1;
-  CounterGroup counters;
-  std::shared_ptr<Ring> ring;
-};
-
-void remember_thread(const std::string& daemon_id, pid_t root, pid_t tid, const std::shared_ptr<Ring>& ring) {
-  std::lock_guard lock(daemons_mu);
-  if (auto* daemon = find_daemon(daemon_id); daemon != nullptr && daemon->pid == root) {
-    daemon->threads.push_back(ThreadRing{tid, ring});
-  }
-}
-
-void forget_thread(const std::string& daemon_id, pid_t root, pid_t tid) {
-  std::lock_guard lock(daemons_mu);
-  if (auto* daemon = find_daemon(daemon_id); daemon != nullptr && daemon->pid == root) {
-    std::erase_if(daemon->threads, [&](const ThreadRing& thread) { return thread.tid == tid; });
-  }
-}
-
-// A full group is several perf fds plus an archive file. Further threads keep
-// task-clock only. Past the cap we open nothing: one fd per thread is what
-// exhausts the process file limit.
-constexpr std::size_t kFullCounterThreads = 16;
-constexpr std::size_t kMaxMonitoredThreads = 64;
-
-// cpu.stat is the kernel total for every task in the daemon cgroup, including
-// threads that never get their own ring.
+// cpu.stat is the kernel total for every task in the daemon cgroup.
 struct CgroupCpu {
   std::uint64_t usage_usec = 0;
   std::uint64_t user_usec = 0;
@@ -1185,6 +1436,62 @@ std::optional<CgroupCpu> read_cgroup_cpu(const std::string& daemon_id) {
   return cpu;
 }
 
+// "some total" of the daemon cgroup cpu.pressure, in microseconds. Empty when PSI is unavailable.
+std::optional<std::uint64_t> read_cgroup_pressure(const std::string& daemon_id) {
+  const auto text = read_file("/sys/fs/cgroup/mercury/" + daemon_id + "/cpu.pressure");
+  const auto line = text.find("some ");
+  if (line == std::string::npos) {
+    return std::nullopt;
+  }
+  const auto total = text.find("total=", line);
+  const auto end = text.find('\n', line);
+  if (total == std::string::npos || (end != std::string::npos && total > end)) {
+    return std::nullopt;
+  }
+  try {
+    return static_cast<std::uint64_t>(std::stoull(text.substr(total + 6)));
+  } catch (const std::exception&) {
+    return std::nullopt;
+  }
+}
+
+std::vector<pid_t> child_pids_of(pid_t pid) {
+  std::vector<pid_t> children;
+  std::istringstream in(read_file("/proc/" + std::to_string(pid) + "/task/" + std::to_string(pid) + "/children"));
+  pid_t child = 0;
+  while (in >> child) {
+    children.push_back(child);
+  }
+  return children;
+}
+
+// Fallback for hosts without PSI: threads in state R across the daemon and its descendants.
+std::uint64_t count_runnable(pid_t root) {
+  std::uint64_t runnable = 0;
+  std::vector<pid_t> todo{root};
+  for (std::size_t n = 0; n < todo.size() && n < 4096; ++n) {
+    const pid_t pid = todo[n];
+    const auto dir = "/proc/" + std::to_string(pid) + "/task";
+    if (DIR* tasks = ::opendir(dir.c_str())) {
+      while (const auto* entry = ::readdir(tasks)) {
+        if (entry->d_name[0] < '0' || entry->d_name[0] > '9') {
+          continue;
+        }
+        const auto stat = read_file(dir + "/" + entry->d_name + "/stat");
+        const auto close = stat.rfind(')');
+        if (close != std::string::npos && close + 2 < stat.size() && stat[close + 2] == 'R') {
+          ++runnable;
+        }
+      }
+      ::closedir(tasks);
+    }
+    for (const pid_t child : child_pids_of(pid)) {
+      todo.push_back(child);
+    }
+  }
+  return runnable;
+}
+
 std::uint64_t usec_delta_ns(std::uint64_t after, std::uint64_t before) {
   if (after < before) {
     return 0;
@@ -1193,114 +1500,58 @@ std::uint64_t usec_delta_ns(std::uint64_t after, std::uint64_t before) {
 }
 
 void monitor_daemon(const std::string& daemon_id, pid_t root) {
-  std::vector<LiveThread> live;
-  std::unordered_map<pid_t, std::uint64_t> cpu_seen;
-  bool reported_cap = false;
-  bool reported_open = false;
-  const std::vector<std::string> daemon_names{"task-clock", "user", "system"};
-  std::shared_ptr<Ring> daemon_ring;
+  // PSI decides the fourth counter for the life of this daemon: pressure, or runnable without PSI.
+  const bool use_psi = read_cgroup_pressure(daemon_id).has_value();
+  const std::vector<std::string> daemon_names{"task-clock", "user", "system", use_psi ? "pressure" : "runnable"};
+  std::shared_ptr<RingArchive> archive;
   try {
-    auto archive = std::make_shared<RingArchive>(rings_dir() + "/" + archive_name(daemon_id) + ".mring", daemon_names);
-    daemon_ring = std::make_shared<Ring>(kRingSlots, daemon_names, archive);
-    std::cout << "counters daemon_id=" << daemon_id << " cgroup" << std::endl;
+    archive = std::make_shared<RingArchive>(rings_dir() + "/" + archive_name(daemon_id) + ".mring", daemon_names);
   } catch (const std::exception& error) {
     std::cerr << "ring archive daemon_id=" << daemon_id << " " << error.what() << std::endl;
   }
+  auto daemon_ring = std::make_shared<Ring>(kRingSlots, daemon_names, archive);
+  {
+    std::lock_guard lock(daemons_mu);
+    if (auto* daemon = find_daemon(daemon_id); daemon != nullptr && daemon->pid == root) {
+      daemon->cgroup_ring = daemon_ring;
+    }
+  }
+  std::cout << "counters daemon_id=" << daemon_id << " cgroup " << daemon_names.back() << std::endl;
   auto previous_cpu = read_cgroup_cpu(daemon_id);
+  auto previous_pressure = use_psi ? read_cgroup_pressure(daemon_id) : std::nullopt;
+  std::unique_ptr<GnnController> gnn;  // only while the gnn policy is attached; its destructor restores affinity
+  long gnn_ticks = 0, gnn_logged = 0, gnn_warned = 0;
+  std::int64_t gnn_read_ns = 0, gnn_infer_ns = 0, gnn_act_ns = 0, gnn_cpuset_ns = 0, gnn_last_log = 0;
   try {
     while (daemon_running(daemon_id, root)) {
-      const auto want = daemon_tasks(root);
-      std::vector<pid_t> keep = want;
-      if (want.size() > kMaxMonitoredThreads) {
-        if (!reported_cap) {
-          std::cerr << "counters daemon_id=" << daemon_id << " thread cap " << kMaxMonitoredThreads << std::endl;
-          reported_cap = true;
-        }
-        std::vector<pid_t> already;
-        already.reserve(live.size());
-        for (const auto& thread : live) {
-          already.push_back(thread.tid);
-        }
-        keep = busiest_threads(want, already, cpu_seen, kMaxMonitoredThreads);
-      } else {
-        cpu_seen.clear();
-      }
-      for (auto it = live.begin(); it != live.end();) {
-        if (std::find(keep.begin(), keep.end(), it->tid) == keep.end()) {
-          it->ring->flush();
-          forget_thread(daemon_id, root, it->tid);
-          it = live.erase(it);
-        } else {
-          ++it;
-        }
-      }
-      bool unmonitored = false;
-      for (const auto tid : keep) {
-        if (std::any_of(live.begin(), live.end(), [&](const LiveThread& thread) { return thread.tid == tid; })) {
-          continue;
-        }
-        try {
-          const bool full = live.size() < kFullCounterThreads;
-          auto counters = full ? open_counters(tid) : open_clock(tid);
-          counters.arm();
-          std::shared_ptr<RingArchive> archive;
-          if (full) {
-            try {
-              archive = std::make_shared<RingArchive>(
-                  rings_dir() + "/" + archive_name(daemon_id) + "." + std::to_string(tid) + ".mring", counters.names());
-            } catch (const std::exception& error) {
-              std::cerr << "ring archive daemon_id=" << daemon_id << " tid=" << tid << " " << error.what() << std::endl;
-            }
-          }
-          auto ring = std::make_shared<Ring>(kRingSlots, counters.names(), archive);
-          remember_thread(daemon_id, root, tid, ring);
-          std::cout << "counters daemon_id=" << daemon_id << " tid=" << tid << std::endl;
-          live.push_back(LiveThread{tid, std::move(counters), std::move(ring)});
-        } catch (const std::exception& error) {
-          // One failure is enough. Retrying every thread in this tick just spends
-          // the remaining descriptors and repeats the same error.
-          if (!reported_open) {
-            std::cerr << "counters daemon_id=" << daemon_id << " tid=" << tid << " " << error.what() << std::endl;
-            reported_open = true;
-          }
-          unmonitored = true;
-          break;
-        }
-      }
-
       std::this_thread::sleep_for(std::chrono::milliseconds(kSampleMs));
       if (!daemon_running(daemon_id, root)) {
         break;
       }
-      for (auto it = live.begin(); it != live.end();) {
-        Sample sample;
-        if (!it->counters.pull(sample)) {
-          it->ring->flush();
-          forget_thread(daemon_id, root, it->tid);
-          it = live.erase(it);
-          continue;
-        }
-        it->ring->push(sample);
-        ++it;
+      const auto current_cpu = read_cgroup_cpu(daemon_id);
+      const auto current_pressure = use_psi ? read_cgroup_pressure(daemon_id) : std::nullopt;
+      const bool pressure_ok =
+          !use_psi || (previous_pressure && current_pressure && *current_pressure >= *previous_pressure);
+      if (previous_cpu && current_cpu && current_cpu->usage_usec >= previous_cpu->usage_usec && pressure_ok) {
+        Sample total;
+        total.timestamp_ns = monotonic_ns();
+        total.nvalues = 4;
+        total.value[0] = usec_delta_ns(current_cpu->usage_usec, previous_cpu->usage_usec);
+        total.value[1] = usec_delta_ns(current_cpu->user_usec, previous_cpu->user_usec);
+        total.value[2] = usec_delta_ns(current_cpu->system_usec, previous_cpu->system_usec);
+        total.value[3] = use_psi ? usec_delta_ns(*current_pressure, *previous_pressure) : count_runnable(root);
+        daemon_ring->push(total);
       }
-      if (daemon_ring) {
-        const auto current_cpu = read_cgroup_cpu(daemon_id);
-        if (previous_cpu && current_cpu && current_cpu->usage_usec >= previous_cpu->usage_usec) {
-          Sample total;
-          total.timestamp_ns = monotonic_ns();
-          total.nvalues = 3;
-          total.value[0] = usec_delta_ns(current_cpu->usage_usec, previous_cpu->usage_usec);
-          total.value[1] = usec_delta_ns(current_cpu->user_usec, previous_cpu->user_usec);
-          total.value[2] = usec_delta_ns(current_cpu->system_usec, previous_cpu->system_usec);
-          daemon_ring->push(total);
-        }
-        if (current_cpu) {
-          previous_cpu = current_cpu;
-        }
+      if (current_cpu) {
+        previous_cpu = current_cpu;
+      }
+      if (current_pressure) {
+        previous_pressure = current_pressure;
       }
 
       ScaleState scale;
-      std::vector<std::shared_ptr<Ring>> rings;
+      bool granted = false;
+      std::vector<std::string> grant;
       {
         std::lock_guard lock(daemons_mu);
         const auto* daemon = find_daemon(daemon_id);
@@ -1308,69 +1559,132 @@ void monitor_daemon(const std::string& daemon_id, pid_t root) {
           break;
         }
         scale = daemon->scale;
-        rings.reserve(daemon->threads.size());
-        for (const auto& thread : daemon->threads) {
-          rings.push_back(thread.ring);
+        granted = daemon->policy.attached && daemon->policy.doc.grant_on;
+        if (granted) {
+          grant = daemon->policy.grant;
+        }
+      }
+      if (!scale.enabled || !scale.policy || !scale.gnn) {
+        if (gnn) {
+          gnn.reset();  // detached or switched away: affinities back to the cpuset-wide mask
+          std::cout << "gnn daemon_id=" << daemon_id << " detached, affinity restored" << std::endl;
         }
       }
       if (!scale.enabled || !scale.policy) {
+        continue;
+      }
+      if (scale.gnn) {
+        if (!gnn) {
+          std::string error;
+          const auto weights = gnn_weights(error);
+          if (!weights) {
+            if (gnn_warned++ % 100 == 0) {
+              std::cerr << "gnn daemon_id=" << daemon_id << " " << error << std::endl;
+            }
+            continue;
+          }
+          gnn = std::make_unique<GnnController>(daemon_id, weights);
+          gnn_ticks = 0;
+          std::cout << "gnn daemon_id=" << daemon_id << " attached tick_ms=" << scale.gnn_tick_ms << std::endl;
+        }
+        if (++gnn_ticks % std::max(1, scale.gnn_tick_ms / kSampleMs) != 0) {
+          continue;
+        }
+        const auto t0 = monotonic_ns();
+        int cores = cpuset_cores(daemon_id);
+        GnnTickStats st;
+        const int target = gnn->observe(cores, scale.min_cores, scale.max_cores, st);
+        if (target < 0) {
+          break;
+        }
+        const int before_cores = cores;
+        int after = 0;
+        std::string spec;
+        while (cores < target && add_core(daemon_id, scale.max_cores, after, spec, nullptr, scale.placement)) {
+          cores = after;
+        }
+        while (cores > target && remove_core(daemon_id, scale.min_cores, after, spec)) {
+          cores = after;
+        }
+        if (cores != before_cores) {
+          std::lock_guard lock(daemons_mu);
+          if (auto* daemon = find_daemon(daemon_id); daemon != nullptr && daemon->pid == root) {
+            daemon->scale.changed_at_ns = monotonic_ns();
+          }
+        }
+        const auto t1 = monotonic_ns();
+        if (const auto cpus = parse_cpuset(trimmed(read_file("/sys/fs/cgroup/mercury/" + daemon_id + "/cpuset.cpus")))) {
+          if (scale.gnn_pin) {
+            gnn->pin(*cpus);
+          } else {
+            gnn->restore();  // no pins: widen anything pinned earlier (cheap when nothing is)
+          }
+        }
+        const auto t2 = monotonic_ns();
+        gnn_read_ns += st.read_ns;
+        gnn_infer_ns += st.infer_ns;
+        gnn_act_ns += t2 - t0 - st.read_ns - st.infer_ns;
+        gnn_cpuset_ns += t1 - t0 - st.read_ns - st.infer_ns;
+        ++gnn_logged;
+        if (cores != before_cores || t2 - gnn_last_log >= 1000000000LL) {
+          std::cout << "gnn daemon_id=" << daemon_id << " cores=" << cores << " required=" << st.required
+                    << " target=" << target << " demand=" << st.demand_sum << " pred=" << st.pred_sum << " breaks=" << st.breaks << " nodes=" << st.nodes
+                    << " threads=" << st.threads << " ticks=" << gnn_logged
+                    << " mean_us read=" << gnn_read_ns / 1000 / gnn_logged << " infer=" << gnn_infer_ns / 1000 / gnn_logged
+                    << " cpuset=" << gnn_cpuset_ns / 1000 / gnn_logged << " act=" << gnn_act_ns / 1000 / gnn_logged
+                    << std::endl;
+          gnn_last_log = t2;
+          gnn_read_ns = gnn_infer_ns = gnn_act_ns = gnn_cpuset_ns = 0;
+          gnn_logged = 0;
+        }
         continue;
       }
       OccupancyWindow window;
       window.cores = cpuset_cores(daemon_id);
       window.min_cores = scale.min_cores;
       window.max_cores = scale.max_cores;
-      window.threads.reserve(rings.size());
-      for (const auto& ring : rings) {
-        if (!ring) {
-          continue;
+      window.runnable = !use_psi;
+      for (const auto& sample : daemon_ring->recent(static_cast<std::size_t>(kScaleWindow) + 1)) {
+        if (sample.timestamp_ns > scale.changed_at_ns) {
+          window.cgroup.push_back(sample);
         }
-        ThreadSamples thread;
-        thread.names = ring->names();
-        for (const auto& sample : ring->recent(static_cast<std::size_t>(kScaleWindow) + 1)) {
-          if (sample.timestamp_ns > scale.added_at_ns) {
-            thread.samples.push_back(sample);
-          }
-        }
-        window.threads.push_back(std::move(thread));
       }
       const int before = window.cores;
       const auto decision = scale.policy->decide(window);
-      // A thread we could not open is invisible. Removing a core from that
-      // partial view would drop capacity the daemon is still using.
-      if (decision == Decision::Hold || (unmonitored && decision == Decision::RemoveCore)) {
+      if (decision == Decision::Hold) {
         continue;
+      }
+      std::vector<int> grant_cpus;
+      if (granted) {
+        for (const auto& info : resource_groups()) {
+          if (std::find(grant.begin(), grant.end(), info.name) != grant.end()) {
+            grant_cpus.insert(grant_cpus.end(), info.linux_cpus.begin(), info.linux_cpus.end());
+          }
+        }
+        std::sort(grant_cpus.begin(), grant_cpus.end());
       }
       int after = 0;
       std::string spec;
       const bool changed = decision == Decision::AddCore
-                               ? add_core(daemon_id, scale.max_cores, after, spec)
+                               ? add_core(daemon_id, scale.max_cores, after, spec, granted ? &grant_cpus : nullptr, scale.placement)
                                : remove_core(daemon_id, scale.min_cores, after, spec);
       if (!changed) {
         continue;
       }
       std::cout << "scale daemon_id=" << daemon_id << " cores=" << after << " cpus=" << spec << std::endl;
-      // Scale-up must wait for a fresh window or the same saturated samples add every core.
-      // Scale-down keeps the window and sheds one core per sample until busy threads fit.
-      if (decision == Decision::AddCore && before >= scale.min_cores) {
+      // Every change, up or down, waits for a fresh full window.
+      (void)before;
+      {
         std::lock_guard lock(daemons_mu);
         if (auto* daemon = find_daemon(daemon_id); daemon != nullptr && daemon->pid == root) {
-          daemon->scale.added_at_ns = monotonic_ns();
+          daemon->scale.changed_at_ns = monotonic_ns();
         }
       }
     }
   } catch (const std::exception& error) {
     std::cerr << "counters daemon_id=" << daemon_id << " " << error.what() << std::endl;
   }
-  for (auto& thread : live) {
-    if (thread.ring) {
-      thread.ring->flush();
-    }
-    forget_thread(daemon_id, root, thread.tid);
-  }
-  if (daemon_ring) {
-    daemon_ring->flush();
-  }
+  daemon_ring->flush();
   mark_counters_done(daemon_id, root);
 }
 
@@ -1386,6 +1700,11 @@ void arm_daemon(const std::string& daemon_id, const std::string& exec_path, int 
     created.cpu = cpu;
     created.listen_fd = listen_fd;
     created.env = std::move(env);
+    created.scale.enabled = true;
+    created.scale.min_cores = 1;
+    created.scale.max_cores = kDefaultMaxCores;
+    created.scale.policy = make_policy("saturate");
+    created.scale.changed_at_ns = monotonic_ns();
     if (auto* daemon = find_daemon(daemon_id)) {
       if (daemon->listen_fd >= 0 && daemon->listen_fd != listen_fd) {
         ::close(daemon->listen_fd);
@@ -1507,7 +1826,7 @@ std::optional<std::string> migrate_route(const std::string& request) {
   }
   const std::vector<int> want{cpu};
   const auto path = *dir + "/cpuset.cpus";
-  if (!write_sysfs(path, std::to_string(cpu))) {
+  if (!write_cpus_and_mems(*dir, std::to_string(cpu))) {
     std::cerr << "migrate daemon_id=" << *daemon_id << " write " << path << " failed" << std::endl;
     return http_response(500, "Internal Server Error", R"({"pid":0})", kJson);
   }
@@ -1572,7 +1891,7 @@ std::optional<std::string> cpus_route(const std::string& request) {
     return http_response(500, "Internal Server Error", ok_json(false), kJson);
   }
   const auto path = *dir + "/cpuset.cpus";
-  if (!write_sysfs(path, trimmed(*cpus_text))) {
+  if (!write_cpus_and_mems(*dir, trimmed(*cpus_text))) {
     std::cerr << "cpus daemon_id=" << *daemon_id << " write " << path << " failed" << std::endl;
     return http_response(500, "Internal Server Error", ok_json(false), kJson);
   }
@@ -1610,6 +1929,32 @@ int scale_int(const std::string& body, const char* key, int fallback, bool& bad)
   }
 }
 
+// The gnn model, loaded once from gnn_model_path() (reloaded if that file changes).
+std::shared_ptr<const GnnWeights> gnn_weights(std::string& error) {
+  static std::mutex mu;
+  static std::shared_ptr<const GnnWeights> cached;
+  static std::string cached_path;
+  static std::int64_t cached_mtime = 0;
+  std::lock_guard lock(mu);
+  const auto path = gnn_model_path();
+  struct stat sb {};
+  if (::stat(path.c_str(), &sb) != 0) {
+    error = "cannot stat " + path;
+    return nullptr;
+  }
+  if (cached && cached_path == path && cached_mtime == static_cast<std::int64_t>(sb.st_mtime)) {
+    return cached;
+  }
+  auto w = load_gnn_weights(path, error);
+  if (w) {
+    cached = w;
+    cached_path = path;
+    cached_mtime = static_cast<std::int64_t>(sb.st_mtime);
+    std::cout << "gnn model " << path << " K=" << w->K << " F=" << w->F << " H=" << w->H << std::endl;
+  }
+  return w;
+}
+
 std::string scale_json(int min_cores, int max_cores, int cores, int threads) {
   return "{\"ok\":true,\"min\":" + std::to_string(min_cores) + ",\"max\":" + std::to_string(max_cores) +
          ",\"cores\":" + std::to_string(cores) + ",\"threads\":" + std::to_string(threads) + "}";
@@ -1627,13 +1972,34 @@ std::optional<std::string> scale_route(const std::string& request) {
   bool bad = false;
   const int min_cores = scale_int(body, "min", 1, bad);
   const int max_cores = scale_int(body, "max", kDefaultMaxCores, bad);
+  const int tick_ms = scale_int(body, "tick_ms", 10, bad);
+  const auto pin_text = json_value(body, "pin");
+  const bool gnn_pin = !(pin_text && (*pin_text == "false" || *pin_text == "0"));
   const auto policy_name = json_value(body, "policy");
   const std::string name = policy_name ? *policy_name : "saturate";
-  if (bad || min_cores < 1 || max_cores < min_cores) {
+  // placement is optional; omitted keeps the daemon's current placement.
+  const auto placement_text = json_value(body, "placement");
+  std::optional<CpuPlacement> placement;
+  if (placement_text) {
+    placement = parse_placement(*placement_text);
+    if (!placement) {
+      return http_response(400, "Bad Request", ok_json(false), kJson);
+    }
+  }
+  if (bad || min_cores < 1 || max_cores < min_cores || tick_ms < kSampleMs) {
     return http_response(400, "Bad Request", ok_json(false), kJson);
   }
+  const bool is_gnn = name == "gnn";
+  if (is_gnn) {
+    std::string error;
+    if (!gnn_weights(error)) {
+      std::cerr << "scale daemon_id=" << *daemon_id << " gnn model: " << error << std::endl;
+      return http_response(500, "Internal Server Error", "{\"ok\":false,\"error\":\"gnn model not loadable\"}", kJson);
+    }
+  }
+  // "none" detaches saturate from this daemon, for callers that hold a cpuset fixed.
   const auto policy = make_policy(name);
-  if (!policy) {
+  if (!policy && name != "none") {
     return http_response(400, "Bad Request", ok_json(false), kJson);
   }
   if (!resources_ready() || !least_loaded(ResourceLevel::Core)) {
@@ -1641,29 +2007,35 @@ std::optional<std::string> scale_route(const std::string& request) {
     return http_response(500, "Internal Server Error", ok_json(false), kJson);
   }
 
-  int threads = 0;
   {
     std::lock_guard lock(daemons_mu);
     auto* daemon = find_daemon(*daemon_id);
     if (daemon == nullptr || !daemon->running) {
       return http_response(400, "Bad Request", ok_json(false), kJson);
     }
-    const bool first = !daemon->scale.enabled || daemon->scale.policy == nullptr;
-    daemon->scale.enabled = true;
+    daemon->scale.enabled = policy != nullptr;
     daemon->scale.min_cores = min_cores;
     daemon->scale.max_cores = max_cores;
     daemon->scale.policy = policy;
-    if (first) {
-      daemon->scale.added_at_ns = monotonic_ns();
+    daemon->scale.gnn = is_gnn;
+    daemon->scale.gnn_tick_ms = (tick_ms / kSampleMs) * kSampleMs;
+    daemon->scale.gnn_pin = gnn_pin;
+    if (placement) {
+      daemon->scale.placement = *placement;
+    } else if (is_gnn) {
+      daemon->scale.placement = CpuPlacement::LeastLoaded;  // gnn defaults to the least_loaded hand-out policy
     }
-    threads = static_cast<int>(daemon->threads.size());
+    placement = daemon->scale.placement;
   }
-  std::cout << "scale daemon_id=" << *daemon_id << " least socket "
+  std::cout << "scale daemon_id=" << *daemon_id << " placement=" << placement_name(*placement) << " least socket "
             << resource_choice(least_loaded(ResourceLevel::Socket)) << " node "
             << resource_choice(least_loaded(ResourceLevel::Node)) << " l3 "
             << resource_choice(least_loaded(ResourceLevel::L3)) << " core "
             << resource_choice(least_loaded(ResourceLevel::Core)) << std::endl;
-  return http_response(200, "OK", scale_json(min_cores, max_cores, cpuset_cores(*daemon_id), threads), kJson);
+  auto json = scale_json(min_cores, max_cores, cpuset_cores(*daemon_id), 0);
+  json.insert(json.size() - 1, std::string(",\"placement\":\"") + placement_name(*placement) + "\",\"policy\":\"" + name + "\"" +
+                                   (is_gnn ? ",\"tick_ms\":" + std::to_string((tick_ms / kSampleMs) * kSampleMs) + ",\"pin\":" + (gnn_pin ? "true" : "false") : std::string()));
+  return http_response(200, "OK", json, kJson);
 }
 
 static bool cpus_hit(const std::vector<int>& group_cpus, const std::vector<int>& want) {
@@ -1923,4 +2295,729 @@ std::optional<std::string> kill_route(const std::string& request) {
     return http_response(200, "OK", ok_json(false), kJson);
   }
   return http_response(200, "OK", kill_json(*daemon->finished), kJson);
+}
+
+// ---------------------------------------------------------------------------
+// POST /policies and policy_loop (policies.md)
+// ---------------------------------------------------------------------------
+
+namespace {
+
+std::mutex policy_file_mu;  // serializes the temp+rename of rings/<daemon_id>.policy
+
+std::string policy_file_path(const std::string& daemon_id) {
+  auto dir = rings_dir();
+  if (!dir.empty() && dir.front() != '/') {
+    char cwd[4096];
+    if (::getcwd(cwd, sizeof(cwd)) != nullptr) {
+      dir = std::string(cwd) + "/" + dir;
+    }
+  }
+  return dir + "/" + archive_name(daemon_id) + ".policy";
+}
+
+std::string policy_file_json(const std::vector<DegradeComponent>& components, const std::vector<std::string>& disabled) {
+  std::ostringstream out;
+  out << "{\"components\":[";
+  for (std::size_t i = 0; i < components.size(); ++i) {
+    if (i != 0) {
+      out << ',';
+    }
+    const bool off = std::find(disabled.begin(), disabled.end(), components[i].name) != disabled.end();
+    out << "{\"name\":\"" << components[i].name << "\",\"enabled\":" << (off ? "false" : "true") << '}';
+  }
+  out << "]}\n";
+  return out.str();
+}
+
+// Temp file in the same directory, renamed into place.
+bool write_policy_file(const std::string& path, const std::string& body) {
+  std::lock_guard lock(policy_file_mu);
+  const auto tmp = path + ".tmp." + std::to_string(::getpid());
+  {
+    std::ofstream out(tmp, std::ios::trunc);
+    if (!out) {
+      return false;
+    }
+    out << body;
+    out.flush();
+    if (!out) {
+      ::unlink(tmp.c_str());
+      return false;
+    }
+  }
+  if (::rename(tmp.c_str(), path.c_str()) != 0) {
+    ::unlink(tmp.c_str());
+    return false;
+  }
+  return true;
+}
+
+void remove_policy_file(const std::string& path) {
+  std::lock_guard lock(policy_file_mu);
+  ::unlink(path.c_str());
+}
+
+// The group tree does not change after init_resources. Loads in this copy are stale; use it for shape only.
+const std::vector<ResourceGroupInfo>& group_tree() {
+  static const std::vector<ResourceGroupInfo> tree = resource_groups();
+  return tree;
+}
+
+const ResourceGroupInfo* tree_group(const std::string& name) {
+  for (const auto& group : group_tree()) {
+    if (group.name == name) {
+      return &group;
+    }
+  }
+  return nullptr;
+}
+
+bool subset_of(const std::vector<int>& small, const std::vector<int>& big) {
+  for (const int cpu : small) {
+    if (!std::binary_search(big.begin(), big.end(), cpu)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool touches(const std::vector<int>& group_cpus, const std::vector<int>& cpus) {
+  for (const int cpu : cpus) {
+    if (std::binary_search(group_cpus.begin(), group_cpus.end(), cpu)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+std::vector<int> sorted_unique(std::vector<int> cpus) {
+  std::sort(cpus.begin(), cpus.end());
+  cpus.erase(std::unique(cpus.begin(), cpus.end()), cpus.end());
+  return cpus;
+}
+
+// CPUs of the ceiling, or every online CPU when there is none.
+std::vector<int> ceiling_cpus(const std::string& ceiling) {
+  std::vector<int> cpus;
+  for (const auto& group : group_tree()) {
+    if (ceiling.empty() ? group.level == ResourceLevel::Socket : group.name == ceiling) {
+      cpus.insert(cpus.end(), group.linux_cpus.begin(), group.linux_cpus.end());
+    }
+  }
+  return sorted_unique(std::move(cpus));
+}
+
+std::vector<int> allocatable_in(const std::vector<int>& cpus) {
+  static const std::vector<int> pool = allocatable_cpus();
+  std::vector<int> out;
+  for (const int cpu : cpus) {
+    if (std::binary_search(pool.begin(), pool.end(), cpu)) {
+      out.push_back(cpu);
+    }
+  }
+  return out;
+}
+
+// Groups at level that contain a CPU of cpus, in tree order.
+std::vector<std::string> groups_holding(ResourceLevel level, const std::vector<int>& cpus) {
+  std::vector<std::string> names;
+  for (const auto& group : group_tree()) {
+    if (group.level == level && touches(group.linux_cpus, cpus)) {
+      names.push_back(group.name);
+    }
+  }
+  return names;
+}
+
+std::vector<int> cpus_of(const std::vector<std::string>& names) {
+  std::vector<int> cpus;
+  for (const auto& name : names) {
+    if (const auto* group = tree_group(name)) {
+      cpus.insert(cpus.end(), group->linux_cpus.begin(), group->linux_cpus.end());
+    }
+  }
+  return sorted_unique(std::move(cpus));
+}
+
+std::optional<std::vector<int>> daemon_cpuset(const std::string& daemon_id) {
+  return parse_cpuset(trimmed(read_file("/sys/fs/cgroup/mercury/" + daemon_id + "/cpuset.cpus")));
+}
+
+bool write_cpuset(const std::string& daemon_id, const std::vector<int>& want) {
+  const auto dir = ensure_daemon_cpuset(daemon_id);
+  if (!dir || !write_cpus_and_mems(*dir, format_cpuset(want))) {
+    return false;
+  }
+  for (int attempt = 0; attempt < 50; ++attempt) {
+    if (cpuset_applied(*dir, want)) {
+      return true;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  return false;
+}
+
+std::string policy_reply(bool ok, const std::string& path, const std::string& error = {}) {
+  std::string body = std::string("{\"ok\":") + (ok ? "true" : "false");
+  if (!path.empty()) {
+    body += ",\"path\":\"" + path + "\"";
+  }
+  if (!error.empty()) {
+    body += ",\"error\":\"" + error + "\"";
+  }
+  return body + "}";
+}
+
+}  // namespace
+
+std::optional<std::string> policies_route(const std::string& request) {
+  if (request_target(request) != "/policies") {
+    return std::nullopt;
+  }
+  const auto body = request_body(request);
+  JNode root;
+  if (!JParser(body).parse(root) || root.type != JNode::Type::Object) {
+    return http_response(400, "Bad Request", policy_reply(false, {}, "body is not a JSON object"), kJson);
+  }
+  const auto* id_node = root.get("daemon_id");
+  if (id_node == nullptr || id_node->type != JNode::Type::String || !safe_daemon_id(id_node->text)) {
+    return http_response(400, "Bad Request", policy_reply(false, {}, "bad daemon_id"), kJson);
+  }
+  const std::string daemon_id = id_node->text;
+  PolicyDoc doc;
+  bool empty = true;
+  if (const auto error = parse_policy_doc(root, doc, empty); !error.empty()) {
+    std::cerr << "policies daemon_id=" << daemon_id << " rejected: " << error << std::endl;
+    return http_response(400, "Bad Request", policy_reply(false, {}, error), kJson);
+  }
+  if (!resources_ready() || !least_loaded(ResourceLevel::Core)) {
+    std::cerr << "policies daemon_id=" << daemon_id << " resource groups are not available" << std::endl;
+    return http_response(500, "Internal Server Error", policy_reply(false, {}, "no resource groups"), kJson);
+  }
+  if (!doc.ceiling.empty()) {
+    const auto* ceiling = tree_group(doc.ceiling);
+    if (ceiling == nullptr) {
+      return http_response(400, "Bad Request", policy_reply(false, {}, "unknown ceiling"), kJson);
+    }
+    // The ceiling is an ancestor of the granted groups: its level is the grant level or above it.
+    if (static_cast<int>(ceiling->level) > static_cast<int>(doc.level)) {
+      return http_response(400, "Bad Request", policy_reply(false, {}, "ceiling is below the grant level"), kJson);
+    }
+  }
+  const auto* exec_node = root.get("exec_path");
+
+  pid_t pid = -1;
+  int stored_cpu = -1;
+  {
+    std::lock_guard lock(daemons_mu);
+    const auto* daemon = find_daemon(daemon_id);
+    if (daemon == nullptr || !daemon->running) {
+      return http_response(400, "Bad Request", policy_reply(false, {}, "daemon is not running"), kJson);
+    }
+    if (exec_node != nullptr && exec_node->text != daemon->exec_path) {
+      return http_response(400, "Bad Request", policy_reply(false, {}, "exec_path differs"), kJson);
+    }
+    pid = daemon->pid;
+    stored_cpu = daemon->cpu;
+  }
+  const auto path = policy_file_path(daemon_id);
+
+  if (empty) {
+    {
+      std::lock_guard lock(daemons_mu);
+      auto* daemon = find_daemon(daemon_id);
+      if (daemon == nullptr || !daemon->running || daemon->pid != pid) {
+        return http_response(400, "Bad Request", policy_reply(false, {}, "daemon is not running"), kJson);
+      }
+      daemon->policy = PolicyState{};
+    }
+    remove_policy_file(path);
+    std::cout << "policies daemon_id=" << daemon_id << " removed" << std::endl;
+    return http_response(200, "OK", policy_reply(true, {}), kJson);
+  }
+
+  auto cpuset = daemon_cpuset(daemon_id);
+  std::vector<int> cpus = cpuset ? *cpuset : std::vector<int>{stored_cpu};
+  if (!doc.ceiling.empty() && !subset_of(cpus, ceiling_cpus(doc.ceiling))) {
+    return http_response(400, "Bad Request", policy_reply(false, {}, "cpuset sticks out of the ceiling"), kJson);
+  }
+
+  PolicyState state;
+  state.attached = true;
+  state.doc = doc;
+  if (doc.grant_on) {
+    state.grant = groups_holding(doc.level, cpus);
+    state.grant_empty_since.assign(state.grant.size(), 0);
+    if (state.doc.max_groups == 0) {
+      const auto inside = ceiling_cpus(doc.ceiling);
+      for (const auto& group : group_tree()) {
+        if (group.level == doc.level && subset_of(group.linux_cpus, inside)) {
+          ++state.doc.max_groups;
+        }
+      }
+    }
+  }
+  state.attached_at_ns = monotonic_ns();
+  {
+    std::lock_guard lock(daemons_mu);
+    auto* daemon = find_daemon(daemon_id);
+    if (daemon == nullptr || !daemon->running || daemon->pid != pid) {
+      return http_response(400, "Bad Request", policy_reply(false, {}, "daemon is not running"), kJson);
+    }
+    state.generation = ++policy_generation;
+    state.path = doc.components.empty() ? std::string{} : path;
+    daemon->policy = state;
+  }
+  std::string written;
+  if (!doc.components.empty()) {
+    if (!write_policy_file(path, policy_file_json(doc.components, {}))) {
+      std::cerr << "policies daemon_id=" << daemon_id << " could not write " << path << std::endl;
+      return http_response(500, "Internal Server Error", policy_reply(false, {}, "policy file write failed"), kJson);
+    }
+    written = path;
+  } else {
+    remove_policy_file(path);
+  }
+  std::cout << "policies daemon_id=" << daemon_id << " shift=" << (doc.shift ? 1 : 0)
+            << " grant=" << (doc.grant_on ? resource_level_name(doc.level) : "none")
+            << " ceiling=" << (doc.ceiling.empty() ? "none" : doc.ceiling) << " max_groups=" << state.doc.max_groups
+            << " groups=" << state.grant.size() << " components=" << doc.components.size() << std::endl;
+  return http_response(200, "OK", policy_reply(true, written), kJson);
+}
+
+namespace {
+
+struct PolicySnap {
+  std::string daemon_id;
+  pid_t pid = -1;
+  int stored_cpu = -1;
+  PolicyState state;
+  ScaleState scale;
+  std::shared_ptr<Ring> cgroup_ring;
+  std::vector<int> cpus;
+  bool moved = false;
+};
+
+using Loads = std::vector<std::optional<double>>;
+
+double latest_or_zero(const Loads& loads) { return !loads.empty() && loads.back() ? *loads.back() : 0.0; }
+
+// task-clock (value[0]) of the cgroup ring over the last 1 s. Empty when no sample fell in it.
+std::optional<std::uint64_t> clock_last_second(const std::shared_ptr<Ring>& ring, std::int64_t now) {
+  if (!ring) {
+    return std::nullopt;
+  }
+  std::optional<std::uint64_t> total;
+  for (const auto& sample : ring->recent(static_cast<std::size_t>(kPolicyIntervalNs / 1000000 / kSampleMs) + 20)) {
+    if (sample.timestamp_ns > now - kPolicyIntervalNs && sample.timestamp_ns <= now && sample.nvalues >= 1) {
+      total = total.value_or(0) + sample.value[0];
+    }
+  }
+  return total;
+}
+
+// The saturate add test over the last 1 s: the window means of the cgroup ring over the samples of
+// that second, with the thresholds of SaturatePolicy (occupancy >= 0.85 and pressure >= 0.10).
+bool saturated_last_second(const PolicySnap& snap, std::int64_t now) {
+  if (!snap.cgroup_ring || snap.cpus.empty()) {
+    return false;
+  }
+  const auto recent = snap.cgroup_ring->recent(static_cast<std::size_t>(kPolicyIntervalNs / 1000000 / kSampleMs) + 20);
+  std::vector<Sample> second;
+  for (std::size_t i = 0; i < recent.size(); ++i) {
+    if (recent[i].timestamp_ns > now - kPolicyIntervalNs && recent[i].timestamp_ns <= now) {
+      if (second.empty() && i > 0) {
+        second.push_back(recent[i - 1]);  // the gap before the first sample of the second
+      }
+      second.push_back(recent[i]);
+    }
+  }
+  if (second.size() < 2) {
+    return false;
+  }
+  const bool runnable = snap.cgroup_ring->names().size() > 3 && snap.cgroup_ring->names()[3] == "runnable";
+  const auto cores = static_cast<int>(snap.cpus.size());
+  const auto means = window_means(second, cores, second.size() - 1, runnable);
+  return means && saturate_add_test(*means, cores, runnable);
+}
+
+bool cooled(std::int64_t since, std::int64_t now) {
+  return since == 0 || now - since >= kPolicyIntervalNs * kPolicyIntervals;
+}
+
+// Store a change only when the document was not replaced in between.
+template <typename Fn>
+bool store_policy(const PolicySnap& snap, Fn&& fn) {
+  std::lock_guard lock(daemons_mu);
+  auto* daemon = find_daemon(snap.daemon_id);
+  if (daemon == nullptr || !daemon->running || daemon->pid != snap.pid || !daemon->policy.attached ||
+      daemon->policy.generation != snap.state.generation) {
+    return false;
+  }
+  fn(*daemon);
+  return true;
+}
+
+void run_shift(std::vector<PolicySnap>& snaps, const std::unordered_map<std::string, Loads>& loads,
+               std::unordered_map<std::string, std::int64_t>& node_left_at, std::int64_t now) {
+  const auto& tree = group_tree();
+  std::vector<const ResourceGroupInfo*> nodes;
+  for (const auto& group : tree) {
+    if (group.level == ResourceLevel::Node) {
+      nodes.push_back(&group);
+    }
+  }
+  auto hot = [&](const std::string& name) {
+    const auto it = loads.find(name);
+    return it != loads.end() && node_hot(it->second);
+  };
+  auto latest = [&](const std::string& name) {
+    const auto it = loads.find(name);
+    return it == loads.end() ? 0.0 : latest_or_zero(it->second);
+  };
+  for (const auto* source : nodes) {
+    if (!hot(source->name) || !cooled(node_left_at[source->name], now)) {
+      continue;
+    }
+    struct Ranked {
+      PolicySnap* snap;
+      std::uint64_t rank;
+    };
+    std::vector<Ranked> ranked;
+    for (auto& snap : snaps) {
+      if (snap.scale.gnn || !snap.state.doc.shift || snap.moved || !touches(source->linux_cpus, snap.cpus) ||
+          !cooled(snap.state.attached_at_ns, now) || !cooled(snap.state.shifted_at_ns, now) ||
+          !cooled(snap.state.widened_at_ns, now)) {
+        continue;
+      }
+      const auto inside = ceiling_cpus(snap.state.doc.ceiling);
+      bool other = false;
+      for (const auto* node : nodes) {
+        if (node != source && subset_of(node->linux_cpus, inside)) {
+          other = true;
+        }
+      }
+      if (!other) {
+        continue;
+      }
+      const auto rank = clock_last_second(snap.cgroup_ring, now);
+      if (!rank) {
+        continue;
+      }
+      ranked.push_back(Ranked{&snap, *rank});
+    }
+    std::sort(ranked.begin(), ranked.end(), [](const Ranked& a, const Ranked& b) {
+      if (a.rank != b.rank) {
+        return a.rank > b.rank;
+      }
+      return a.snap->daemon_id < b.snap->daemon_id;
+    });
+    for (auto& candidate : ranked) {
+      auto& snap = *candidate.snap;
+      const auto inside = ceiling_cpus(snap.state.doc.ceiling);
+      const ResourceGroupInfo* dest = nullptr;
+      for (const auto* node : nodes) {
+        if (node == source || hot(node->name) || !subset_of(node->linux_cpus, inside) ||
+            allocatable_in(node->linux_cpus).size() < snap.cpus.size()) {
+          continue;
+        }
+        if (dest == nullptr || latest(node->name) < latest(dest->name) ||
+            (latest(node->name) == latest(dest->name) && node->linux_cpus.front() < dest->linux_cpus.front())) {
+          dest = node;
+        }
+      }
+      if (dest == nullptr) {
+        continue;
+      }
+      std::vector<int> eligible;
+      const auto level = snap.state.doc.grant_on ? snap.state.doc.level : ResourceLevel::Core;
+      if (level == ResourceLevel::Core || level == ResourceLevel::L3) {
+        const ResourceGroupInfo* best_l3 = nullptr;
+        for (const auto& child : dest->children) {
+          const auto* l3 = tree_group(child);
+          if (l3 == nullptr || allocatable_in(l3->linux_cpus).empty()) {
+            continue;
+          }
+          if (best_l3 == nullptr || latest(l3->name) < latest(best_l3->name) ||
+              (latest(l3->name) == latest(best_l3->name) && l3->linux_cpus.front() < best_l3->linux_cpus.front())) {
+            best_l3 = l3;
+          }
+        }
+        if (best_l3 != nullptr) {
+          eligible = allocatable_in(best_l3->linux_cpus);
+        }
+      } else {
+        eligible = allocatable_in(dest->linux_cpus);
+      }
+      std::vector<int> exclude;
+      for (const int cpu : allocatable_cpus()) {
+        if (!std::binary_search(eligible.begin(), eligible.end(), cpu)) {
+          exclude.push_back(cpu);
+        }
+      }
+      std::vector<int> chosen;
+      while (chosen.size() < snap.cpus.size()) {
+        const auto next = request_cpu(exclude);
+        if (!next) {
+          break;
+        }
+        chosen.push_back(*next);
+        exclude.push_back(*next);
+      }
+      if (chosen.size() < snap.cpus.size()) {
+        continue;  // short on the destination; try the next candidate
+      }
+      chosen = sorted_unique(std::move(chosen));
+      if (std::find(chosen.begin(), chosen.end(), mercury_linux_cpu) != chosen.end()) {
+        continue;
+      }
+      if (!write_cpuset(snap.daemon_id, chosen)) {
+        std::cerr << "policy shift daemon_id=" << snap.daemon_id << " cpuset did not take effect" << std::endl;
+        write_cpuset(snap.daemon_id, snap.cpus);
+        break;
+      }
+      const auto stamp = monotonic_ns();
+      store_policy(snap, [&](Daemon& daemon) {
+        daemon.cpu = chosen.front();
+        if (daemon.policy.doc.grant_on) {
+          daemon.policy.grant = groups_holding(daemon.policy.doc.level, chosen);
+          daemon.policy.grant_empty_since.assign(daemon.policy.grant.size(), 0);
+        }
+        daemon.policy.shifted_at_ns = stamp;
+        daemon.scale.changed_at_ns = stamp;
+      });
+      std::cout << "policy shift daemon_id=" << snap.daemon_id << " " << source->name << " -> " << dest->name
+                << " cpus " << format_cpuset(snap.cpus) << " -> " << format_cpuset(chosen) << std::endl;
+      snap.cpus = chosen;
+      snap.moved = true;
+      snap.state.shifted_at_ns = stamp;
+      if (snap.state.doc.grant_on) {
+        snap.state.grant = groups_holding(snap.state.doc.level, chosen);
+        snap.state.grant_empty_since.assign(snap.state.grant.size(), 0);
+      }
+      node_left_at[source->name] = stamp;
+      break;  // one daemon leaves a node per five intervals
+    }
+  }
+}
+
+void run_widen(std::vector<PolicySnap>& snaps, const std::vector<int>& used_cpus, std::int64_t now) {
+  std::vector<ResourceGroupInfo> live;  // current load_of, fetched only when a widen is due
+  for (auto& snap : snaps) {
+    auto& state = snap.state;
+    if (!state.doc.grant_on) {
+      continue;
+    }
+    if (!snap.scale.gnn && state.doc.widen && !snap.moved && cooled(state.attached_at_ns, now) && cooled(state.widened_at_ns, now) &&
+        cooled(state.shifted_at_ns, now) && static_cast<int>(state.grant.size()) < state.doc.max_groups &&
+        (!snap.scale.enabled || static_cast<int>(snap.cpus.size()) < snap.scale.max_cores)) {
+      const auto granted = allocatable_in(cpus_of(state.grant));
+      const bool exhausted = subset_of(granted, snap.cpus);
+      if (exhausted && saturated_last_second(snap, now)) {
+        const auto inside = ceiling_cpus(state.doc.ceiling);
+        if (live.empty()) {
+          live = resource_groups();
+        }
+        std::vector<GroupCandidate> legal;
+        for (const auto& group : live) {
+          if (group.level != state.doc.level || !subset_of(group.linux_cpus, inside) ||
+              std::find(state.grant.begin(), state.grant.end(), group.name) != state.grant.end()) {
+            continue;
+          }
+          auto alloc = allocatable_in(group.linux_cpus);
+          if (alloc.empty()) {
+            continue;
+          }
+          legal.push_back(GroupCandidate{group.name, std::move(alloc), group.load, group.linux_cpus.front()});
+        }
+        if (const auto pick = least_allocated(legal, used_cpus)) {
+          const auto& group = legal[*pick];
+          std::vector<int> exclude = snap.cpus;
+          for (const int cpu : allocatable_cpus()) {
+            if (!std::binary_search(group.allocatable.begin(), group.allocatable.end(), cpu)) {
+              exclude.push_back(cpu);
+            }
+          }
+          if (const auto next = request_cpu(exclude)) {
+            auto want = snap.cpus;
+            want.push_back(*next);
+            want = sorted_unique(std::move(want));
+            if (write_cpuset(snap.daemon_id, want)) {
+              const auto stamp = monotonic_ns();
+              store_policy(snap, [&](Daemon& daemon) {
+                daemon.policy.grant.push_back(group.name);
+                daemon.policy.grant_empty_since.push_back(0);
+                daemon.policy.widened_at_ns = stamp;
+                daemon.scale.changed_at_ns = stamp;
+              });
+              std::cout << "policy widen daemon_id=" << snap.daemon_id << " group " << group.name << " cpus "
+                        << format_cpuset(want) << " groups " << state.grant.size() + 1 << "/" << state.doc.max_groups
+                        << std::endl;
+              snap.cpus = want;
+              state.grant.push_back(group.name);
+              state.grant_empty_since.push_back(0);
+            } else {
+              std::cerr << "policy widen daemon_id=" << snap.daemon_id << " cpuset did not take effect" << std::endl;
+            }
+          }
+        }
+      }
+    }
+    // A group other than the last leaves the grant after five intervals without a CPU of the cpuset.
+    bool changed = false;
+    state.grant_empty_since.resize(state.grant.size(), 0);
+    for (std::size_t i = 0; i < state.grant.size();) {
+      const auto* group = tree_group(state.grant[i]);
+      const bool holds = group != nullptr && touches(group->linux_cpus, snap.cpus);
+      if (holds) {
+        if (state.grant_empty_since[i] != 0) {
+          state.grant_empty_since[i] = 0;
+          changed = true;
+        }
+        ++i;
+        continue;
+      }
+      if (state.grant_empty_since[i] == 0) {
+        state.grant_empty_since[i] = now;
+        changed = true;
+        ++i;
+        continue;
+      }
+      if (state.grant.size() > 1 && now - state.grant_empty_since[i] >= kPolicyIntervalNs * kPolicyIntervals) {
+        std::cout << "policy grant daemon_id=" << snap.daemon_id << " drops " << state.grant[i] << std::endl;
+        state.grant.erase(state.grant.begin() + static_cast<std::ptrdiff_t>(i));
+        state.grant_empty_since.erase(state.grant_empty_since.begin() + static_cast<std::ptrdiff_t>(i));
+        changed = true;
+        continue;
+      }
+      ++i;
+    }
+    if (changed) {
+      store_policy(snap, [&](Daemon& daemon) {
+        daemon.policy.grant = state.grant;
+        daemon.policy.grant_empty_since = state.grant_empty_since;
+      });
+    }
+  }
+}
+
+void run_degrade(std::vector<PolicySnap>& snaps, const std::unordered_map<std::string, Loads>& loads,
+                 std::int64_t now) {
+  for (auto& snap : snaps) {
+    auto& state = snap.state;
+    if (state.doc.components.empty() || !cooled(state.attached_at_ns, now) || !cooled(state.degraded_at_ns, now)) {
+      continue;
+    }
+    Loads series(static_cast<std::size_t>(kPolicyIntervals));
+    std::vector<std::string> sources;
+    if (!state.doc.ceiling.empty()) {
+      sources.push_back(state.doc.ceiling);
+    } else {
+      sources = groups_holding(ResourceLevel::Node, snap.cpus);
+    }
+    for (const auto& name : sources) {
+      const auto it = loads.find(name);
+      if (it == loads.end()) {
+        continue;
+      }
+      for (std::size_t k = 0; k < series.size() && k < it->second.size(); ++k) {
+        if (it->second[k] && (!series[k] || *it->second[k] > *series[k])) {
+          series[k] = it->second[k];
+        }
+      }
+    }
+    const auto next = degrade_set(state.doc.components, state.disabled, series);
+    auto before = state.disabled;
+    auto after = next;
+    std::sort(before.begin(), before.end());
+    std::sort(after.begin(), after.end());
+    if (before == after) {
+      continue;
+    }
+    const auto stamp = monotonic_ns();
+    if (!store_policy(snap, [&](Daemon& daemon) {
+          daemon.policy.disabled = next;
+          daemon.policy.degraded_at_ns = stamp;
+        })) {
+      continue;
+    }
+    const auto path = state.path.empty() ? policy_file_path(snap.daemon_id) : state.path;
+    if (!write_policy_file(path, policy_file_json(state.doc.components, next))) {
+      std::cerr << "policy degrade daemon_id=" << snap.daemon_id << " could not write " << path << std::endl;
+    }
+    std::ostringstream off;
+    for (std::size_t i = 0; i < next.size(); ++i) {
+      off << (i == 0 ? "" : ",") << next[i];
+    }
+    std::cout << "policy degrade daemon_id=" << snap.daemon_id << " U=" << latest_or_zero(series)
+              << " disabled=" << (next.empty() ? "none" : off.str()) << std::endl;
+  }
+}
+
+void policy_tick(std::unordered_map<std::string, std::int64_t>& node_left_at) {
+  const auto now = monotonic_ns();
+  // 1. One interval load per group for each of the last five 1 s stretches.
+  std::unordered_map<std::string, Loads> loads;
+  const auto window = static_cast<std::size_t>(kPolicyIntervals) * static_cast<std::size_t>(kPolicyIntervalNs / 1000000 / kSampleMs) + 50;
+  for (const auto& view : resource_rings(window)) {
+    loads[view.name] = interval_loads(view.samples, now);
+  }
+  // 2. Copy under daemons_mu, then drop it before any ring read or cpuset write.
+  std::vector<PolicySnap> snaps;
+  std::vector<std::pair<std::string, int>> running;
+  {
+    std::lock_guard lock(daemons_mu);
+    for (const auto& daemon : daemons) {
+      if (!daemon.running) {
+        continue;
+      }
+      running.emplace_back(daemon.daemon_id, daemon.cpu);
+      if (!daemon.policy.attached) {
+        continue;
+      }
+      PolicySnap snap;
+      snap.daemon_id = daemon.daemon_id;
+      snap.pid = daemon.pid;
+      snap.stored_cpu = daemon.cpu;
+      snap.state = daemon.policy;
+      snap.scale = daemon.scale;
+      snap.cgroup_ring = daemon.cgroup_ring;
+      snaps.push_back(std::move(snap));
+    }
+  }
+  if (snaps.empty()) {
+    return;
+  }
+  std::vector<int> used;
+  for (const auto& [id, cpu] : running) {
+    if (const auto cpus = daemon_cpuset(id)) {
+      used.insert(used.end(), cpus->begin(), cpus->end());
+    } else {
+      used.push_back(cpu);
+    }
+  }
+  used = sorted_unique(std::move(used));
+  for (auto& snap : snaps) {
+    const auto cpus = daemon_cpuset(snap.daemon_id);
+    snap.cpus = cpus ? *cpus : std::vector<int>{snap.stored_cpu};
+  }
+  // 3. shift, 4. widen and grant pruning, 5. degrade.
+  run_shift(snaps, loads, node_left_at, now);
+  run_widen(snaps, used, now);
+  run_degrade(snaps, loads, now);
+}
+
+}  // namespace
+
+void policy_loop() {
+  std::unordered_map<std::string, std::int64_t> node_left_at;
+  while (true) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+    try {
+      policy_tick(node_left_at);
+    } catch (const std::exception& error) {
+      std::cerr << "policy_loop " << error.what() << std::endl;
+    }
+  }
 }

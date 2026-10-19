@@ -344,3 +344,17 @@ CounterGroup open_clock(pid_t pid) {
   impl->events = open_group(pid, &kTaskClock, 1);
   return CounterGroup(std::move(impl));
 }
+
+namespace {
+constexpr Spec kSoftwareTrio[] = {
+    {"task-clock", PERF_TYPE_SOFTWARE, PERF_COUNT_SW_TASK_CLOCK},
+    {"context-switches", PERF_TYPE_SOFTWARE, PERF_COUNT_SW_CONTEXT_SWITCHES},
+    {"cpu-migrations", PERF_TYPE_SOFTWARE, PERF_COUNT_SW_CPU_MIGRATIONS},
+};
+}  // namespace
+
+CounterGroup open_software(pid_t pid) {
+  auto impl = std::make_unique<CounterGroup::Impl>();
+  impl->events = open_group(pid, kSoftwareTrio, std::size(kSoftwareTrio));
+  return CounterGroup(std::move(impl));
+}

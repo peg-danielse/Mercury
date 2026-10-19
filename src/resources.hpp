@@ -37,10 +37,37 @@ std::optional<ResourceGroupState> least_loaded(ResourceLevel level);
 std::optional<ResourceGroupState> least_loaded_touching(ResourceLevel level,
                                                         const std::vector<int>& linux_cpus);
 
-// Allocatable Linux CPU on the least-loaded core that still has one outside exclude.
+// Allocatable Linux CPU chosen by walking socket → node → L3 → core.
+// At each level the group with fewer exclude CPUs already in it wins, so sibling
+// groups stay even. An equal count keeps the lower load, then the lower Linux CPU.
 // exclude are Linux CPUs the caller already holds. Another daemon may already run on
 // the CPU returned. Empty when every allocatable CPU is excluded.
 std::optional<int> request_cpu(const std::vector<int>& exclude);
+
+// CPU placement used by saturate's add_core. least_loaded is request_cpu above.
+// nearest_first takes the allocatable CPU outside exclude that is closest to held:
+// same core (SMT sibling), then same L3, then same node, then same socket, then any.
+// Within a tier: lower load_of of the candidate's core group, then lower Linux CPU.
+// Empty held falls back to request_cpu(exclude).
+enum class CpuPlacement { LeastLoaded, NearestFirst };
+
+std::optional<int> request_cpu_nearest(const std::vector<int>& held, const std::vector<int>& exclude);
+
+std::optional<int> request_cpu_for(CpuPlacement placement, const std::vector<int>& held, const std::vector<int>& exclude);
+
+inline const char* placement_name(CpuPlacement placement) {
+  return placement == CpuPlacement::NearestFirst ? "nearest_first" : "least_loaded";
+}
+
+inline std::optional<CpuPlacement> parse_placement(const std::string& name) {
+  if (name == "least_loaded") {
+    return CpuPlacement::LeastLoaded;
+  }
+  if (name == "nearest_first") {
+    return CpuPlacement::NearestFirst;
+  }
+  return std::nullopt;
+}
 
 inline const char* resource_level_name(ResourceLevel level) {
   switch (level) {
@@ -83,3 +110,7 @@ struct ResourceRingView {
 
 // count is how many of the newest samples to copy. Zero copies every sample stored.
 std::vector<ResourceRingView> resource_rings(std::size_t count);
+
+// policy_loop (src/daemons.cpp) is registered here so init_resources can detach it beside
+// sample_loop without resources.cpp depending on the daemon table. Call before init_resources.
+void set_policy_loop(void (*loop)());
