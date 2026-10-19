@@ -1113,6 +1113,27 @@ bool add_core(const std::string& daemon_id, int max_cores, int& cores_after, std
   return false;
 }
 
+// "full" baseline: the cpuset becomes the whole daemon pool, and nothing scales it afterwards.
+bool set_full_pool(const std::string& daemon_id, int& cores_after, std::string& spec_after) {
+  const auto dir = ensure_daemon_cpuset(daemon_id);
+  if (!dir || daemon_cpus.empty()) {
+    return false;
+  }
+  const auto spec = format_cpuset(daemon_cpus);
+  if (!write_cpus_and_mems(*dir, spec)) {
+    return false;
+  }
+  for (int attempt = 0; attempt < 50; ++attempt) {
+    if (cpuset_applied(*dir, daemon_cpus)) {
+      cores_after = static_cast<int>(daemon_cpus.size());
+      spec_after = spec;
+      return true;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  return false;
+}
+
 bool remove_core(const std::string& daemon_id, int min_cores, int& cores_after, std::string& spec_after) {
   const auto dir = ensure_daemon_cpuset(daemon_id);
   if (!dir) {
@@ -1712,8 +1733,10 @@ std::optional<std::string> scale_route(const std::string& request) {
     }
   }
   // "none" detaches saturate from this daemon, for callers that hold a cpuset fixed.
+  // "full" detaches it too and gives the daemon the whole pool (min and max do not apply).
+  const bool is_full = name == "full";
   const auto policy = make_policy(name);
-  if (!policy && name != "none") {
+  if (!policy && name != "none" && !is_full) {
     return http_response(400, "Bad Request", ok_json(false), kJson);
   }
   if (!resources_ready() || !least_loaded(ResourceLevel::Core)) {
@@ -1740,6 +1763,22 @@ std::optional<std::string> scale_route(const std::string& request) {
       daemon->scale.placement = CpuPlacement::LeastLoaded;  // gnn defaults to the least_loaded hand-out policy
     }
     placement = daemon->scale.placement;
+  }
+  // Written after the policy is detached above, so the monitor no longer adds or removes cores.
+  if (is_full) {
+    int after = 0;
+    std::string spec;
+    if (!set_full_pool(*daemon_id, after, spec)) {
+      std::cerr << "scale daemon_id=" << *daemon_id << " full: cpuset write failed" << std::endl;
+      return http_response(500, "Internal Server Error", ok_json(false), kJson);
+    }
+    {
+      std::lock_guard lock(daemons_mu);
+      if (auto* daemon = find_daemon(*daemon_id)) {
+        daemon->scale.changed_at_ns = monotonic_ns();
+      }
+    }
+    std::cout << "scale daemon_id=" << *daemon_id << " policy=full cores=" << after << " cpus=" << spec << std::endl;
   }
   std::cout << "scale daemon_id=" << *daemon_id << " placement=" << placement_name(*placement) << " least socket "
             << resource_choice(least_loaded(ResourceLevel::Socket)) << " node "

@@ -21,7 +21,7 @@
 #                      tids, demand = cpu-load/100 (wrappers/stressng). result.json has bogo-ops per step.
 #   --step-s S         stressng steps length (default 3)
 #   --fixed-cpus SPEC  hold the cpuset fixed at SPEC (policy none, POST /cpus) instead of scaling
-#   --policy P         saturate (default) or gnn (posted to /scale after start; gnn uses nearest_first)
+#   --policy P         saturate (default), gnn, or full (the whole pool, unscaled) (posted to /scale after start)
 #   --tick-ms N        gnn decision tick (default 10)
 #   --seed-base N      gnnload GNN_SEED = N + case index (default 0; v4 DAgger rounds use distinct bases)
 #   --no-validate      skip gnn_validate.py

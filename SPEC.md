@@ -78,7 +78,7 @@ When `cpu.pressure` cannot be read (PSI disabled in the kernel), the worker coun
 
 ## Scaling
 
-`saturate` is attached to every daemon when it starts, with `min` 1 and `max` 16. `scale` updates a running daemon: `min` defaults to 1 and `max` defaults to 16. `policy` defaults to `saturate`. An unknown policy is rejected. The policy name `none` detaches `saturate` from that daemon, for callers that hold a cpuset fixed; posting `saturate` again attaches it. Posting again updates the limits and the policy and does not clear the current window.
+`saturate` is attached to every daemon when it starts, with `min` 1 and `max` 16. `scale` updates a running daemon: `min` defaults to 1 and `max` defaults to 16. `policy` defaults to `saturate`. An unknown policy is rejected. The policy name `none` detaches `saturate` from that daemon, for callers that hold a cpuset fixed; posting `saturate` again attaches it. The policy name `full` is the reference baseline for `gnn`: it detaches `saturate` (and `gnn`) like `none`, then `set_full_pool` writes the daemon's cpuset to the whole daemon pool (every CPU after the worker's own, through `write_cpus_and_mems`, polling `cpuset_applied`) and sets `changed_at_ns`. `min` and `max` do not apply to it; the response's `cores` is the pool size. Nothing resizes or pins the daemon afterwards, so the kernel places its threads anywhere in the pool. A failed write is HTTP 500. Several daemons on `full` share the same CPUs. Posting again updates the limits and the policy and does not clear the current window.
 
 `saturate` decides on the mean of the last `kScaleWindow` (64) samples, which is 640 ms. Every sample in the window is newer than the last change of the cpuset by `saturate`.
 
