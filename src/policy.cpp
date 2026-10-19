@@ -347,3 +347,58 @@ std::optional<std::size_t> tune_step(std::vector<TuneParameter>& parameters, con
   }
   return std::nullopt;
 }
+
+std::string validate_zeroctl(const ZeroctlAction& action, const ZeroctlView& view) {
+  const auto& kind = action.action;
+  if (kind == "none" || kind == "stop") {
+    return {};
+  }
+  if (kind != "move" && kind != "scale_out" && kind != "degrade" && kind != "restore") {
+    return "unknown action " + (kind.empty() ? std::string("(empty)") : kind);
+  }
+  const auto daemon = view.daemons.find(action.workload);
+  if (daemon == view.daemons.end()) {
+    return "workload " + (action.workload.empty() ? std::string("(empty)") : action.workload) +
+           " is not a daemon zeroctl may change";
+  }
+  if (kind == "move") {
+    const auto group = view.groups.find(action.node);
+    if (group == view.groups.end()) {
+      return "node " + (action.node.empty() ? std::string("(empty)") : action.node) + " is not a CPU group";
+    }
+    if (group->second.level != view.move_level) {
+      return "move targets a " + view.move_level + " group, not " + group->second.level;
+    }
+    for (const auto& name : daemon->second.groups) {
+      if (name == action.node) {
+        return action.workload + " already runs on " + action.node;
+      }
+    }
+    if (!(group->second.load < 1.0)) {
+      return action.node + " is at 100% load";
+    }
+    if (group->second.allocatable < daemon->second.cpus) {
+      return action.node + " has " + std::to_string(group->second.allocatable) + " allocatable CPUs, " +
+             action.workload + " needs " + std::to_string(daemon->second.cpus);
+    }
+    return {};
+  }
+  if (kind == "scale_out") {
+    if (action.cpus < 1 || action.cpus > view.max_cpus) {
+      return "cpus must be between 1 and " + std::to_string(view.max_cpus);
+    }
+    return {};
+  }
+  const auto component = daemon->second.components.find(action.component);
+  if (component == daemon->second.components.end()) {
+    return "component " + (action.component.empty() ? std::string("(empty)") : action.component) +
+           " is not an optional component of " + action.workload;
+  }
+  if (kind == "degrade" && !component->second) {
+    return action.component + " is already disabled";
+  }
+  if (kind == "restore" && component->second) {
+    return action.component + " is already enabled";
+  }
+  return {};
+}

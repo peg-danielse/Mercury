@@ -1969,6 +1969,11 @@ struct PolicyDoc {
   double tune_limit = kDegradeLimit;
   std::vector<TuneParameter> parameters;
   std::vector<std::vector<TuneValue>> raw_values;
+  // zeroctl: an external model proposes actions (scripts/zeroctl.py via MERCURY_ZEROCTL).
+  bool zeroctl = false;
+  int zeroctl_every = 20;
+  std::string zeroctl_llm = "openai";
+  std::string zeroctl_level = "node";
   std::int64_t attached_tick = 0;
   std::int64_t shifted_tick = -1000000;
   std::int64_t degrade_tick = -1000000;
@@ -2112,7 +2117,7 @@ bool fraction(const JsonValue* value, double& out, bool allow_one_plus = false) 
 
 // Parse a policies.md document into doc. Returns an error string, empty on success.
 std::string parse_policy_doc(const JsonValue& body, PolicyDoc& doc, bool& empty) {
-  static const std::set<std::string> known = {"daemon_id", "exec_path", "shift", "restrict", "widen", "degrade", "tune"};
+  static const std::set<std::string> known = {"daemon_id", "exec_path", "shift", "restrict", "widen", "degrade", "tune", "zeroctl"};
   empty = true;
   for (const auto& [key, _] : body.fields) {
     if (known.count(key) == 0) {
@@ -2242,6 +2247,56 @@ std::string parse_policy_doc(const JsonValue& body, PolicyDoc& doc, bool& empty)
       }
     }
   }
+  if (const auto* zeroctl = body.get("zeroctl")) {
+    if (zeroctl->is_bool()) {
+      doc.zeroctl = zeroctl->boolean;
+    } else if (zeroctl->is_object()) {
+      doc.zeroctl = true;
+      for (const auto& [key, value] : zeroctl->fields) {
+        if (key == "llm") {
+          if (!value.is_string() || (value.text != "openai" && value.text != "gemini" && value.text != "mock")) {
+            return "zeroctl.llm must be openai, gemini, or mock";
+          }
+          doc.zeroctl_llm = value.text;
+        } else if (key == "every") {
+          if (!value.is_number() || value.number < 2 || value.number > 3600) {
+            return "zeroctl.every must be 2..3600 seconds";
+          }
+          doc.zeroctl_every = static_cast<int>(value.number);
+        } else if (key == "level") {
+          if (!value.is_string() || !parse_level(value.text)) {
+            return "zeroctl.level must be socket, node, l3, or core";
+          }
+          doc.zeroctl_level = value.text;
+        } else if (key == "components") {
+          if (doc.degrade) {
+            return "list optional components in degrade or in zeroctl, not both";
+          }
+          if (!value.is_array()) {
+            return "zeroctl.components must be a list";
+          }
+          for (const auto& item : value.items) {
+            const auto* name = item.get("name");
+            const auto* cost = item.get("cost");
+            if (!item.is_object() || item.fields.size() != 2 || name == nullptr || !name->is_string() ||
+                !valid_policy_name(name->text) || cost == nullptr) {
+              return "zeroctl.components entries are {name, cost}";
+            }
+            DegradeComponent component;
+            component.name = name->text;
+            if (!fraction(cost, component.cost)) {
+              return "component cost must be in (0, 1]";
+            }
+            doc.components.push_back(component);
+          }
+        } else {
+          return "unknown field zeroctl." + key;
+        }
+      }
+    } else {
+      return "zeroctl must be true, false, or an object";
+    }
+  }
   if (const auto* tune = body.get("tune")) {
     if (!tune->is_object()) {
       return "tune must be an object";
@@ -2299,7 +2354,8 @@ std::string parse_policy_doc(const JsonValue& body, PolicyDoc& doc, bool& empty)
 std::string doc_state_json(const std::string& daemon_id, const PolicyDoc& doc) {
   std::ostringstream out;
   out << "{\"daemon_id\":\"" << json_escape(daemon_id) << "\",\"pid\":" << doc.pid
-      << ",\"shift\":" << (doc.shift ? "true" : "false") << ",\"trigger\":\"" << trigger_name(doc.rule.trigger)
+      << ",\"shift\":" << (doc.shift ? "true" : "false") << ",\"zeroctl\":" << (doc.zeroctl ? "true" : "false")
+      << ",\"trigger\":\"" << trigger_name(doc.rule.trigger)
       << "\",\"shift_level\":\"" << resource_level_name(doc.shift_level)
       << "\",\"util\":" << fmt_double(doc.rule.hot_util) << ",\"theta\":" << fmt_double(doc.rule.mean_theta)
       << ",\"level\":\"" << doc.level << "\",\"ceiling\":\"" << json_escape(doc.ceiling) << "\",\"degrade_limit\":"
@@ -2702,7 +2758,12 @@ void policy_loop() {
 
 }  // namespace
 
-void start_policy_loop() { std::thread(policy_loop).detach(); }
+void zeroctl_loop();
+
+void start_policy_loop() {
+  std::thread(policy_loop).detach();
+  std::thread(zeroctl_loop).detach();
+}
 
 std::optional<std::string> policies_route(const std::string& request) {
   const auto target = request_target(request);
@@ -2779,7 +2840,13 @@ std::optional<std::string> policies_route(const std::string& request) {
   doc.pid = pid;
   doc.attached_tick = policy_tick.load();
   bool wrote = false;
-  if (doc.degrade || doc.tune) {
+  if (doc.zeroctl) {
+    const char* command = std::getenv("MERCURY_ZEROCTL");
+    if (command == nullptr || command[0] == '\0' || ::access(command, X_OK) != 0) {
+      return bad_policy("zeroctl needs MERCURY_ZEROCTL set to an executable (scripts/zeroctl.py) in mercury's environment");
+    }
+  }
+  if (doc.degrade || doc.tune || !doc.components.empty()) {
     std::filesystem::create_directories(rings_dir());
     doc.path = path;
     wrote = write_policy_file(doc);
@@ -2805,4 +2872,469 @@ std::optional<std::string> policies_route(const std::string& request) {
   }
   body += "}";
   return http_response(200, "OK", body, kJson);
+}
+
+// ---------------------------------------------------------------------------
+// zeroctl: Mercury calls an external model step (MERCURY_ZEROCTL, normally
+// scripts/zeroctl.py). The step gets the state as JSON on stdin and prints one
+// action as JSON on stdout. Mercury validates the action (validate_zeroctl) and
+// applies it; anything illegal or unparsable is recorded as FAILED and ignored.
+// ---------------------------------------------------------------------------
+namespace {
+
+std::vector<std::string> zeroctl_history;  // JSON rows, under policies_mu
+std::int64_t zeroctl_started_ms = 0;       // under policies_mu
+
+std::optional<std::string> run_step(const std::vector<std::string>& argv, const std::string& input, int timeout_s,
+                                    std::string& error) {
+  int in_pipe[2];
+  int out_pipe[2];
+  if (::pipe2(in_pipe, O_CLOEXEC) != 0) {
+    error = "pipe failed";
+    return std::nullopt;
+  }
+  if (::pipe2(out_pipe, O_CLOEXEC) != 0) {
+    ::close(in_pipe[0]);
+    ::close(in_pipe[1]);
+    error = "pipe failed";
+    return std::nullopt;
+  }
+  const pid_t pid = ::fork();
+  if (pid < 0) {
+    error = "fork failed";
+    for (const int fd : {in_pipe[0], in_pipe[1], out_pipe[0], out_pipe[1]}) {
+      ::close(fd);
+    }
+    return std::nullopt;
+  }
+  if (pid == 0) {
+    ::dup2(in_pipe[0], 0);
+    ::dup2(out_pipe[1], 1);
+    ::close_range(3, ~0U, 0);
+    std::vector<char*> args;
+    for (const auto& arg : argv) {
+      args.push_back(const_cast<char*>(arg.c_str()));
+    }
+    args.push_back(nullptr);
+    ::execv(args[0], args.data());
+    ::_exit(127);
+  }
+  ::close(in_pipe[0]);
+  ::close(out_pipe[1]);
+  std::size_t sent = 0;
+  ::signal(SIGPIPE, SIG_IGN);
+  while (sent < input.size()) {
+    const auto n = ::write(in_pipe[1], input.data() + sent, input.size() - sent);
+    if (n <= 0) {
+      break;
+    }
+    sent += static_cast<std::size_t>(n);
+  }
+  ::close(in_pipe[1]);
+  std::string output;
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(timeout_s);
+  bool timed_out = false;
+  while (true) {
+    const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - std::chrono::steady_clock::now()).count();
+    if (left <= 0) {
+      timed_out = true;
+      break;
+    }
+    pollfd pfd{out_pipe[0], POLLIN, 0};
+    const int ready = ::poll(&pfd, 1, static_cast<int>(std::min<long long>(left, 1000)));
+    if (ready < 0 && errno != EINTR) {
+      break;
+    }
+    if (ready <= 0) {
+      continue;
+    }
+    char buffer[4096];
+    const auto n = ::read(out_pipe[0], buffer, sizeof(buffer));
+    if (n <= 0) {
+      break;
+    }
+    output.append(buffer, static_cast<std::size_t>(n));
+    if (output.size() > 65536) {
+      break;
+    }
+  }
+  ::close(out_pipe[0]);
+  if (timed_out) {
+    ::kill(pid, SIGKILL);
+  }
+  int status = 0;
+  ::waitpid(pid, &status, 0);
+  if (timed_out) {
+    error = "model step timed out after " + std::to_string(timeout_s) + "s";
+    return std::nullopt;
+  }
+  if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+    error = "model step exited with " + std::to_string(WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+    if (output.empty()) {
+      return std::nullopt;
+    }
+  }
+  return output;
+}
+
+std::string json_list(const std::vector<std::string>& rows) {
+  std::string out = "[";
+  for (std::size_t i = 0; i < rows.size(); ++i) {
+    if (i != 0) {
+      out += ',';
+    }
+    out += rows[i];
+  }
+  return out + "]";
+}
+
+std::string ints_json(const std::vector<int>& values) {
+  std::string out = "[";
+  for (std::size_t i = 0; i < values.size(); ++i) {
+    if (i != 0) {
+      out += ',';
+    }
+    out += std::to_string(values[i]);
+  }
+  return out + "]";
+}
+
+std::string loads_json(const IntervalLoads& loads) {
+  std::string out = "[";
+  for (std::size_t i = 0; i < loads.size(); ++i) {
+    if (i != 0) {
+      out += ',';
+    }
+    out += loads[i] ? fmt_double(*loads[i]) : std::string("null");
+  }
+  return out + "]";
+}
+
+struct ZeroctlRound {
+  std::string state;
+  ZeroctlView view;
+  std::map<std::string, pid_t> pids;
+  std::map<std::string, std::vector<int>> group_cpus;
+  std::vector<int> allocatable;
+  std::string llm;
+};
+
+ZeroctlRound zeroctl_state(const std::map<std::string, PolicyDoc>& docs) {
+  ZeroctlRound round;
+  const auto tree = resource_groups();
+  round.allocatable = allocatable_cpus();
+  std::sort(round.allocatable.begin(), round.allocatable.end());
+  std::map<std::string, IntervalLoads> loads;
+  std::vector<std::string> events;
+  std::vector<std::string> history;
+  std::int64_t started = 0;
+  {
+    std::lock_guard lock(policies_mu);
+    loads = latest_group_loads;
+    const std::size_t from = policy_events.size() > 20 ? policy_events.size() - 20 : 0;
+    events.assign(policy_events.begin() + static_cast<std::ptrdiff_t>(from), policy_events.end());
+    history = zeroctl_history;
+    started = zeroctl_started_ms;
+  }
+  (void)started;
+  std::map<std::string, std::vector<int>> cpusets;
+  for (const auto& [daemon_id, doc] : docs) {
+    cpusets[daemon_id] = read_cpuset_of(daemon_id);
+    round.pids[daemon_id] = doc.pid;
+    round.view.move_level = doc.zeroctl_level;
+    round.llm = doc.zeroctl_llm;
+  }
+  round.view.max_cpus = std::max(1, std::min<int>(kDefaultMaxCores, static_cast<int>(round.allocatable.size())));
+  std::ostringstream out;
+  out << "{\"mercury_cpu\":" << mercury_linux_cpu << ",\"allocatable\":" << ints_json(round.allocatable)
+      << ",\"interval_s\":1,\"move_level\":\"" << round.view.move_level << "\",\"max_cpus\":" << round.view.max_cpus
+      << ",\"groups\":[";
+  bool first = true;
+  for (const auto& group : tree) {
+    auto cpus = group.linux_cpus;
+    std::sort(cpus.begin(), cpus.end());
+    round.group_cpus[group.name] = cpus;
+    const auto it = loads.find(group.name);
+    const IntervalLoads none(static_cast<std::size_t>(kPolicyIntervals));
+    const auto& group_loads = it == loads.end() ? none : it->second;
+    ZeroctlGroup info;
+    info.level = resource_level_name(group.level);
+    info.load = group_loads.empty() || !group_loads.back() ? 0.0 : *group_loads.back();
+    info.allocatable = static_cast<int>(cpus_inside(round.allocatable, cpus).size());
+    round.view.groups[group.name] = info;
+    std::vector<std::string> on;
+    for (const auto& [daemon_id, set] : cpusets) {
+      if (!cpus_inside(set, cpus).empty()) {
+        on.push_back("\"" + json_escape(daemon_id) + "\"");
+        round.view.daemons[daemon_id].groups.push_back(group.name);
+      }
+    }
+    if (!first) {
+      out << ',';
+    }
+    first = false;
+    out << "{\"name\":\"" << group.name << "\",\"level\":\"" << info.level << "\",\"parent\":\"" << group.parent
+        << "\",\"linux_cpus\":" << ints_json(cpus) << ",\"allocatable\":" << info.allocatable
+        << ",\"loads\":" << loads_json(group_loads) << ",\"daemons\":" << json_list(on) << '}';
+  }
+  out << "],\"daemons\":[";
+  first = true;
+  for (const auto& [daemon_id, doc] : docs) {
+    auto& view = round.view.daemons[daemon_id];
+    view.cpus = static_cast<int>(cpusets[daemon_id].size());
+    ScaleState scale;
+    std::string exec_path;
+    {
+      std::lock_guard lock(daemons_mu);
+      if (const auto* daemon = find_daemon(daemon_id)) {
+        scale = daemon->scale;
+        exec_path = daemon->exec_path;
+      }
+    }
+    if (!first) {
+      out << ',';
+    }
+    first = false;
+    out << "{\"daemon_id\":\"" << json_escape(daemon_id) << "\",\"exec_path\":\"" << json_escape(exec_path)
+        << "\",\"cpus\":" << ints_json(cpusets[daemon_id]) << ",\"groups\":[";
+    for (std::size_t i = 0; i < view.groups.size(); ++i) {
+      out << (i ? "," : "") << '"' << view.groups[i] << '"';
+    }
+    out << "],\"scale\":{\"enabled\":" << (scale.enabled ? "true" : "false") << ",\"min\":" << scale.min_cores
+        << ",\"max\":" << scale.max_cores << "},\"components\":[";
+    for (std::size_t i = 0; i < doc.components.size(); ++i) {
+      const auto& component = doc.components[i];
+      view.components[component.name] = component.enabled;
+      out << (i ? "," : "") << "{\"name\":\"" << component.name << "\",\"cost\":" << fmt_double(component.cost)
+          << ",\"enabled\":" << (component.enabled ? "true" : "false") << '}';
+    }
+    out << "]}";
+  }
+  out << "],\"history\":" << json_list(history) << ",\"events\":" << json_list(events) << '}';
+  round.state = out.str();
+  return round;
+}
+
+std::string text_field(const JsonValue& doc, std::string_view key) {
+  const auto* value = doc.get(key);
+  if (value == nullptr) {
+    return {};
+  }
+  if (value->is_string()) {
+    return value->text;
+  }
+  if (value->is_number()) {
+    std::ostringstream out;
+    out << value->number;
+    return out.str();
+  }
+  return {};
+}
+
+// Apply a validated action. Returns an error string, empty on success.
+std::string apply_zeroctl(const ZeroctlAction& action, const ZeroctlRound& round) {
+  if (action.action == "none" || action.action == "stop") {
+    return {};
+  }
+  const auto pid = round.pids.at(action.workload);
+  if (action.action == "move") {
+    const auto& cpus = round.group_cpus.at(action.node);
+    const auto have = read_cpuset_of(action.workload);
+    std::vector<int> exclude = cpus_outside(round.allocatable, cpus);
+    std::vector<int> chosen;
+    while (chosen.size() < std::max<std::size_t>(have.size(), 1)) {
+      const auto next = request_cpu(exclude);
+      if (!next) {
+        break;
+      }
+      chosen.push_back(*next);
+      exclude.push_back(*next);
+    }
+    if (chosen.size() < std::max<std::size_t>(have.size(), 1)) {
+      return action.node + " cannot supply " + std::to_string(have.size()) + " CPUs";
+    }
+    std::sort(chosen.begin(), chosen.end());
+    if (!write_daemon_cpuset(action.workload, chosen)) {
+      return "cpuset write did not take effect";
+    }
+    std::lock_guard lock(daemons_mu);
+    if (auto* daemon = find_daemon(action.workload); daemon != nullptr && daemon->pid == pid) {
+      daemon->cpu = chosen.front();
+      daemon->scale.added_at_ns = monotonic_ns();
+      // A ceiling would pull saturate back; zeroctl's move replaces it.
+      daemon->scale.outside.clear();
+    }
+    return {};
+  }
+  if (action.action == "scale_out") {
+    std::lock_guard lock(daemons_mu);
+    auto* daemon = find_daemon(action.workload);
+    if (daemon == nullptr || daemon->pid != pid || !daemon->running) {
+      return action.workload + " is not running";
+    }
+    const bool first = !daemon->scale.enabled || daemon->scale.policy == nullptr;
+    daemon->scale.enabled = true;
+    daemon->scale.min_cores = action.cpus;
+    daemon->scale.max_cores = action.cpus;
+    if (first) {
+      daemon->scale.policy = make_policy("saturate");
+      daemon->scale.added_at_ns = monotonic_ns();
+    }
+    return {};
+  }
+  // degrade / restore
+  std::lock_guard lock(policies_mu);
+  auto it = policy_docs.find(action.workload);
+  if (it == policy_docs.end() || it->second.pid != pid) {
+    return action.workload + " lost its policy document";
+  }
+  for (auto& component : it->second.components) {
+    if (component.name == action.component) {
+      component.enabled = action.action == "restore";
+    }
+  }
+  it->second.degrade_tick = policy_tick.load();
+  if (!write_policy_file(it->second)) {
+    return "could not write " + it->second.path;
+  }
+  return {};
+}
+
+void zeroctl_round() {
+  std::map<std::string, PolicyDoc> docs;
+  {
+    std::lock_guard lock(policies_mu);
+    for (const auto& [daemon_id, doc] : policy_docs) {
+      if (doc.zeroctl) {
+        docs[daemon_id] = doc;
+      }
+    }
+  }
+  if (docs.empty()) {
+    return;
+  }
+  const char* command = std::getenv("MERCURY_ZEROCTL");
+  if (command == nullptr || command[0] == '\0') {
+    return;
+  }
+  auto round = zeroctl_state(docs);
+  const auto log_dir = rings_dir() + "/zeroctl";
+  std::filesystem::create_directories(log_dir);
+  std::string error;
+  const auto t_ms = now_ms();
+  std::int64_t started = 0;
+  {
+    std::lock_guard lock(policies_mu);
+    started = zeroctl_started_ms;
+  }
+  const auto output = run_step({command, "--llm", round.llm, "--log-dir", log_dir}, round.state, 120, error);
+  ZeroctlAction action;
+  if (output) {
+    // The step prints one JSON object on its last non-empty line.
+    std::string line;
+    std::istringstream lines(*output);
+    for (std::string next; std::getline(lines, next);) {
+      if (!trimmed(next).empty()) {
+        line = trimmed(next);
+      }
+    }
+    const auto doc = parse_json(line);
+    if (!doc || !doc->is_object()) {
+      error = "model step printed no JSON action";
+    } else {
+      action.action = text_field(*doc, "action");
+      action.workload = text_field(*doc, "workload");
+      action.node = text_field(*doc, "node");
+      action.component = text_field(*doc, "component");
+      action.reason = text_field(*doc, "reason");
+      if (const auto* cpus = doc->get("cpus"); cpus != nullptr && cpus->is_number()) {
+        action.cpus = static_cast<int>(cpus->number);
+      }
+      if (const auto* step_error = doc->get("error"); step_error != nullptr && step_error->is_string()) {
+        error = step_error->text;
+      }
+    }
+  }
+  if (error.empty()) {
+    error = validate_zeroctl(action, round.view);
+  }
+  if (error.empty()) {
+    error = apply_zeroctl(action, round);
+  }
+  if (!error.empty()) {
+    // Bad output falls back to no adaptation this round.
+    if (action.action.empty()) {
+      action.action = "none";
+    }
+  }
+  std::ostringstream row;
+  row << "{\"at_seconds\":" << (t_ms - started) / 1000 << ",\"action\":\"" << json_escape(action.action) << '"';
+  if (!action.workload.empty()) {
+    row << ",\"workload\":\"" << json_escape(action.workload) << '"';
+  }
+  if (!action.node.empty()) {
+    row << ",\"node\":\"" << json_escape(action.node) << '"';
+  }
+  if (action.cpus > 0) {
+    row << ",\"cpus\":" << action.cpus;
+  }
+  if (!action.component.empty()) {
+    row << ",\"component\":\"" << json_escape(action.component) << '"';
+  }
+  if (!action.reason.empty()) {
+    row << ",\"reason\":\"" << json_escape(action.reason) << '"';
+  }
+  if (!error.empty()) {
+    row << ",\"error\":\"" << json_escape(error) << '"';
+  }
+  row << '}';
+  {
+    std::lock_guard lock(policies_mu);
+    zeroctl_history.push_back(row.str());
+    if (zeroctl_history.size() > 50) {
+      zeroctl_history.erase(zeroctl_history.begin());
+    }
+  }
+  std::string fields = row.str().substr(1, row.str().size() - 2);
+  // Event log uses "action" for what happened; keep zeroctl's proposal under the same keys.
+  record_event("\"policy\":\"zeroctl\"," + fields + ",\"status\":\"" + (error.empty() ? "applied" : "FAILED") + "\"");
+}
+
+}  // namespace
+
+void zeroctl_loop() {
+  std::int64_t last_ms = 0;
+  while (true) {
+    std::this_thread::sleep_for(std::chrono::seconds(1));
+    int every = 0;
+    std::int64_t attached_ms = 0;
+    {
+      std::lock_guard lock(policies_mu);
+      for (const auto& [_, doc] : policy_docs) {
+        if (doc.zeroctl && (every == 0 || doc.zeroctl_every < every)) {
+          every = doc.zeroctl_every;
+        }
+      }
+      if (every == 0) {
+        zeroctl_started_ms = 0;
+        continue;
+      }
+      if (zeroctl_started_ms == 0) {
+        zeroctl_started_ms = now_ms();
+        zeroctl_history.clear();
+      }
+      attached_ms = zeroctl_started_ms;
+    }
+    const auto now = now_ms();
+    if (now - std::max(last_ms, attached_ms) < static_cast<std::int64_t>(every) * 1000) {
+      continue;
+    }
+    last_ms = now;
+    try {
+      zeroctl_round();
+    } catch (const std::exception& error) {
+      std::cerr << "zeroctl " << error.what() << std::endl;
+    }
+    last_ms = now_ms();
+  }
 }

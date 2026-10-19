@@ -4,6 +4,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <map>
 #include <memory>
 #include <optional>
 #include <string>
@@ -138,3 +139,36 @@ struct TuneParameter {
 // end while all five intervals are at or below limit and nothing is degraded. Returns the index moved.
 std::optional<std::size_t> tune_step(std::vector<TuneParameter>& parameters, const IntervalLoads& loads,
                                      bool degraded, double limit = kDegradeLimit);
+
+// zeroctl (infrabench "ours"): the model proposes one action per call. Mercury validates it
+// against the live state before anything is applied; an illegal action is a no-op.
+struct ZeroctlAction {
+  std::string action;     // move | scale_out | degrade | restore | none | stop
+  std::string workload;   // daemon_id
+  std::string node;       // move: destination group name
+  std::string component;  // degrade, restore
+  int cpus = 0;           // scale_out
+  std::string reason;
+};
+
+struct ZeroctlGroup {
+  std::string level;
+  double load = 0;   // latest interval
+  int allocatable = 0;
+};
+
+struct ZeroctlDaemon {
+  std::vector<std::string> groups;          // groups its cpuset touches (any level)
+  int cpus = 0;
+  std::map<std::string, bool> components;   // name -> enabled
+};
+
+struct ZeroctlView {
+  std::map<std::string, ZeroctlDaemon> daemons;  // zeroctl-attached, running
+  std::map<std::string, ZeroctlGroup> groups;
+  std::string move_level = "node";
+  int max_cpus = kDefaultMaxCores;
+};
+
+// Empty string when the action may be applied; otherwise why it is rejected.
+std::string validate_zeroctl(const ZeroctlAction& action, const ZeroctlView& view);

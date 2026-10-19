@@ -150,6 +150,45 @@ int main() {
     check(!parse_json(R"({"a":1} trailing)"), "json rejects trailing text");
   }
 
+  // zeroctl: model actions are validated before Mercury applies them.
+  {
+    ZeroctlView view;
+    view.move_level = "node";
+    view.max_cpus = 6;
+    view.groups["node.0"] = {"node", 0.95, 3};
+    view.groups["node.1"] = {"node", 0.20, 4};
+    view.groups["node.2"] = {"node", 1.00, 4};
+    view.groups["node.3"] = {"node", 0.10, 1};
+    view.groups["core.5"] = {"core", 0.0, 1};
+    view.daemons["svc0"] = {{"socket.0", "node.0", "core.1"}, 2, {{"extra", true}, {"trace", false}}};
+    auto act = [](std::string action, std::string workload, std::string node = "", std::string component = "",
+                  int cpus = 0) {
+      ZeroctlAction a;
+      a.action = std::move(action);
+      a.workload = std::move(workload);
+      a.node = std::move(node);
+      a.component = std::move(component);
+      a.cpus = cpus;
+      return a;
+    };
+    check(validate_zeroctl(act("none", ""), view).empty(), "zeroctl none is always legal");
+    check(validate_zeroctl(act("move", "svc0", "node.1"), view).empty(), "zeroctl move to a cool node");
+    check(!validate_zeroctl(act("move", "svc0", "node.0"), view).empty(), "zeroctl rejects move onto own node");
+    check(!validate_zeroctl(act("move", "svc0", "node.2"), view).empty(), "zeroctl rejects move onto a full node");
+    check(!validate_zeroctl(act("move", "svc0", "node.3"), view).empty(), "zeroctl rejects a node too small");
+    check(!validate_zeroctl(act("move", "svc0", "core.5"), view).empty(), "zeroctl rejects the wrong level");
+    check(!validate_zeroctl(act("move", "svc0", "node.9"), view).empty(), "zeroctl rejects an unknown group");
+    check(!validate_zeroctl(act("move", "mercury", "node.1"), view).empty(), "zeroctl rejects an unknown daemon");
+    check(validate_zeroctl(act("scale_out", "svc0", "", "", 3), view).empty(), "zeroctl scale_out in range");
+    check(!validate_zeroctl(act("scale_out", "svc0", "", "", 7), view).empty(), "zeroctl scale_out above max");
+    check(!validate_zeroctl(act("scale_out", "svc0", "", "", 0), view).empty(), "zeroctl scale_out to zero");
+    check(validate_zeroctl(act("degrade", "svc0", "", "extra"), view).empty(), "zeroctl degrade enabled component");
+    check(!validate_zeroctl(act("degrade", "svc0", "", "trace"), view).empty(), "zeroctl degrade already off");
+    check(validate_zeroctl(act("restore", "svc0", "", "trace"), view).empty(), "zeroctl restore disabled component");
+    check(!validate_zeroctl(act("degrade", "svc0", "", "db"), view).empty(), "zeroctl rejects a critical part");
+    check(!validate_zeroctl(act("add_worker", "svc0"), view).empty(), "zeroctl rejects actions Mercury lacks");
+  }
+
   if (failures != 0) {
     std::cerr << failures << " policy checks failed" << std::endl;
     return 1;
