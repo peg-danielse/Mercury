@@ -21,38 +21,14 @@ function(mercury_test name)
   set_target_properties(${name} PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_SOURCE_DIR}/build/test")
 endfunction()
 
-mercury_test(ping src/test/ping.cpp)
-mercury_test(hello_server src/test/hello_server.cpp)
-target_link_libraries(hello_server PRIVATE mercury_http Threads::Threads)
 mercury_executable(mercury src/mercury.cpp src/daemons.cpp src/counters.cpp src/ring.cpp src/ring_archive.cpp src/policy.cpp src/resources.cpp src/threadstat.cpp src/gnn.cpp)
 mercury_executable(speculator src/speculator.cpp)
 target_link_libraries(mercury PRIVATE mercury_http Threads::Threads)
 mercury_executable(perfcount src/perfcount.cpp)
-mercury_test(arrival_test src/test/arrival.cpp)
-mercury_test(daemon_test src/test/main.cpp)
-mercury_test(cpus_test src/test/cpus.cpp)
-mercury_test(cpus_many_test src/test/cpus_many.cpp)
-target_link_libraries(cpus_many_test PRIVATE Threads::Threads)
-mercury_test(scale_server src/test/scale_server.cpp)
-target_link_libraries(scale_server PRIVATE Threads::Threads)
-mercury_test(scale_client src/test/scale_client.cpp)
-target_link_libraries(scale_client PRIVATE Threads::Threads)
-mercury_test(scale_test src/test/scale.cpp)
-mercury_test(autoscale_test src/test/autoscale.cpp)
-target_link_libraries(autoscale_test PRIVATE Threads::Threads)
-mercury_test(partial_server src/test/partial_server.cpp)
-target_link_libraries(partial_server PRIVATE mercury_http Threads::Threads)
-mercury_test(autoscale_least_loaded src/test/autoscale_least_loaded.cpp)
-target_link_libraries(autoscale_least_loaded PRIVATE Threads::Threads)
-mercury_test(autoscale_nearest_first src/test/autoscale_nearest_first.cpp)
-target_link_libraries(autoscale_nearest_first PRIVATE Threads::Threads)
 mercury_test(env_probe src/test/env_probe.cpp)
-mercury_test(env_test src/test/env_test.cpp)
 mercury_test(resources_test src/test/resources.cpp src/resources.cpp src/ring.cpp src/ring_archive.cpp src/policy.cpp)
-mercury_test(map_test src/test/map.cpp)
 target_include_directories(resources_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_link_libraries(resources_test PRIVATE Threads::Threads)
-target_compile_definitions(daemon_test PRIVATE DAEMONS_TXT="${CMAKE_SOURCE_DIR}/src/test/daemons.txt")
 mercury_test(policy_test src/test/policy.cpp src/policy.cpp)
 target_include_directories(policy_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_compile_definitions(policy_test PRIVATE TRACES_DIR="${CMAKE_SOURCE_DIR}/src/test/traces")
@@ -67,10 +43,16 @@ mercury_executable(gnnreplay src/gnnreplay.cpp src/gnn.cpp src/threadstat.cpp sr
 mercury_test(gnnload src/test/workloads/gnnload.cpp)
 target_link_libraries(gnnload PRIVATE Threads::Threads)
 
-# ctest: the saturate decisions, and the saturate integration run on a partial CPU share
-# (src/test/saturate_it.sh re-executes itself with sudo -n for cgroup writes).
+# ctest: the saturate decisions and the placement walk (no root, any host), and the route smoke test
+# (root, a few seconds). saturate_integration is the slow end-to-end check on dtn-01 (NUMA nodes 0-2,
+# about a minute, known flaky); it carries the label "slow": `ctest -LE slow` skips it.
+# The shell tests re-execute themselves with sudo -n for cgroup writes.
 enable_testing()
 add_test(NAME policy_test COMMAND policy_test)
+add_test(NAME resources_test COMMAND resources_test)
+add_test(NAME smoke_integration COMMAND ${CMAKE_SOURCE_DIR}/src/test/smoke_it.sh)
+set_tests_properties(smoke_integration PROPERTIES
+  ENVIRONMENT "MERCURY_BIN=$<TARGET_FILE:mercury>;PROBE_BIN=$<TARGET_FILE:env_probe>" TIMEOUT 60)
 add_test(NAME saturate_integration COMMAND ${CMAKE_SOURCE_DIR}/src/test/saturate_it.sh)
 set_tests_properties(saturate_integration PROPERTIES
-  ENVIRONMENT "MERCURY_BIN=$<TARGET_FILE:mercury>;SPIN_BIN=$<TARGET_FILE:spinner>" TIMEOUT 600)
+  ENVIRONMENT "MERCURY_BIN=$<TARGET_FILE:mercury>;SPIN_BIN=$<TARGET_FILE:spinner>" TIMEOUT 600 LABELS slow)

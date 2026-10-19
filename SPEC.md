@@ -235,16 +235,13 @@ Back in `monitor_daemon`, `Hold` does nothing. `AddCore` calls `add_core` and `R
 
 `decide` is tested without a host: `policy_test` feeds it synthetic windows (including 6 busy threads on 7 CPUs, which must remove) and the recorded traces in `src/test/traces/` (CSV, `ts,task_clock,user,system,pressure`, header `# cores=N ... expect=X`; `TRACES_DIR` in CMake). Every sliding 65-sample window of a trace must give its expected decision. `src/test/record_traces.py` (root) re-records them with `spinner` in the cgroup `mercury/ptrec`. Acceptance on dtn-01: `spinner` with N busy threads started on one CPU settles at N CPUs and stays there for ten windows; `src/test/saturate_it.sh` checks N = 1, 3, 6 on the CPUs of NUMA nodes 0-2 (`saturate_integration` under `ctest`).
 
-Known flaky (2026-10-19): `saturate_integration` passed 1 of 3 runs on dtn-01 against the working tree that became `gnn-dsb-slo` (ctest, then two reruns on port 18180, nothing else running). It fails in two ways. In one, N=3 reaches 3 CPUs after 1.5 s but moves to 3..4 CPUs during the ten-window hold, so one CPU too many is added. In the other, N=6 does not reach 6 CPUs and stays at 5. `policy_test` and `policies_integration` passed. The cause is not settled; timing near the add/remove thresholds (occupancy >= 0.85, pressure >= 0.10) and window freshness after a change are the first suspects. Main 8e75094 cannot serve as a baseline: there `arm_daemon` does not attach `saturate` to the daemons it starts (the auto-attach, min 1 max 16, is new in this change), so a Release build of main fails 3 of 3 runs with N=3 and N=6 stuck at 1 CPU.
+Known flaky (2026-10-19): `saturate_integration` passed 1 of 3 runs on dtn-01 against the working tree that became `gnn-dsb-slo` (ctest, then two reruns on port 18180, nothing else running). It fails in two ways. In one, N=3 reaches 3 CPUs after 1.5 s but moves to 3..4 CPUs during the ten-window hold, so one CPU too many is added. In the other, N=6 does not reach 6 CPUs and stays at 5. `policy_test` and `policies_integration` (since removed) passed. The cause is not settled; timing near the add/remove thresholds (occupancy >= 0.85, pressure >= 0.10) and window freshness after a change are the first suspects. Main 8e75094 cannot serve as a baseline: there `arm_daemon` does not attach `saturate` to the daemons it starts (the auto-attach, min 1 max 16, is new in this change), so a Release build of main fails 3 of 3 runs with N=3 and N=6 stuck at 1 CPU.
 
-Test expectations that follow from saturate being attached at start:
-- Tests that pin a daemon (`main.cpp` after `hello` starts and after each "start failed for" probe) post `/scale` with `max` 1 so the cpuset is not grown.
-- `scale_test` and the fixed-size steps of `autoscale_test` post `/scale` with policy `none` before writing `/cpus`, and `autoscale_test` re-attaches `saturate` afterwards and checks the default range 1-16.
-- `autoscale_test` allows 60 s to grow from 1 to 16 cores (one CPU per window plus the cooldown), and in its ramp and down phases expects N `/cpu` clients, each burning one core, to settle at N cores (clamped to 1-16).
-- `autoscale_nearest_first` mirrors `autoscale_least_loaded` (own ports 18133/18134 and daemon id `nearest`) with `placement` `nearest_first` and `partial_server` started with `PARTIAL_BURN_PCT=100`, so each served connection burns a whole core and N clients must settle at N cores (clamped to 1-16). Every CPU it sees added must be in the nearest tier any free allocatable CPU offered. `partial_server` reads `PARTIAL_BURN_PCT` (1-100, default 33).
-- `resources_test` checks `nearest_first` on the live topology (each start CPU and a 20-step grow pick a CPU of the best tier) and, on dtn-01, the concrete picks: 1 → 33, {1,33} → 32, a full L3 stays on node 0, an excluded sibling falls to the L3, socket 0 excluded goes to socket 1.
-- `saturate_it.sh` takes `SAT_PLACEMENT` and `autoscale_test` takes `AUTOSCALE_PLACEMENT`; when set, the test posts that placement to `/scale` (test-side only).
-- `autoscale_least_loaded` still encodes the earlier 90% rule (`cores_for_clients`: 0.33 core per client) and does not match this rule.
+Tests (`ctest` in `build/`; reduced on 2026-10-19 to these four):
+- `policy_test`: `decide` on synthetic windows and the recorded traces (above). No root, any host.
+- `resources_test`: the group tree and both placements on the live topology (each start CPU and a 20-step grow pick a CPU of the best `nearest_first` tier) and, on dtn-01, the concrete picks: 1 → 33, {1,33} → 32, a full L3 stays on node 0, an excluded sibling falls to the L3, socket 0 excluded goes to socket 1. No root, any host.
+- `smoke_integration` (`src/test/smoke_it.sh`, root, under a second): its own `mercury` on CPU 0 with daemons on 1-3 and `env_probe` as the daemon. It checks `/start` with `env` and a listen socket (and a bad env name rejected), `/cpus` (and the rejections of Mercury's CPU, a bad set and a path in `daemon_id`), `/migrate`, `/scale` with `none`, `full` and an unknown policy, `/map`, `/rings`, `/kill`, and that SIGTERM exits 143 after killing the remaining daemon and removing its cgroup.
+- `saturate_integration` (`src/test/saturate_it.sh`, label `slow`, dtn-01): the acceptance run above. `ctest -LE slow` skips it. It takes `SAT_PLACEMENT`; when set, the test posts that placement to `/scale` (test-side only).
 
 The reactive policies `shift`, `restrict`/`widen` (the grant) and `degrade`, with `POST /policies`, `policy_loop` and `policies.md`, were removed on 2026-10-19. They were cluster baselines ported onto one host; gnn is to be compared against the best fixed allocation on the system instead (the daemon alone, with as many CPUs as possible).
 
@@ -478,13 +475,13 @@ The `gnn` policy is built and selectable per daemon through `/scale`.`/scale` pi
   - demand per thread = run + wait time;
   - cores = `ceil(sum demand / 0.75)`;
   - packing nearest-first in NUMA order, one busy thread per CPU.
-- Data: `partial_server` runs, `src/test/traces`, and later `~/Benchmarks`.
+- Data: `src/test/traces`, and later `~/Benchmarks` (`gnnload` replaced the planned `partial_server` runs; `partial_server` was removed on 2026-10-19).
 - Prototyping: in the Python/torch repo `/home/pager/Documents/gnn-example`, outside this repository.
 - Deployment: the trained weights (small, about 1-2k parameters) are exported and run as a handwritten C++ forward pass, or through ONNX Runtime, inside Mercury. There is no Python in the loop. The lab 5 forward pass measured under 1 ms, which fits a 1 s tick.
 
 ### Evaluation
 
-`gnn` is compared A/B against `saturate` with `least_loaded` and with `nearest_first` placement, using `autoscale_test`, `autoscale_nearest_first`, `saturate_it.sh` and `partial_server`. The metrics are:
+`gnn` is compared A/B against `saturate` with `least_loaded` and with `nearest_first` placement, using `gnnload` (`gnn_dataset.sh`), stress-ng and the DSB operators (`dsb_ab.sh`); the autoscale tests and `partial_server` originally named here were removed on 2026-10-19. The metrics are:
 - tier misses;
 - stacking (busy threads per CPU);
 - time to reach the target core count;
