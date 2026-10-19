@@ -161,6 +161,114 @@ void require_status(const std::string& response, int status, const std::string& 
   }
 }
 
+std::string run_speculator(const std::string& bin) {
+  int pipes[2] = {-1, -1};
+  if (::pipe(pipes) != 0) {
+    throw std::runtime_error("speculator pipe failed");
+  }
+  const auto pid = ::fork();
+  if (pid < 0) {
+    throw std::runtime_error("speculator fork failed");
+  }
+  if (pid == 0) {
+    ::dup2(pipes[1], STDOUT_FILENO);
+    ::dup2(pipes[1], STDERR_FILENO);
+    ::close(pipes[0]);
+    ::close(pipes[1]);
+    ::execl(bin.c_str(), bin.c_str(), std::to_string(kPort).c_str(), nullptr);
+    _exit(127);
+  }
+  ::close(pipes[1]);
+  std::string out;
+  char buffer[1024];
+  while (true) {
+    const auto n = ::read(pipes[0], buffer, sizeof(buffer));
+    if (n > 0) {
+      out.append(buffer, static_cast<std::size_t>(n));
+      continue;
+    }
+    if (n == 0) {
+      break;
+    }
+    if (errno == EINTR) {
+      continue;
+    }
+    throw std::runtime_error("speculator read failed");
+  }
+  ::close(pipes[0]);
+  int status = 0;
+  if (::waitpid(pid, &status, 0) < 0 || !WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+    throw std::runtime_error("speculator failed: " + out);
+  }
+  return out;
+}
+
+void require_tree(const std::string& body, int daemon_lines, const std::string& what) {
+  if (body.rfind("mercury cpu 0\nallocatable 1-2\n\n", 0) != 0) {
+    throw std::runtime_error(what + " header: " + body);
+  }
+  bool socket = false;
+  bool node = false;
+  bool l3 = false;
+  bool core = false;
+  int placed = 0;
+  std::size_t at = 0;
+  int line_no = 0;
+  while (at < body.size()) {
+    auto end = body.find('\n', at);
+    if (end == std::string::npos) {
+      end = body.size();
+    }
+    const auto line = body.substr(at, end - at);
+    at = end < body.size() ? end + 1 : body.size();
+    ++line_no;
+    if (line_no <= 2 || line.empty()) {
+      continue;
+    }
+    const auto open = line.find('[');
+    const auto close = line.find(']');
+    if (open == std::string::npos || close != open + 11) {
+      throw std::runtime_error(what + " bar: " + line);
+    }
+    for (std::size_t i = open + 1; i < close; ++i) {
+      if (line[i] != '#' && line[i] != '-') {
+        throw std::runtime_error(what + " bar cells: " + line);
+      }
+    }
+    if (line.size() < close + 6 || line[close + 1] != ' ' || line[close + 2] < '0' || line[close + 2] > '1' ||
+        line[close + 3] != '.' || line.find("  cpus ", close) == std::string::npos) {
+      throw std::runtime_error(what + " load: " + line);
+    }
+    const auto name = line.find_first_not_of(' ');
+    if (name == std::string::npos) {
+      throw std::runtime_error(what + " blank group: " + line);
+    }
+    if (line.compare(name, 7, "socket.") == 0) {
+      socket = true;
+      if (name != 0) {
+        throw std::runtime_error(what + " socket indent: " + line);
+      }
+    } else if (line.compare(name, 5, "node.") == 0) {
+      node = true;
+    } else if (line.compare(name, 3, "l3.") == 0) {
+      l3 = true;
+    } else if (line.compare(name, 5, "core.") == 0) {
+      core = true;
+    } else {
+      throw std::runtime_error(what + " unknown group: " + line);
+    }
+    if (line.find("mapprobe") != std::string::npos) {
+      ++placed;
+    }
+  }
+  if (!socket || !node || !l3 || !core) {
+    throw std::runtime_error(what + " missing a level: " + body);
+  }
+  if (placed != daemon_lines) {
+    throw std::runtime_error(what + " mapprobe lines " + std::to_string(placed) + ": " + body);
+  }
+}
+
 }  // namespace
 
 int main() {
@@ -169,6 +277,7 @@ int main() {
   try {
     const auto bindir = dirname_of(exe_dir());
     const auto mercury_bin = bindir + "/mercury";
+    const auto speculator_bin = bindir + "/speculator";
     const auto probe = exe_dir() + "/env_probe";
     int pipes[2] = {-1, -1};
     if (::pipe(pipes) != 0) {
@@ -194,6 +303,8 @@ int main() {
     if (ready.find("listening") == std::string::npos) {
       throw std::runtime_error("mercury did not start: " + ready);
     }
+
+    require_tree(run_speculator(speculator_bin), 0, "empty tree");
 
     const auto map = http_get("/map");
     require_status(map, 200, "map");
@@ -231,6 +342,7 @@ int main() {
         placed.find("\"cpus\":[1]") == std::string::npos) {
       throw std::runtime_error("map did not place mapprobe on cpu 1: " + placed);
     }
+    require_tree(run_speculator(speculator_bin), 4, "placed tree");
 
     require_status(http_post("/kill", R"({"daemon_id":"mapprobe"})"), 200, "kill");
     ::kill(-mercury, SIGTERM);

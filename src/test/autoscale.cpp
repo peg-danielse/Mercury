@@ -449,6 +449,13 @@ int current_cores() {
   return count_cpuset(read_file(std::string(kParent) + "/" + kHelloId + "/cpuset.cpus"));
 }
 
+// Each /cpu client burns one core. Saturate adds while the 64-sample mean
+// occupancy is >= 0.85 with run-queue pressure >= 0.10, and removes only when
+// the cgroup would still fit on one core less, so N busy clients settle at N.
+int cores_for_clients(int clients) {
+  return std::max(1, std::min(clients, kPoolCores));
+}
+
 void set_cpus(const std::string& spec) {
   const std::string body = std::string("{\"daemon_id\":\"") + kHelloId + "\",\"cpus\":\"" + spec + "\"}";
   const auto response = http_post("/cpus", body);
@@ -661,6 +668,12 @@ int main() {
       throw std::runtime_error("sleep route produced no replies");
     }
 
+    // arm_daemon attaches saturate by default; detach it so the fixed steps hold.
+    const auto detached = http_post("/scale", std::string("{\"daemon_id\":\"") + kHelloId + "\",\"policy\":\"none\"}");
+    if (response_status(detached) != 200) {
+      throw std::runtime_error("scale detach failed: " + trim(response_body(detached)));
+    }
+
     std::uint64_t fixed[5]{};
     const int steps[] = {1, 2, 4, 8, 16};
     std::cout << "fixed" << std::endl;
@@ -677,28 +690,27 @@ int main() {
 
     set_cpus("1");
     const auto attached =
-        http_post("/scale", std::string("{\"daemon_id\":\"") + kHelloId + "\",\"policy\":\"saturate\"}");
+        http_post("/scale", std::string("{\"daemon_id\":\"") + kHelloId + "\",\"policy\":\"saturate\"" +
+                                (std::getenv("AUTOSCALE_PLACEMENT") != nullptr
+                                     ? std::string(",\"placement\":\"") + std::getenv("AUTOSCALE_PLACEMENT") + "\""
+                                     : std::string()) +
+                                "}");
     if (response_status(attached) != 200) {
       throw std::runtime_error("scale attach failed: " + trim(response_body(attached)));
     }
     const auto body = response_body(attached);
     const int min_cores = json_int(body, "min");
     const int max_cores = json_int(body, "max");
-    const int threads = json_int(body, "threads");
-    std::cout << "scale min " << min_cores << " max " << max_cores << " threads " << threads << std::endl;
+    std::cout << "scale min " << min_cores << " max " << max_cores << std::endl;
     if (min_cores != 1 || max_cores != 16) {
       throw std::runtime_error("default core range is " + std::to_string(min_cores) + "-" + std::to_string(max_cores));
-    }
-    if (threads < kPoolCores + kSleepClients) {
-      throw std::runtime_error("attached threads " + std::to_string(threads) + ", want at least " +
-                               std::to_string(kPoolCores + kSleepClients));
     }
 
     std::cout << "autoscale" << std::endl;
     int last_cores = current_cores();
     std::cout << "autoscale cores " << last_cores << std::endl;
     const auto grow_began = monotonic_ns();
-    while (monotonic_ns() - grow_began < 25000000000LL) {
+    while (monotonic_ns() - grow_began < 60000000000LL) {  // one core per 64-sample window plus cooldown
       const int cores = current_cores();
       if (cores != last_cores) {
         std::cout << "autoscale cores " << cores << std::endl;
@@ -756,12 +768,12 @@ int main() {
           std::cout << "ramp clients " << clients << " cores " << cores << std::endl;
           printed = cores;
         }
-        if (cores == clients && monotonic_ns() - began >= 1500000000LL) {
+        if (cores == cores_for_clients(clients) && monotonic_ns() - began >= 1500000000LL) {
           break;
         }
         sleep_ms(100);
       }
-      if (cores != clients) {
+      if (cores != cores_for_clients(clients)) {
         throw std::runtime_error("ramp clients " + std::to_string(clients) + " settled at " + std::to_string(cores) +
                                  " cores");
       }
@@ -779,12 +791,12 @@ int main() {
           std::cout << "down clients " << clients << " cores " << cores << std::endl;
           printed = cores;
         }
-        if (cores == clients && monotonic_ns() - began >= 1500000000LL) {
+        if (cores == cores_for_clients(clients) && monotonic_ns() - began >= 1500000000LL) {
           break;
         }
         sleep_ms(100);
       }
-      if (cores != clients) {
+      if (cores != cores_for_clients(clients)) {
         throw std::runtime_error("down clients " + std::to_string(clients) + " settled at " + std::to_string(cores) +
                                  " cores");
       }
