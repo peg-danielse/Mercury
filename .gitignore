@@ -9,3 +9,15 @@ libmercury_http.a
 /CMakeFiles/
 /cmake_install.cmake
 /Makefile
+/data/dsb/
+/data/gnn/**
+!/data/gnn/*/
+!/data/gnn/*/*.sh
+!/data/gnn/*/*.py
+!/data/gnn/*/ESTIMATE.txt
+*.log
+*.bak*
+*.unused
+__pycache__/
+/data/analysis/**/*.png
+SATURATE_PROPOSAL.*
