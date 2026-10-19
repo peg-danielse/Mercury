@@ -1,6 +1,8 @@
 # Policies
 
-This file is the contract for resource and application policies beyond `saturate`. `make_policy` still returns only `SaturatePolicy`. The loop, the grant, and `POST /policies` are not built yet.
+This file is the contract for resource and application policies beyond `saturate`. `make_policy` still returns only `SaturatePolicy`.
+
+Status on branch `infrabench-policies`: `policy_loop`, `POST /policies`, `GET /policies`, `shift`, `degrade`, `tune`, and `restrict.ceiling` are built (see `RUNNING_POLICIES.md`). `shift` additionally accepts `{trigger, util, theta, level}` so the `scale_nodes_ind` (mean) and `reactive_move` (hotspot) rows and the `combined` thresholds can be expressed. The grant (`widen`, `max_groups`, grant groups leaving after five empty intervals) is not built: `widen` answers HTTP 501. `least_allocated` exists as a pure decision only.
 
 A policy watches load that Mercury already records and changes one of three things: which resource groups a daemon may use, the CPUs in its cpuset, or a small file the application reads. The process stays running. The pid stays the same. Policies do not submit daemons, do not register workers, and do not start computers.
 
