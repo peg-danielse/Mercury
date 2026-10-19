@@ -71,6 +71,7 @@ void restore_numa_at_exit() {
 }
 
 void on_terminate(int sig) {
+  kill_daemon_cgroups_raw();
   gnn_restore_all_affinity_raw();
   restore_numa_raw();
   ::_exit(128 + sig);

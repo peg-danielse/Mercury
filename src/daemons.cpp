@@ -22,6 +22,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <cerrno>
 #include <chrono>
@@ -30,6 +31,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
@@ -1165,10 +1167,84 @@ struct Launched {
   _exit(127);
 }
 
+namespace {
+
+// Signal-safe registry of the daemon cgroups this mercury created, for kill_daemon_cgroups_raw.
+// A slot is filled under g_cgroup_mu and published by its atomic flag; slots are never cleared,
+// so a cgroup whose root pid exited is still killed (descendants may remain) and removed.
+constexpr int kCgroupSlots = 1024;
+constexpr std::size_t kCgroupPathMax = 320;  // "/sys/fs/cgroup/mercury/" + a 255-byte daemon_id
+char g_cgroup_dirs[kCgroupSlots][kCgroupPathMax];
+std::atomic<bool> g_cgroup_used[kCgroupSlots];
+std::mutex g_cgroup_mu;  // only for insert, never in the signal handler
+
+void remember_cgroup(const std::string& dir) {
+  if (dir.size() + std::strlen("/cgroup.kill") >= kCgroupPathMax) {
+    std::cout << "cgroup path too long to clean up on exit: " << dir << std::endl;
+    return;
+  }
+  std::lock_guard lock(g_cgroup_mu);
+  for (int i = 0; i < kCgroupSlots; ++i) {
+    if (g_cgroup_used[i].load(std::memory_order_acquire) && dir == g_cgroup_dirs[i]) {
+      return;
+    }
+  }
+  for (int i = 0; i < kCgroupSlots; ++i) {
+    if (!g_cgroup_used[i].load(std::memory_order_acquire)) {
+      std::memcpy(g_cgroup_dirs[i], dir.c_str(), dir.size() + 1);
+      g_cgroup_used[i].store(true, std::memory_order_release);
+      return;
+    }
+  }
+  std::cout << "cgroup registry full; not cleaned up on exit: " << dir << std::endl;
+}
+
+}  // namespace
+
+void kill_daemon_cgroups_raw() {
+  char path[kCgroupPathMax];
+  bool any = false;
+  for (int i = 0; i < kCgroupSlots; ++i) {
+    if (!g_cgroup_used[i].load(std::memory_order_acquire)) {
+      continue;
+    }
+    const std::size_t n = std::strlen(g_cgroup_dirs[i]);
+    std::memcpy(path, g_cgroup_dirs[i], n);
+    std::memcpy(path + n, "/cgroup.kill", sizeof("/cgroup.kill"));
+    const int fd = ::open(path, O_WRONLY | O_CLOEXEC);
+    if (fd >= 0) {
+      const auto written = ::write(fd, "1", 1);
+      (void)written;
+      ::close(fd);
+      any = true;
+    }
+  }
+  if (!any) {
+    return;
+  }
+  // rmdir succeeds once the kernel has reaped every task (EBUSY until then). Give up after 2 s.
+  const timespec pause{0, 10 * 1000 * 1000};
+  for (int attempt = 0; attempt < 200; ++attempt) {
+    bool busy = false;
+    for (int i = 0; i < kCgroupSlots; ++i) {
+      if (g_cgroup_used[i].load(std::memory_order_acquire) && ::rmdir(g_cgroup_dirs[i]) != 0 && errno == EBUSY) {
+        busy = true;
+      }
+    }
+    if (!busy) {
+      return;
+    }
+    ::nanosleep(&pause, nullptr);
+  }
+}
+
 std::optional<Launched> launch(const std::string& daemon_id, const std::string& exec_path, int cpu, int listen_fd,
                                const std::vector<std::pair<std::string, std::string>>& env) {
   const int linux_cpu = cpu;
   const auto placement = prepare_placement(daemon_id, linux_cpu);
+  if (placement) {
+    remember_cgroup(placement->dir);
+  }
   int out_pipe[2] = {-1, -1};
   int err_pipe[2] = {-1, -1};
   int sync_pipe[2] = {-1, -1};
