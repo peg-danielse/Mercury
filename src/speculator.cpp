@@ -1,6 +1,7 @@
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
+#include <poll.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -8,6 +9,8 @@
 #include <cctype>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
+#include <filesystem>
 #include <fstream>
 #include <map>
 #include <set>
@@ -585,25 +588,176 @@ void print_status(std::ostream& out, const std::vector<std::string>& files) {
   }
 }
 
+
+// An app on screen: name groups daemons (<name>-...) in "apps"; status is an
+// operator -status-file (demo section). Either may be empty.
+struct App {
+  std::string name;
+  std::string status;
+};
+
+std::string status_app(const std::string& file) {
+  std::ifstream in(file);
+  std::string line;
+  while (std::getline(in, line)) {
+    if (line.rfind("app ", 0) == 0) {
+      return line.substr(4);
+    }
+  }
+  return "";
+}
+
+// Daemon id prefixes shared by at least two daemons (hotel, hotel-a, hotel-b).
+std::vector<std::pair<std::string, int>> prefix_suggestions(const MapView& map) {
+  std::map<std::string, std::set<std::string>> ids;
+  for (const auto& daemon : map.daemons) {
+    for (auto dash = daemon.id.find('-'); dash != std::string::npos; dash = daemon.id.find('-', dash + 1)) {
+      ids[daemon.id.substr(0, dash)].insert(daemon.id);
+    }
+  }
+  std::vector<std::pair<std::string, int>> out;
+  for (const auto& [prefix, set] : ids) {
+    if (set.size() >= 2) {
+      out.emplace_back(prefix, static_cast<int>(set.size()));
+    }
+  }
+  std::sort(out.begin(), out.end(), [](const auto& a, const auto& b) {
+    return a.first.size() != b.first.size() ? a.first.size() > b.first.size() : a.first < b.first;
+  });
+  return out;
+}
+
+// Newest <runs>/<run>/<name>/status (run-demo.sh layout), or "".
+std::string status_suggestion(const std::string& runs, const std::string& name) {
+  namespace fs = std::filesystem;
+  std::string best;
+  fs::file_time_type best_time{};
+  std::error_code ec;
+  for (const auto& run : fs::directory_iterator(runs, ec)) {
+    const auto path = run.path() / name / "status";
+    if (fs::exists(path, ec)) {
+      const auto t = fs::last_write_time(path, ec);
+      if (best.empty() || t > best_time) {
+        best = path.string();
+        best_time = t;
+      }
+    }
+  }
+  return best;
+}
+
+std::string ask(const std::string& prompt) {
+  std::cout << prompt << std::flush;
+  std::string line;
+  if (!std::getline(std::cin, line)) {
+    return "";
+  }
+  return line;
+}
+
+// Interactive "add app": name (or a number from the daemon prefixes) and status file.
+void add_app(std::vector<App>& apps, const MapView& map, const std::string& runs, std::string name, std::string status) {
+  if (name.empty()) {
+    const auto prefixes = prefix_suggestions(map);
+    std::cout << "\nadd app: daemon prefixes in Mercury\n";
+    for (std::size_t i = 0; i < prefixes.size(); ++i) {
+      std::cout << "  " << i + 1 << ") " << prefixes[i].first << "  (" << prefixes[i].second << " daemons)\n";
+    }
+    name = ask("app name or number (empty = cancel): ");
+    if (!name.empty() && std::all_of(name.begin(), name.end(), ::isdigit)) {
+      const auto n = static_cast<std::size_t>(std::stoul(name));
+      name = n >= 1 && n <= prefixes.size() ? prefixes[n - 1].first : "";
+    }
+    if (name.empty()) {
+      return;
+    }
+  }
+  if (status.empty()) {
+    const auto suggestion = status_suggestion(runs, name);
+    status = ask("status file for " + name + (suggestion.empty() ? "" : " [" + suggestion + "]") + " ('-' = none): ");
+    if (status.empty()) {
+      status = suggestion;
+    }
+  }
+  if (status == "-") {
+    status.clear();
+  }
+  apps.erase(std::remove_if(apps.begin(), apps.end(), [&](const App& a) { return a.name == name; }), apps.end());
+  apps.push_back({name, status});
+}
+
+void remove_app(std::vector<App>& apps, std::string name) {
+  if (apps.empty()) {
+    return;
+  }
+  if (name.empty()) {
+    std::cout << "\nremove app:\n";
+    for (std::size_t i = 0; i < apps.size(); ++i) {
+      std::cout << "  " << i + 1 << ") " << (apps[i].name.empty() ? status_app(apps[i].status) : apps[i].name)
+                << (apps[i].status.empty() ? "" : "  " + apps[i].status) << '\n';
+    }
+    name = ask("app name or number (empty = cancel): ");
+    if (!name.empty() && std::all_of(name.begin(), name.end(), ::isdigit)) {
+      const auto n = static_cast<std::size_t>(std::stoul(name));
+      if (n >= 1 && n <= apps.size()) {
+        apps.erase(apps.begin() + static_cast<long>(n - 1));
+      }
+      return;
+    }
+  }
+  apps.erase(std::remove_if(apps.begin(), apps.end(),
+                            [&](const App& a) { return a.name == name || (a.name.empty() && status_app(a.status) == name); }),
+             apps.end());
+}
+
+// One typed line in watch mode: "a [NAME [STATUS]]", "r [NAME]", "q"; empty = menu.
+bool command(std::string line, std::vector<App>& apps, const MapView& map, const std::string& runs) {
+  if (line.empty()) {
+    line = ask("\na) add app   r) remove app   q) quit   Enter) back: ");
+  }
+  std::istringstream in(line);
+  std::string verb, name, status;
+  in >> verb >> name >> status;
+  if (verb == "q" || verb == "quit") {
+    return false;
+  }
+  if (verb == "a" || verb == "add") {
+    add_app(apps, map, runs, name, status);
+  } else if (verb == "r" || verb == "rm" || verb == "remove") {
+    remove_app(apps, name);
+  }
+  return true;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
-  const char* usage = "usage: speculator <port> [--watch SECONDS] [--status FILE]... [--app NAME]...\n";
+  const char* usage =
+      "usage: speculator <port> [--watch SECONDS] [--once] [--status FILE]... [--app NAME[=STATUS]]... [--runs DIR]\n"
+      "  on a terminal it refreshes every 2 s; Enter opens a menu (a add app, r remove app, q quit)\n";
   if (argc < 2) {
     std::cerr << usage;
     return 1;
   }
   double watch = 0;
-  std::vector<std::string> status_files;
-  std::vector<std::string> app_names;
+  bool once = false;
+  std::vector<App> apps;
+  std::string runs = std::getenv("SPECULATOR_RUNS") != nullptr ? std::getenv("SPECULATOR_RUNS")
+                     : std::string(std::getenv("HOME") != nullptr ? std::getenv("HOME") : ".") + "/Benchmarks/demo/runs";
   for (int i = 2; i < argc; ++i) {
     const std::string arg = argv[i];
     if (arg == "--watch" && i + 1 < argc) {
       watch = std::stod(argv[++i]);
+    } else if (arg == "--once") {
+      once = true;
     } else if (arg == "--status" && i + 1 < argc) {
-      status_files.emplace_back(argv[++i]);
+      apps.push_back({"", argv[++i]});
     } else if (arg == "--app" && i + 1 < argc) {
-      app_names.emplace_back(argv[++i]);
+      const std::string v = argv[++i];
+      const auto eq = v.find('=');
+      apps.push_back({v.substr(0, eq), eq == std::string::npos ? "" : v.substr(eq + 1)});
+    } else if (arg == "--runs" && i + 1 < argc) {
+      runs = argv[++i];
     } else {
       std::cerr << usage;
       return 1;
@@ -619,24 +773,56 @@ int main(int argc, char** argv) {
     std::cerr << error.what() << std::endl;
     return 1;
   }
+  const bool interactive = !once && isatty(0) && isatty(1);
+  if (interactive && watch <= 0) {
+    watch = 2;
+  }
+  if (once) {
+    watch = 0;
+  }
+  MapView last;
   while (true) {
     std::ostringstream frame;
     bool ok = true;
+    std::vector<std::string> names, files;
+    for (const auto& app : apps) {
+      const auto name = app.name.empty() ? status_app(app.status) : app.name;
+      if (!name.empty()) {
+        names.push_back(name);
+      }
+      if (!app.status.empty()) {
+        files.push_back(app.status);
+      }
+    }
     try {
-      const auto map = parse_map(fetch_map(static_cast<std::uint16_t>(port_number)));
-      print_tree(frame, map);
-      print_apps(frame, map, app_names);
+      last = parse_map(fetch_map(static_cast<std::uint16_t>(port_number)));
+      print_tree(frame, last);
+      print_apps(frame, last, names);
     } catch (const std::exception& error) {
       ok = false;
       frame << "mercury :" << port_number << ": " << error.what() << '\n';
     }
     frame << std::fixed << std::setprecision(2);
-    print_status(frame, status_files);
+    print_status(frame, files);
     if (watch <= 0) {
       (ok ? std::cout : std::cerr) << frame.str();
       return ok ? 0 : 1;
     }
-    std::cout << "\033[H\033[2J" << frame.str() << std::flush;
-    std::this_thread::sleep_for(std::chrono::milliseconds(static_cast<long>(watch * 1000)));
+    std::cout << "\033[H\033[2J" << frame.str();
+    if (interactive) {
+      std::cout << "\n[Enter] menu: a add app, r remove app, q quit   (or type: a hotel-a, r hotel-a)\n";
+    }
+    std::cout << std::flush;
+    if (!interactive) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(static_cast<long>(watch * 1000)));
+      continue;
+    }
+    pollfd in{0, POLLIN, 0};
+    if (::poll(&in, 1, static_cast<int>(watch * 1000)) > 0) {
+      std::string line;
+      if (!std::getline(std::cin, line) || !command(line, apps, last, runs)) {
+        return 0;
+      }
+    }
   }
 }
