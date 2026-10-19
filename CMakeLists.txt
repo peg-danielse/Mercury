@@ -29,6 +29,8 @@ mercury_test(env_probe src/test/env_probe.cpp)
 mercury_test(resources_test src/test/resources.cpp src/resources.cpp src/ring.cpp src/ring_archive.cpp src/policy.cpp)
 target_include_directories(resources_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_link_libraries(resources_test PRIVATE Threads::Threads)
+mercury_test(ring_test src/test/ring.cpp src/ring.cpp src/ring_archive.cpp)
+target_include_directories(ring_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
 mercury_test(policy_test src/test/policy.cpp src/policy.cpp)
 target_include_directories(policy_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_compile_definitions(policy_test PRIVATE TRACES_DIR="${CMAKE_SOURCE_DIR}/src/test/traces")
@@ -43,13 +45,14 @@ mercury_executable(gnnreplay src/gnnreplay.cpp src/gnn.cpp src/threadstat.cpp sr
 mercury_test(gnnload src/test/workloads/gnnload.cpp)
 target_link_libraries(gnnload PRIVATE Threads::Threads)
 
-# ctest: the saturate decisions and the placement walk (no root, any host), and the route smoke test
+# ctest: the saturate decisions, the placement walk and the ring archive (no root, any host), and the route smoke test
 # (root, a few seconds). saturate_integration is the slow end-to-end check on dtn-01 (NUMA nodes 0-2,
 # about a minute, known flaky); it carries the label "slow": `ctest -LE slow` skips it.
 # The shell tests re-execute themselves with sudo -n for cgroup writes.
 enable_testing()
 add_test(NAME policy_test COMMAND policy_test)
 add_test(NAME resources_test COMMAND resources_test)
+add_test(NAME ring_test COMMAND ring_test)
 add_test(NAME smoke_integration COMMAND ${CMAKE_SOURCE_DIR}/src/test/smoke_it.sh)
 set_tests_properties(smoke_integration PROPERTIES
   ENVIRONMENT "MERCURY_BIN=$<TARGET_FILE:mercury>;PROBE_BIN=$<TARGET_FILE:env_probe>" TIMEOUT 60)

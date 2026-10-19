@@ -10,13 +10,24 @@ Ring::Ring(std::size_t capacity, std::vector<std::string> names, std::shared_ptr
 
 Ring::~Ring() = default;
 
-std::vector<Sample> Ring::settled_third() const {
+// The oldest third of a full ring (the next pushes overwrite it), minus samples an earlier push or
+// flush already archived. Advances [archived_lo_, archived_hi_), which stays contiguous.
+std::vector<Sample> Ring::settled_third() {
   const std::size_t third = slots_.size() / 3;
-  const std::size_t begin = (head_ + third) % slots_.size();
+  const std::size_t oldest = pushed_ - size_;
+  std::size_t from = oldest;
+  if (archived_hi_ > archived_lo_ && archived_hi_ > from) {
+    from = archived_hi_;
+  }
   std::vector<Sample> samples;
-  samples.reserve(third);
-  for (std::size_t i = 0; i < third; ++i) {
-    samples.push_back(slots_[(begin + i) % slots_.size()]);
+  for (std::size_t index = from; index < oldest + third; ++index) {
+    samples.push_back(slots_[index % slots_.size()]);
+  }
+  if (archived_hi_ <= archived_lo_) {
+    archived_lo_ = oldest;
+  }
+  if (oldest + third > archived_hi_) {
+    archived_hi_ = oldest + third;
   }
   return samples;
 }
@@ -34,8 +45,6 @@ void Ring::push(const Sample& sample) {
     const std::size_t third = slots_.size() / 3;
     if (archive_ && third > 0 && size_ == slots_.size() && head_ % third == 0) {
       settled = settled_third();
-      archived_lo_ = third;
-      archived_hi_ = pushed_ - third;
     }
   }
   if (settled.empty()) {

@@ -38,7 +38,7 @@ class Ring {
   const std::vector<std::string>& names() const { return names_; }
 
  private:
-  std::vector<Sample> settled_third() const;
+  std::vector<Sample> settled_third();
 
   mutable std::mutex mu_;
   std::vector<Sample> slots_;
