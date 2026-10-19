@@ -44,6 +44,16 @@ Sample group_sample(std::int64_t t_ns, std::uint64_t busy, std::uint64_t idle) {
 }  // namespace
 
 int main() {
+  // Baselines.pdf eq. 2 (aggregate) and eq. 6 (OpenFaaS proportional), pure decisions.
+  check(cluster_overloaded({loads({0.9, 0.9, 0.9, 0.9, 0.9}), loads({0.8, 0.8, 0.8, 0.8, 0.8})}), "aggregate: mean 0.85 > 0.80");
+  check(!cluster_overloaded({loads({1.0, 1.0, 1.0, 1.0, 1.0}), loads({0.1, 0.1, 0.1, 0.1, 0.1})}),
+        "aggregate: one hot group alone (mean 0.55) is not cluster overload");
+  check(!cluster_overloaded({loads({0.9, 0.9, 0.9, 0.9})}), "aggregate: short window is cold");
+  check(proportional_replicas(2, 0.9, 0.5, 0.9, 1, 16) == 4, "openfaas: ceil(2 * 0.9 / 0.45) = 4");
+  check(proportional_replicas(4, 0.45, 0.5, 0.9, 1, 16) == 4, "openfaas: at target proportion holds");
+  check(proportional_replicas(4, 0.1, 0.5, 0.9, 1, 16) == 1, "openfaas: scales down");
+  check(proportional_replicas(8, 1.0, 0.5, 0.9, 1, 10) == 10, "openfaas: clamped to max");
+
   // interval_loads buckets 10 ms samples into five 1 s intervals.
   {
     std::vector<Sample> samples;

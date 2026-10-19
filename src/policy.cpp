@@ -1,6 +1,7 @@
 #include "policy.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <limits>
 #include <optional>
@@ -223,6 +224,36 @@ bool node_overloaded(const IntervalLoads& loads, double theta) {
     sum += *loads[i];
   }
   return sum / kPolicyIntervals > theta;
+}
+
+bool cluster_overloaded(const std::vector<IntervalLoads>& groups, double theta) {
+  if (groups.empty()) {
+    return false;
+  }
+  double sum = 0;
+  for (const auto& loads : groups) {
+    if (!all_present(loads)) {
+      return false;
+    }
+    double group = 0;
+    for (std::size_t i = loads.size() - static_cast<std::size_t>(kPolicyIntervals); i < loads.size(); ++i) {
+      group += *loads[i];
+    }
+    sum += group / kPolicyIntervals;
+  }
+  return sum / static_cast<double>(groups.size()) > theta;
+}
+
+int proportional_replicas(int replicas, double mean_load, double target, double proportion, int min_replicas,
+                          int max_replicas) {
+  const int low = std::max(1, min_replicas);
+  const int high = std::max(low, max_replicas);
+  if (replicas < 1 || target <= 0 || proportion <= 0 || !(mean_load >= 0)) {
+    return std::clamp(replicas, low, high);
+  }
+  // Small epsilon so an exact ratio of 1.0 computed in floating point does not round up.
+  const double want = std::ceil(replicas * mean_load / (target * proportion) - 1e-9);
+  return std::clamp(static_cast<int>(want), low, high);
 }
 
 bool shift_triggered(const IntervalLoads& loads, const ShiftRule& rule) {

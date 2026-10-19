@@ -81,6 +81,17 @@ bool node_hot(const IntervalLoads& loads, double util = kHotspotUtil, int hits =
 // scale_nodes_ind test: the mean of all kPolicyIntervals loads is above theta. A missing interval is cold.
 bool node_overloaded(const IntervalLoads& loads, double theta = kNodeTheta);
 
+// scale_nodes_agg (Baselines.pdf eq. 2, right): the mean over groups of each group's window mean is
+// above theta. A group with a missing interval makes the test cold. Pure decision only (not wired).
+bool cluster_overloaded(const std::vector<IntervalLoads>& groups, double theta = kNodeTheta);
+
+// Horizontal scaling as written in Baselines.pdf eq. 6 (native OpenFaaS):
+// r(t+1) = ceil(r(t) * mean_load / (target * proportion)), clamped to [min, max]. infrabench's
+// scale_out module instead pins 2 replicas, which is what the scale_out arm reproduces; this is the
+// paper's rule for when the arm is switched to it. Pure decision only (not wired).
+int proportional_replicas(int replicas, double mean_load, double target, double proportion, int min_replicas,
+                          int max_replicas);
+
 enum class ShiftTrigger { Hotspot, Mean, Either };
 
 struct ShiftRule {

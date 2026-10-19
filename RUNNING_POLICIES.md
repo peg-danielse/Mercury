@@ -13,13 +13,18 @@ infrabench-style results (one scored adaptation per policy arm).
 | `scale_nodes_ind` (CMT20) | developed: add a worker when one node's 75 s mean CPU > 0.80 | `shift` with `trigger: "mean"`, `theta: 0.80`: a running daemon leaves a group whose mean load over the last five 1 s intervals is above 0.80. Mercury does not start machines; leaving the overloaded group is the equivalent (`policies.md` Baselines) |
 | `reactive_move` (WSVY07, Sandpiper) | developed: hotspot = 3 of the last 5 samples > 0.75, move to least-loaded legal node | `shift` with `trigger: "hotspot"`, `util: 0.75`: same test on five 1 s intervals, cpuset rewritten onto the least-loaded legal group (same CPU count, same pid) |
 | `degrade_optional` (XDB17, XNTB19) | developed: shed the first optional function on a node above 0.80 | `degrade`: operator-listed optional components with a cost; disabled costliest-first until `U - cost(disabled) <= 0.80`, restored cheapest-first; written to `rings/<daemon_id>.policy`, read by the app via `MERCURY_POLICY` |
-| `scale_out` | developed: 2 replicas, hostname pin kept | `/scale {"min":2,"max":2}` (saturate) plus `restrict.ceiling` = the group the daemon sits in, so the 2nd CPU comes from the same group |
+| `scale_out` | developed: 2 replicas, hostname pin kept (`policy/scale_out.py` `REPLICAS = 2`) | `/scale {"min":2,"max":2}` (saturate) plus `restrict.ceiling` = the group the daemon sits in, so the 2nd CPU comes from the same group. **Baselines.pdf mismatch:** the PDF specifies native OpenFaaS autoscaling, eq. 6 `r(t+1) = ceil(r(t) * mean_load / (L_target * p))`, not a fixed 2. The arm reproduces the infrabench code; the eq. 6 rule exists as the pure decision `proportional_replicas()` (tested, not wired) |
 | `scale_out_spread` | developed: drop pin, 2 replicas | `/scale {"min":2,"max":2}` with no ceiling: 2nd CPU from the least-loaded core anywhere in the pool |
-| `combined` | developed: scale 0.80, move 0.85, degrade 0.90 | one document: `shift` `trigger: "either"` (`theta: 0.80`, `util: 0.85`) + `degrade` `limit: 0.90` |
+| `combined` | developed: scale 0.80, move 0.85, degrade 0.90 (PDF: "fixed cross-layer rules, all above"; the code combines only these three) | one document: `shift` `trigger: "either"` (`theta: 0.80`, `util: 0.85`) + `degrade` `limit: 0.90` |
 | `zeroctl` (ours) | LLM path in `adapt.py` + `rca/controller/llm/` | `zeroctl` document: Mercury calls the model step `scripts/zeroctl/zeroctl.py` every `every` seconds, validates the proposed action, and applies it (see "zeroctl" below) |
-| scale nodes, aggregate | planned (Baselines table / `policies.md`), no infrabench module | not built; documented only |
-| least allocated | planned, no infrabench module | pure `least_allocated()` decision in `src/policy.cpp` + test; the `widen` grant around it is **not built** (`POST /policies` with `widen` returns HTTP 501) |
-| tune app | planned, no infrabench module | built per `policies.md` (`tune.parameters` ladders, written to the policy file). Treat it as experimental: infrabench has no reference implementation to compare against |
+| scale nodes, aggregate (CMT20, Goo26) | planned: Baselines.pdf eq. 2 right, `mean over nodes of the 75 s mean > 0.8`, add one node; no infrabench module | pure decision `cluster_overloaded()` (tested, not wired: Mercury cannot add machines) |
+| least allocated (Kub26) | planned: Baselines.pdf eq. 5, feasible node with the largest unallocated requested capacity; no infrabench module | pure `least_allocated()` decision in `src/policy.cpp` + test; the `widen` grant around it is **not built** (`POST /policies` with `widen` returns HTTP 501) |
+| tune app | planned: Baselines.pdf eq. 8, `argmax_theta J(theta, w)`; no infrabench module | built per `policies.md` (`tune.parameters` ladders, written to the policy file). This is a load-driven ladder, not the PDF's search for argmax J; treat it as experimental |
+
+Checked against the real `Baselines.pdf` (2026-10-02): θ = 0.8 and T = 75 s for node scaling,
+hotspot `sum_{i=t-4..t} I(U > 0.75) >= 3` with a move to the least-loaded legal node, brownout until
+`U - sum u_c <= 0.8`, all match. The mismatches are the `scale_out` replica rule (code: fixed 2,
+PDF: OpenFaaS eq. 6) and `tune` (ladder vs. argmax J), noted in the table.
 
 Thresholds come from the infrabench modules (`THETA`, `HOTSPOT_UTIL`,
 `HOTSPOT_HITS`, `UTIL_LIMIT`, the combined staggering). The window is
@@ -176,6 +181,87 @@ the C++ `validate_zeroctl` checks in `policy_test`.
 Not ported: infrabench's `repair` script (re-asking after an apply failure); here the failure goes
 into History for the next call instead, which is what infrabench's zeroctl loop does too.
 
+## zeroctl RCA: rings, GNN, Jaeger
+
+Before every prompt the step runs `scripts/zeroctl/rca.py` and renders a "Root cause analysis"
+section (see `scripts/zeroctl/example-prompt.md`). Every call also writes `<stamp>-rca.json`.
+
+What infrabench does (read from `rca/controller/detect`, `rca/eval`, `llm/situation.py`): Jaeger
+traces become per-trace span-duration rows; per-pattern Isolation Forests (scikit-learn,
+contamination 0.01, trained on healthy traces) flag anomalous traces; each anomalous trace is blamed
+on the workload of its longest span (`spans.py dominant_service`); the counts become the ranking line
+"where the degradation shows, most affected first: svc (x%) [method]" in the Situation. `rca/eval`
+adds SHAP and BARO rankings offline. **There is no GNN in infrabench.** The GNN is Paul's Mercury
+model (`gnn-example/mercury`, `dtn01-snapshot-20261018`): a per-thread CPU-demand estimator, not a
+service-graph localizer.
+
+Inputs, in order:
+
+1. **Rings (always).** Group loads and daemon cpusets from Mercury's state; also a labelled
+   heuristic ranking of daemons by the load of their own cores ("ring load (heuristic ...)").
+2. **GNN (default on, `zeroctl.gnn`).** Mercury runs the C++ forward pass from the dtn-01 snapshot
+   (`src/gnn.cpp`, `src/threadstat.cpp`, unchanged except the default model) in observe-only mode
+   (`src/gnn_rca.cpp`): every 10 ms per zeroctl daemon it reads the cgroup's threads (task-clock,
+   context switches, migrations via perf software counters; run/wait from `/proc/<tid>/schedstat`;
+   cgroup `cpu.stat`/`cpu.pressure`), builds the graph (one node per busy thread + one aggregate,
+   same-cgroup + NUMA-distance edges), runs the two delayed graph-filter layers (LocalGNN_DB, K=3,
+   H=16, 17 features, 1,633 parameters), and FFD-packs the predicted per-thread demand into the
+   cores the daemon needs. Nothing is pinned and no cpuset is written by the sampler. The prompt gets,
+   per daemon over the last 5 s: CPUs held, needed (mean/p90/max), share of ticks under-provisioned,
+   predicted demand, threads. A daemon whose need exceeds its cpuset (or is under-provisioned in 20%+ of
+   ticks) is `STARVED` and is the localization. Without the GNN (off, or the model fails to load) the
+   section says why and the localization uses the ring heuristic, labelled as such.
+3. **Jaeger (DSB only, `zeroctl.jaeger`).** `auto` (default) queries `JAEGER_URL` or
+   `http://localhost:16686` and, if nothing answers, prints "skipped: no Jaeger, not a traced (DSB)
+   workload"; `off` (or `ZEROCTL_JAEGER=off` in the step's environment) disables it; a URL forces it
+   (unreachable is reported as an error, still a no-op for control). It fetches the last 60 s of
+   traces of every service from the Jaeger query API, blames each anomalous trace on the service of
+   its longest non-root span (infrabench's rule), and ranks. Anomalous = total above the healthy p95
+   from the Situation file when known, else median + 3 MAD. That threshold is a stdlib stand-in for
+   infrabench's Isolation Forest (needs scikit-learn and healthy training traces) and is labelled so
+   in the prompt. `ZEROCTL_JAEGER_TRACES=<file>` replays a saved `/api/traces` reply.
+
+The GNN needs nothing beyond the build: no torch, no Python packages. It needs root (perf on other
+pids, cgroup files), cgroup v2 with `cpu.pressure` (PSI; absent PSI reads as 0), and the model file.
+Model: `models/gnn_v5.json` (34 KB, the `weights.json` export of results/v5), found as
+`<dir of build/mercury>/../models/gnn_v5.json`; override with `MERCURY_GNN_MODEL=/path/gnn_vN.json`
+in mercury's environment. The format is the snapshot's `weights.json` (`g1.W [K][F][H]`, `g1.b`,
+`g2.W`, `g2.b`, `readout.weight`, `readout.bias`), so any `models/gnn_*.json` from dtn-01 also loads.
+`build/gnnreplay <weights.json> <case_dir>` (from the snapshot) checks the C++ pass against the Python
+model on a recorded threadtrace case.
+
+Why v5: it is the newest model and the one trained on the most data (v3 data + v4 exponential
+data, balanced, + two DAgger rounds, `results/v5-README.md`). Closed loop against v3/v4 it has the
+lowest over-provisioning on exponential patterns (35.8% vs 39.7% v4 / 43.3% v3, under 1.2%, demand
+met 98.1%), the fewest never-reached scale-downs on both suites (100 / 11), and similar old-pattern
+numbers to v3 (`v5-closedloop-*`). On DSB hotel it ties v3 on p95/p99 (33.6 / 54.5 ms) and on DSB
+social it has the best p95 and p99 of the GNN models (28.3 / 54.5 ms vs v3 31.5 / 58.7). Caveat: on
+dtn-01 the deployed default is still v3 (v5 is "not default" there), and the model was trained on
+synthetic gnnload/stress-ng workloads at 10 ms ticks; it estimates current per-thread demand, not
+future demand, and says nothing about causality between services. Set `MERCURY_GNN_MODEL` to
+`gnn_v3.json` to compare.
+
+Switches:
+
+```bash
+# zeroctl with GNN (default) and no Jaeger (hello_server workload: auto skips)
+sudo python3 scripts/policy_experiment.py --label zeroctl-mock --arms zeroctl --llm mock
+# without the GNN (ring heuristic only)
+sudo python3 scripts/policy_experiment.py --label zeroctl-nognn --arms zeroctl --llm mock --no-gnn
+# DSB workload with Jaeger on this host
+curl -s -XPOST localhost:18200/policies -d '{"daemon_id":"frontend","zeroctl":{"llm":"openai","every":20,"jaeger":"http://localhost:16686","application":"hotel"}}'
+# harness: --jaeger auto|off|http://host:16686
+```
+
+`zeroctl` fields added: `gnn` (bool, default true), `jaeger` (`"auto"`|`"off"`|true|false|URL,
+default `auto`), `application` (label for the prompt). The mock model now scales a STARVED daemon to
+its p90 need before trying a move or a degrade.
+
+Tests: `gnn_test` (ctest; loads `models/gnn_v5.json`, shape, missing model, forward pass in [0,1],
+contended > idle, deterministic, FFD), and `zeroctl_test` class `Rca`: with GNN, without GNN,
+GNN unavailable, old state without `rca`, mock scaling a starved daemon, Jaeger auto with no Jaeger,
+explicit unreachable URL, replayed traces, and a fake Jaeger HTTP API with a healthy reference.
+
 ## Driving it by hand
 
 ```bash
@@ -196,8 +282,8 @@ HTTP 400; `widen` is HTTP 501.
 
 ## Differences from infrabench, on purpose
 
-- No RCA in the loop: infrabench applies the baseline to the services the isolation
-  forest blames; here the documents are attached to every service daemon up front, and
+- No RCA in the baseline loop (zeroctl has its own RCA step, above): infrabench applies the
+  baseline to the services the isolation forest blames; here the documents are attached to every service daemon up front, and
   `policy_loop` acts continuously (one action per group per five intervals) instead of
   once per anomaly batch.
 - Unit of capacity is a resource group (node/L3/core), unit that moves is a daemon cpuset;
