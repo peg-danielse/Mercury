@@ -10,3 +10,4 @@ libmercury_http.a
 /cmake_install.cmake
 /Makefile
 output/
+__pycache__/

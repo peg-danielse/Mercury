@@ -53,3 +53,8 @@ target_include_directories(policy_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
 add_test(NAME policy_test COMMAND policy_test)
 mercury_test(burn src/test/burn.cpp)
 target_link_libraries(burn PRIVATE Threads::Threads)
+find_package(Python3 COMPONENTS Interpreter)
+if(Python3_Interpreter_FOUND)
+  # zeroctl model step: prompt, parser, providers against a local fake, mock mode.
+  add_test(NAME zeroctl_test COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/scripts/zeroctl/test_zeroctl.py)
+endif()
