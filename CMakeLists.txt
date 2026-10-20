@@ -21,7 +21,7 @@ function(mercury_test name)
   set_target_properties(${name} PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_SOURCE_DIR}/build/test")
 endfunction()
 
-mercury_executable(mercury src/mercury.cpp src/daemons.cpp src/counters.cpp src/ring.cpp src/ring_archive.cpp src/policy.cpp src/resources.cpp src/threadstat.cpp src/gnn.cpp)
+mercury_executable(mercury src/mercury.cpp src/daemons.cpp src/counters.cpp src/ring.cpp src/ring_archive.cpp src/policy.cpp src/resources.cpp src/threadstat.cpp src/gnn.cpp src/cpustat.cpp)
 mercury_executable(speculator src/speculator.cpp)
 target_link_libraries(mercury PRIVATE mercury_http Threads::Threads)
 mercury_executable(perfcount src/perfcount.cpp)
@@ -31,6 +31,9 @@ target_include_directories(resources_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_link_libraries(resources_test PRIVATE Threads::Threads)
 mercury_test(ring_test src/test/ring.cpp src/ring.cpp src/ring_archive.cpp)
 target_include_directories(ring_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+mercury_test(cpustat_test src/test/cpustat.cpp src/cpustat.cpp src/counters.cpp src/ring.cpp src/ring_archive.cpp)
+target_include_directories(cpustat_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(cpustat_test PRIVATE Threads::Threads)
 mercury_test(policy_test src/test/policy.cpp src/policy.cpp)
 target_include_directories(policy_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_compile_definitions(policy_test PRIVATE TRACES_DIR="${CMAKE_SOURCE_DIR}/src/test/traces")
@@ -45,7 +48,7 @@ mercury_executable(gnnreplay src/gnnreplay.cpp src/gnn.cpp src/threadstat.cpp sr
 mercury_test(gnnload src/test/workloads/gnnload.cpp)
 target_link_libraries(gnnload PRIVATE Threads::Threads)
 
-# ctest: the saturate decisions, the placement walk and the ring archive (no root, any host), and the route smoke test
+# ctest: the saturate decisions, the placement walk, the ring archive and the per-CPU parsers (no root, any host), and the route smoke test
 # (root, a few seconds). saturate_integration is the slow end-to-end check on dtn-01 (NUMA nodes 0-2,
 # about a minute, known flaky); it carries the label "slow": `ctest -LE slow` skips it.
 # The shell tests re-execute themselves with sudo -n for cgroup writes.
@@ -53,6 +56,7 @@ enable_testing()
 add_test(NAME policy_test COMMAND policy_test)
 add_test(NAME resources_test COMMAND resources_test)
 add_test(NAME ring_test COMMAND ring_test)
+add_test(NAME cpustat_test COMMAND cpustat_test)
 add_test(NAME smoke_integration COMMAND ${CMAKE_SOURCE_DIR}/src/test/smoke_it.sh)
 set_tests_properties(smoke_integration PROPERTIES
   ENVIRONMENT "MERCURY_BIN=$<TARGET_FILE:mercury>;PROBE_BIN=$<TARGET_FILE:env_probe>" TIMEOUT 60)

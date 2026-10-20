@@ -1,4 +1,5 @@
 #include "http.hpp"
+#include "cpustat.hpp"
 #include "daemons.hpp"
 #include "gnn.hpp"
 #include "resources.hpp"
@@ -325,6 +326,9 @@ int main(int argc, char** argv) {
     std::cout << std::endl;
     set_daemon_cpus(daemon_cpus);
     init_resources(std::move(daemon_cpus));
+    if (const char* env = std::getenv("MERCURY_CPUSTAT"); env != nullptr && std::string(env) == "1") {
+      init_cpustat(ring_archive_dir());
+    }
     serve(static_cast<std::uint16_t>(port_number), "mercury", route);
   } catch (const std::exception& error) {
     std::cerr << error.what() << std::endl;

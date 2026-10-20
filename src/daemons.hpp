@@ -7,6 +7,8 @@
 void set_daemon_cpus(std::vector<int> cpus);
 void set_mercury_cpu(int cpu);
 void raise_nofile();
+// Directory of the ring archives: MERCURY_RINGS, else ./rings.
+std::string ring_archive_dir();
 
 std::optional<std::string> stat_route(const std::string& request);
 std::optional<std::string> start_route(const std::string& request);

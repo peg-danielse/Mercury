@@ -43,6 +43,7 @@ fi
 # TRACEALL=MS: threadtrace every $PFX daemon at MS ms in every run, from the load generator start
 #   (TRACE_SLOW daemons at 50 ms). TRACE_ONLY="hotel-geo hotel-rate": trace only these daemons.
 # SVC_ARGS: extra operator args per run appended verbatim (e.g. "-svc-min 4 -svc-max 4").
+# CPUSTAT=1: per-CPU rings (rings/cpu-<n>.mring) and rings/placement.jsonl (src/cpustat.hpp), for interference.
 # SEED=DIR: before every run, restore a dsb_seed.sh snapshot (MongoDB's data directory and redis's dump.rdb), so every
 #   run starts from the same filled state. Refuses while a mongod runs.
 for r in $(seq 1 $REPS); do for pol in ${POLICIES:-saturate gnn}; do
@@ -63,7 +64,7 @@ for r in $(seq 1 $REPS); do for pol in ${POLICIES:-saturate gnn}; do
     echo "external mercury pid $XPID port $PORT from $(date +%T); its log is its own output" > $D/mercury.log
   else
     ss -ltnH | grep -q ":$PORT " && { echo "port $PORT busy"; exit 1; }
-    (cd $WD && exec sudo -n env MERCURY_RINGS=$D/rings ${MODEL:+MERCURY_GNN_MODEL=$MODEL} $M/build/mercury $PORT 0 $POOL) > $D/mercury.log 2>&1 &
+    (cd $WD && exec sudo -n env MERCURY_RINGS=$D/rings ${MODEL:+MERCURY_GNN_MODEL=$MODEL} ${CPUSTAT:+MERCURY_CPUSTAT=$CPUSTAT} $M/build/mercury $PORT 0 $POOL) > $D/mercury.log 2>&1 &
     sleep 1; MPID=$(pgrep -f "^$M/build/mercury $PORT 0" | head -1)
     for i in $(seq 50); do curl -s -m 1 127.0.0.1:$PORT/ping >/dev/null && break; sleep 0.2; done
   fi

@@ -7,6 +7,7 @@
 #include "resources.hpp"
 #include "ring.hpp"
 #include "ring_archive.hpp"
+#include "cpustat.hpp"
 
 #include <arpa/inet.h>
 #include <dirent.h>
@@ -1073,13 +1074,12 @@ std::string format_cpuset(const std::vector<int>& cpus) {
   return out;
 }
 
-int cpuset_cores(const std::string& daemon_id) {
+std::vector<int> cpuset_of(const std::string& daemon_id) {
   const auto have = parse_cpuset(trimmed(read_file("/sys/fs/cgroup/mercury/" + daemon_id + "/cpuset.cpus")));
-  if (!have) {
-    return 0;
-  }
-  return static_cast<int>(have->size());
+  return have ? *have : std::vector<int>{};
 }
+
+int cpuset_cores(const std::string& daemon_id) { return static_cast<int>(cpuset_of(daemon_id).size()); }
 
 bool add_core(const std::string& daemon_id, int max_cores, int& cores_after, std::string& spec_after,
               CpuPlacement placement = CpuPlacement::LeastLoaded) {
@@ -1255,6 +1255,8 @@ std::uint64_t usec_delta_ns(std::uint64_t after, std::uint64_t before) {
   return (after - before) * 1000ULL;
 }
 
+std::string ring_archive_dir() { return rings_dir(); }
+
 void monitor_daemon(const std::string& daemon_id, pid_t root) {
   // PSI decides the fourth counter for the life of this daemon: pressure, or runnable without PSI.
   const bool use_psi = read_cgroup_pressure(daemon_id).has_value();
@@ -1303,7 +1305,9 @@ void monitor_daemon(const std::string& daemon_id, pid_t root) {
         total.value[1] = usec_delta_ns(current_cpu->user_usec, previous_cpu->user_usec);
         total.value[2] = usec_delta_ns(current_cpu->system_usec, previous_cpu->system_usec);
         total.value[3] = use_psi ? usec_delta_ns(*current_pressure, *previous_pressure) : count_runnable(root);
-        total.value[kCgroupCores] = static_cast<std::uint64_t>(cpuset_cores(daemon_id));
+        const auto cpus = cpuset_of(daemon_id);
+        total.value[kCgroupCores] = static_cast<std::uint64_t>(cpus.size());
+        note_cpuset(daemon_id, cpus);
         daemon_ring->push(total);
       }
       if (current_cpu) {
@@ -1434,6 +1438,7 @@ void monitor_daemon(const std::string& daemon_id, pid_t root) {
     std::cerr << "counters daemon_id=" << daemon_id << " " << error.what() << std::endl;
   }
   daemon_ring->flush();
+  note_cpuset(daemon_id, {});
   mark_counters_done(daemon_id, root);
 }
 

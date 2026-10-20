@@ -66,7 +66,7 @@ std::int64_t monotonic_ns() {
   return static_cast<std::int64_t>(now.tv_sec) * 1000000000LL + now.tv_nsec;
 }
 
-int open_event(const Spec& spec, pid_t pid, int group_fd, int exclude_kernel) {
+int open_event(const Spec& spec, pid_t pid, int cpu, int group_fd, int exclude_kernel) {
   perf_event_attr attr{};
   attr.type = spec.type;
   attr.size = sizeof(attr);
@@ -77,7 +77,7 @@ int open_event(const Spec& spec, pid_t pid, int group_fd, int exclude_kernel) {
   attr.read_format = PERF_FORMAT_GROUP | PERF_FORMAT_TOTAL_TIME_ENABLED |
                      PERF_FORMAT_TOTAL_TIME_RUNNING | PERF_FORMAT_ID;
 
-  const auto fd = ::syscall(__NR_perf_event_open, &attr, pid, -1, group_fd, PERF_FLAG_FD_CLOEXEC);
+  const auto fd = ::syscall(__NR_perf_event_open, &attr, pid, cpu, group_fd, PERF_FLAG_FD_CLOEXEC);
   if (fd < 0) {
     return -1;
   }
@@ -92,7 +92,8 @@ std::uint64_t event_id(int fd) {
   return id;
 }
 
-std::vector<Opened> open_group(pid_t pid, const Spec* specs, std::size_t count) {
+// cpu -1 counts the task on any CPU; pid -1 with a cpu counts everything on that CPU.
+std::vector<Opened> open_group(pid_t pid, int cpu, const Spec* specs, std::size_t count) {
   std::vector<Opened> opened;
   opened.reserve(count);
   int leader = -1;
@@ -100,10 +101,10 @@ std::vector<Opened> open_group(pid_t pid, const Spec* specs, std::size_t count) 
   int saved = ENODEV;
 
   for (std::size_t i = 0; i < count; ++i) {
-    int fd = open_event(specs[i], pid, leader, exclude_kernel);
+    int fd = open_event(specs[i], pid, cpu, leader, exclude_kernel);
     if (fd < 0 && leader < 0 && errno == EACCES && exclude_kernel == 0) {
       exclude_kernel = 1;
-      fd = open_event(specs[i], pid, -1, exclude_kernel);
+      fd = open_event(specs[i], pid, cpu, -1, exclude_kernel);
     }
     if (fd < 0) {
       saved = errno;
@@ -231,10 +232,22 @@ constexpr Spec kSoftwareTrio[] = {
     {"context-switches", PERF_TYPE_SOFTWARE, PERF_COUNT_SW_CONTEXT_SWITCHES},
     {"cpu-migrations", PERF_TYPE_SOFTWARE, PERF_COUNT_SW_CPU_MIGRATIONS},
 };
+
+constexpr Spec kCpuHardware[] = {
+    {"cycles", PERF_TYPE_HARDWARE, PERF_COUNT_HW_CPU_CYCLES},
+    {"instructions", PERF_TYPE_HARDWARE, PERF_COUNT_HW_INSTRUCTIONS},
+    {"llc_misses", PERF_TYPE_HARDWARE, PERF_COUNT_HW_CACHE_MISSES},
+};
 }  // namespace
 
 CounterGroup open_software(pid_t pid) {
   auto impl = std::make_unique<CounterGroup::Impl>();
-  impl->events = open_group(pid, kSoftwareTrio, std::size(kSoftwareTrio));
+  impl->events = open_group(pid, -1, kSoftwareTrio, std::size(kSoftwareTrio));
+  return CounterGroup(std::move(impl));
+}
+
+CounterGroup open_cpu_hardware(int cpu) {
+  auto impl = std::make_unique<CounterGroup::Impl>();
+  impl->events = open_group(-1, cpu, kCpuHardware, std::size(kCpuHardware));
   return CounterGroup(std::move(impl));
 }
