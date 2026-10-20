@@ -211,6 +211,15 @@ void CounterGroup::arm() {
   impl_->armed = true;
 }
 
+void CounterGroup::kick() {
+  if (!impl_ || !impl_->armed || impl_->events.empty()) {
+    return;
+  }
+  const int leader = impl_->events.front().fd.get();
+  ::ioctl(leader, PERF_EVENT_IOC_DISABLE, PERF_IOC_FLAG_GROUP);
+  ::ioctl(leader, PERF_EVENT_IOC_ENABLE, PERF_IOC_FLAG_GROUP);
+}
+
 bool CounterGroup::pull(Sample& sample) {
   if (!impl_ || !impl_->armed || impl_->events.empty()) {
     return false;

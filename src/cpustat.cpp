@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <ctime>
 #include <fstream>
 #include <iostream>
@@ -41,6 +42,8 @@ struct CpuTarget {
 };
 
 bool enabled = false;
+// Disable/enable each CPU's perf group before reading it (see cpustat.hpp); MERCURY_CPUSTAT_KICK=0 turns it off.
+bool kick_perf = true;
 std::mutex placement_mu;
 std::map<std::string, std::vector<int>> placement;  // daemon -> cpuset, daemons with a non-empty set only
 std::unordered_map<int, int> daemons_on;             // cpu -> daemons whose cpuset contains it
@@ -127,6 +130,9 @@ void sample_loop(std::vector<CpuTarget> targets, std::uint64_t tick_ns, int peri
         sample.value[kSlices] = delta(r1->second.slices, r0->second.slices);
       }
       Sample perf;
+      if (kick_perf) {
+        target.perf.kick();
+      }
       if (!target.perf.empty() && target.perf.pull(perf)) {
         for (int i = 0; i < perf.nvalues; ++i) {
           if (target.perf_column[i] >= 0) {
@@ -266,6 +272,9 @@ void init_cpustat(const std::string& dir, int period_ms, int cpu) {
       perf_error = error.what();
     }
     targets.push_back(std::move(target));
+  }
+  if (const char* env = std::getenv("MERCURY_CPUSTAT_KICK"); env != nullptr && std::string(env) == "0") {
+    kick_perf = false;
   }
   placement_log.open(dir + "/placement.jsonl", std::ios::app);
   enabled = true;

@@ -11,6 +11,9 @@
 // to the daemons on that CPU at that moment. Off unless init_cpustat runs (mercury: MERCURY_CPUSTAT=1, period
 // MERCURY_CPUSTAT_MS [50], sampler pinned to MERCURY_CPUSTAT_CPU if set). One sample of every CPU costs a few ms
 // (/proc/schedstat alone is 1.5 ms on a 64-CPU EPYC), hence the coarser default than the 10 ms daemon rings.
+// Each CPU's perf group is disabled and re-enabled before every read (MERCURY_CPUSTAT_KICK=0 skips it): on dtn-01
+// (EPYC 7301, kernel 6.12) groups on CPUs running DSB services stayed "running" (time_running == time_enabled) but
+// counted 0 cycles until something reprogrammed the PMU; the kick does that. It costs the sampler ~13% of its CPU.
 //
 // Columns: busy (ns tasks ran on this CPU), run_delay (ns tasks waited on its run queue) and slices (/proc/schedstat,
 // exact), irq (/proc/stat irq+softirq, ns in clock ticks), cycles, instructions, llc_misses (perf on that CPU, pid -1;

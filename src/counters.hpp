@@ -19,6 +19,8 @@ class CounterGroup {
   std::vector<std::string> names() const;
   // Reset and enable. The next pull is the delta since this call.
   void arm();
+  // Disable and re-enable the group without resetting it (forces the kernel to reprogram the PMU).
+  void kick();
   // One delta since arm or the previous pull. False when the thread is gone.
   bool pull(Sample& sample);
 
