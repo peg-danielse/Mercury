@@ -29,8 +29,9 @@ constexpr int kIrq = 1;
 constexpr int kRunDelay = 2;
 constexpr int kSlices = 3;
 constexpr int kDaemons = 7;
-// Archive every second from the sampling thread: SIGTERM ends Mercury with _exit, so at most this much is lost.
-constexpr int kFlushMs = 1000;
+// Archive from a thread of its own: every append fsyncs twice, and 64 archives a second stalled sampling for
+// seconds on dtn-01. SIGTERM ends Mercury with _exit, so at most this much is lost.
+constexpr int kFlushMs = 5000;
 
 struct CpuTarget {
   int cpu = 0;
@@ -93,11 +94,10 @@ void sample_loop(std::vector<CpuTarget> targets, std::uint64_t tick_ns, int peri
       std::cerr << "cpustat: cannot pin the sampler to cpu " << cpu << std::endl;
     }
   }
-  const long flush_every = std::max(1, kFlushMs / period_ms);
   auto previous_stat = parse_proc_stat(read_file("/proc/stat"));
   auto previous_sched = parse_schedstat(read_file("/proc/schedstat"));
   auto next = std::chrono::steady_clock::now();
-  for (long tick = 1;; ++tick) {
+  while (true) {
     // Fixed cadence: reading every CPU takes a few ms, which a plain sleep would add to each period.
     next += std::chrono::milliseconds(period_ms);
     std::this_thread::sleep_until(next);
@@ -140,13 +140,17 @@ void sample_loop(std::vector<CpuTarget> targets, std::uint64_t tick_ns, int peri
       sample.value[kDaemons] = here == on.end() ? 0 : static_cast<std::uint64_t>(here->second);
       target.ring->push(sample);
     }
-    if (tick % flush_every == 0) {
-      for (auto& target : targets) {
-        target.ring->flush();
-      }
-    }
     previous_stat = stat;
     previous_sched = sched;
+  }
+}
+
+void flush_loop(std::vector<std::shared_ptr<Ring>> rings) {
+  while (true) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(kFlushMs));
+    for (auto& ring : rings) {
+      ring->flush();
+    }
   }
 }
 
@@ -268,6 +272,11 @@ void init_cpustat(const std::string& dir, int period_ms, int cpu) {
   std::cout << "cpustat cpus=" << targets.size() << " perf=" << perf_cpus << " period_ms=" << period_ms
             << " sampler_cpu=" << cpu << " dir=" << dir
             << (perf_error.empty() ? "" : " perf error: " + perf_error) << std::endl;
+  std::vector<std::shared_ptr<Ring>> rings;
+  for (const auto& target : targets) {
+    rings.push_back(target.ring);
+  }
+  std::thread(flush_loop, std::move(rings)).detach();
   std::thread(sample_loop, std::move(targets), tick_ns, period_ms, cpu).detach();
 }
 
