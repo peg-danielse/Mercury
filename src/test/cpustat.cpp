@@ -46,7 +46,7 @@ void placement_log() {
   require(::mkdtemp(dir) != nullptr, "mkdtemp");
   require(!cpustat_enabled(), "off before init");
   note_cpuset("a", {1});  // ignored while off
-  init_cpustat(dir);
+  init_cpustat(dir, 50, -1);
   require(cpustat_enabled(), "on after init");
   note_cpuset("a", {3, 1});
   note_cpuset("a", {1, 3});  // unchanged: no line

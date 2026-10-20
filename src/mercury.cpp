@@ -327,7 +327,9 @@ int main(int argc, char** argv) {
     set_daemon_cpus(daemon_cpus);
     init_resources(std::move(daemon_cpus));
     if (const char* env = std::getenv("MERCURY_CPUSTAT"); env != nullptr && std::string(env) == "1") {
-      init_cpustat(ring_archive_dir());
+      const char* period = std::getenv("MERCURY_CPUSTAT_MS");
+      const char* cpu = std::getenv("MERCURY_CPUSTAT_CPU");
+      init_cpustat(ring_archive_dir(), period != nullptr ? std::stoi(period) : 50, cpu != nullptr ? std::stoi(cpu) : -1);
     }
     serve(static_cast<std::uint16_t>(port_number), "mercury", route);
   } catch (const std::exception& error) {

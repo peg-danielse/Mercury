@@ -24,7 +24,7 @@ case $SYS in
 esac
 OUT=$(realpath -m $OUT); RUN=$OUT/$(date +%Y%m%d-%H%M%S); mkdir -p $RUN
 killcg() { for c in /sys/fs/cgroup/mercury/$PFX*; do [ -d $c ] && echo 1 | sudo -n tee $c/cgroup.kill >/dev/null; done; sleep 1; for c in /sys/fs/cgroup/mercury/$PFX*; do [ -d $c ] && sudo -n rmdir $c 2>/dev/null; done; }
-cleanup() { killcg; [ -n "${SPID:-}" ] && kill $SPID 2>/dev/null; [ -n "${MPID:-}" ] && sudo -n kill -TERM $MPID 2>/dev/null; sleep 2; }
+cleanup() { killcg; [ -n "${SPID:-}" ] && kill $SPID 2>/dev/null; [ -n "${SCPID:-}" ] && kill -TERM $SCPID 2>/dev/null; [ -n "${MPID:-}" ] && sudo -n kill -TERM $MPID 2>/dev/null; sleep 2; }
 trap cleanup EXIT
 if [ -n "${EXTERNAL:-}" ]; then
   curl -s -m 2 127.0.0.1:$PORT/ping | grep -q pong || { echo "no mercury answering on port $PORT"; exit 1; }
@@ -43,7 +43,10 @@ fi
 # TRACEALL=MS: threadtrace every $PFX daemon at MS ms in every run, from the load generator start
 #   (TRACE_SLOW daemons at 50 ms). TRACE_ONLY="hotel-geo hotel-rate": trace only these daemons.
 # SVC_ARGS: extra operator args per run appended verbatim (e.g. "-svc-min 4 -svc-max 4").
-# CPUSTAT=1: per-CPU rings (rings/cpu-<n>.mring) and rings/placement.jsonl (src/cpustat.hpp), for interference.
+# CPUSTAT=1: per-CPU rings (rings/cpu-<n>.mring) and rings/placement.jsonl (src/cpustat.hpp), for interference;
+#   CPUSTAT_MS [50] sampling period, CPUSTAT_CPU [SAMPLE_CPU] the sampler's CPU (off the operator's and Mercury's).
+# SIDECAR="cmd args": started once the services are up (the load generator's cgroup exists) with --run-dir D
+#   --prefix PFX --port PORT appended, on SAMPLE_CPU, output in D/sidecar.log; SIGTERM when the operator exits.
 # SEED=DIR: before every run, restore a dsb_seed.sh snapshot (MongoDB's data directory and redis's dump.rdb), so every
 #   run starts from the same filled state. Refuses while a mongod runs.
 for r in $(seq 1 $REPS); do for pol in ${POLICIES:-saturate gnn}; do
@@ -64,7 +67,7 @@ for r in $(seq 1 $REPS); do for pol in ${POLICIES:-saturate gnn}; do
     echo "external mercury pid $XPID port $PORT from $(date +%T); its log is its own output" > $D/mercury.log
   else
     ss -ltnH | grep -q ":$PORT " && { echo "port $PORT busy"; exit 1; }
-    (cd $WD && exec sudo -n env MERCURY_RINGS=$D/rings ${MODEL:+MERCURY_GNN_MODEL=$MODEL} ${CPUSTAT:+MERCURY_CPUSTAT=$CPUSTAT} $M/build/mercury $PORT 0 $POOL) > $D/mercury.log 2>&1 &
+    (cd $WD && exec sudo -n env MERCURY_RINGS=$D/rings ${MODEL:+MERCURY_GNN_MODEL=$MODEL} ${CPUSTAT:+MERCURY_CPUSTAT=$CPUSTAT MERCURY_CPUSTAT_MS=${CPUSTAT_MS:-50} MERCURY_CPUSTAT_CPU=${CPUSTAT_CPU:-$SAMPLE_CPU}} $M/build/mercury $PORT 0 $POOL) > $D/mercury.log 2>&1 &
     sleep 1; MPID=$(pgrep -f "^$M/build/mercury $PORT 0" | head -1)
     for i in $(seq 50); do curl -s -m 1 127.0.0.1:$PORT/ping >/dev/null && break; sleep 0.2; done
   fi
@@ -79,12 +82,17 @@ for r in $(seq 1 $REPS); do for pol in ${POLICIES:-saturate gnn}; do
         case " ${TRACE_SLOW:-} " in *" $d "*) iv=50;; esac
         taskset -c $TRACE_CPUS sudo -n $M/build/threadtrace $d --interval-ms $iv --duration-s 900 --out $D/trace-$d.jsonl 2>/dev/null & done; wait ) &
   fi
+  if [ -n "${SIDECAR:-}" ]; then
+    ( for i in $(seq 300); do [ -d /sys/fs/cgroup/mercury/${PFX}loadgen ] && break; sleep 1; done
+      exec taskset -c $SAMPLE_CPU $SIDECAR --run-dir $D --prefix $PFX --port $PORT ) > $D/sidecar.log 2>&1 & SCPID=$!
+  fi
   echo "$(date +%T) run $r $NAME"
   T0=$(python3 -c 'import time; print(time.monotonic_ns())')
   (cd $WD && taskset -c $OP_CPU $OP -mercury 127.0.0.1:$PORT -cpu 2 -gen-cpu $GEN_CPU -client mercury $PARGS -placement least_loaded -gen-out $D/loadgen.out $EXTRA ${SVC_ARGS:-} autoscale) > $D/operate.out 2> $D/operate.err
   echo "  operator exit $? routes=$(grep -c ^route $D/operate.out)"
   T1=$(python3 -c 'import time; print(time.monotonic_ns())')
   kill $SPID; SPID=""
+  [ -n "${SCPID:-}" ] && { kill -TERM $SCPID 2>/dev/null; wait $SCPID 2>/dev/null; SCPID=""; }
   if [ -n "${MPID:-}" ]; then
     sudo -n kill -TERM $MPID; for i in $(seq 50); do kill -0 $MPID 2>/dev/null || break; sleep 0.2; done; MPID=""
   fi

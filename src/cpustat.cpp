@@ -4,6 +4,8 @@
 #include "ring.hpp"
 #include "ring_archive.hpp"
 
+#include <pthread.h>
+#include <sched.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -28,7 +30,7 @@ constexpr int kRunDelay = 2;
 constexpr int kSlices = 3;
 constexpr int kDaemons = 7;
 // Archive every second from the sampling thread: SIGTERM ends Mercury with _exit, so at most this much is lost.
-constexpr int kFlushEvery = 1000 / kSampleMs;
+constexpr int kFlushMs = 1000;
 
 struct CpuTarget {
   int cpu = 0;
@@ -82,13 +84,22 @@ std::shared_ptr<RingArchive> open_archive(const std::string& path) {
   }
 }
 
-void sample_loop(std::vector<CpuTarget> targets, std::uint64_t tick_ns) {
+void sample_loop(std::vector<CpuTarget> targets, std::uint64_t tick_ns, int period_ms, int cpu) {
+  if (cpu >= 0) {
+    cpu_set_t mask;
+    CPU_ZERO(&mask);
+    CPU_SET(cpu, &mask);
+    if (::pthread_setaffinity_np(::pthread_self(), sizeof(mask), &mask) != 0) {
+      std::cerr << "cpustat: cannot pin the sampler to cpu " << cpu << std::endl;
+    }
+  }
+  const long flush_every = std::max(1, kFlushMs / period_ms);
   auto previous_stat = parse_proc_stat(read_file("/proc/stat"));
   auto previous_sched = parse_schedstat(read_file("/proc/schedstat"));
   auto next = std::chrono::steady_clock::now();
   for (long tick = 1;; ++tick) {
     // Fixed cadence: reading every CPU takes a few ms, which a plain sleep would add to each period.
-    next += std::chrono::milliseconds(kSampleMs);
+    next += std::chrono::milliseconds(period_ms);
     std::this_thread::sleep_until(next);
     const auto stat = parse_proc_stat(read_file("/proc/stat"));
     const auto sched = parse_schedstat(read_file("/proc/schedstat"));
@@ -129,7 +140,7 @@ void sample_loop(std::vector<CpuTarget> targets, std::uint64_t tick_ns) {
       sample.value[kDaemons] = here == on.end() ? 0 : static_cast<std::uint64_t>(here->second);
       target.ring->push(sample);
     }
-    if (tick % kFlushEvery == 0) {
+    if (tick % flush_every == 0) {
       for (auto& target : targets) {
         target.ring->flush();
       }
@@ -218,8 +229,8 @@ std::unordered_map<int, SchedstatCpu> parse_schedstat(std::string_view text) {
   return cpus;
 }
 
-void init_cpustat(const std::string& dir) {
-  if (enabled) {
+void init_cpustat(const std::string& dir, int period_ms, int cpu) {
+  if (enabled || period_ms <= 0) {
     return;
   }
   auto online = parse_cpu_ranges(read_file("/sys/devices/system/cpu/online"));
@@ -254,9 +265,10 @@ void init_cpustat(const std::string& dir) {
   }
   placement_log.open(dir + "/placement.jsonl", std::ios::app);
   enabled = true;
-  std::cout << "cpustat cpus=" << targets.size() << " perf=" << perf_cpus << " dir=" << dir
+  std::cout << "cpustat cpus=" << targets.size() << " perf=" << perf_cpus << " period_ms=" << period_ms
+            << " sampler_cpu=" << cpu << " dir=" << dir
             << (perf_error.empty() ? "" : " perf error: " + perf_error) << std::endl;
-  std::thread(sample_loop, std::move(targets), tick_ns).detach();
+  std::thread(sample_loop, std::move(targets), tick_ns, period_ms, cpu).detach();
 }
 
 bool cpustat_enabled() { return enabled; }
