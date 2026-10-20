@@ -43,11 +43,22 @@ fi
 # TRACEALL=MS: threadtrace every $PFX daemon at MS ms in every run, from the load generator start
 #   (TRACE_SLOW daemons at 50 ms). TRACE_ONLY="hotel-geo hotel-rate": trace only these daemons.
 # SVC_ARGS: extra operator args per run appended verbatim (e.g. "-svc-min 4 -svc-max 4").
+# SEED=DIR: before every run, restore a dsb_seed.sh snapshot (MongoDB's data directory and redis's dump.rdb), so every
+#   run starts from the same filled state. Refuses while a mongod runs.
 for r in $(seq 1 $REPS); do for pol in ${POLICIES:-saturate gnn}; do
   MODEL=""; NAME=$pol
   case $pol in *@*) MODEL=${pol#*@}; pol=${pol%%@*}; NAME=$pol-$(basename $MODEL .json);; esac
   case $pol in gnn-nopin) PARGS="-policy gnn -pin=false";; *) PARGS="-policy $pol";; esac
   D=$RUN/$r-$NAME; mkdir -p $D
+  if [ -n "${SEED:-}" ]; then
+    pgrep -x mongod >/dev/null && { echo "mongod is running: cannot restore SEED"; exit 1; }
+    [ -d "$SEED/mongodb" ] || { echo "SEED $SEED has no mongodb/"; exit 1; }
+    sudo -n mkdir -p $B/runtime/mongodb/27017/db $B/runtime/redis/6379
+    sudo -n rsync -a --delete "$SEED/mongodb/" $B/runtime/mongodb/27017/db/
+    if [ -f "$SEED/redis/dump.rdb" ]; then sudo -n cp -p "$SEED/redis/dump.rdb" $B/runtime/redis/6379/dump.rdb
+    else sudo -n rm -f $B/runtime/redis/6379/dump.rdb; fi
+    echo "seed $SEED restored $(date -Is)" > $D/seed.txt
+  fi
   if [ -n "${EXTERNAL:-}" ]; then
     echo "external mercury pid $XPID port $PORT from $(date +%T); its log is its own output" > $D/mercury.log
   else
