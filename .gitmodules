@@ -30,3 +30,7 @@
 	path = benchmarks/runtime/mongodb
 	url = git@github.com:peg-danielse/Benchmarks.git
 	branch = runtime/mongodb
+[submodule "train-ticket"]
+	path = benchmarks/train-ticket
+	url = git@github.com:peg-danielse/Benchmarks.git
+	branch = train-ticket
