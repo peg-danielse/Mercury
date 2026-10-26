@@ -26,6 +26,20 @@ void init_cpustat(const std::string& dir, int period_ms, int cpu);
 
 bool cpustat_enabled();
 
+// One CPU over the samples newer than from_ns (CLOCK_MONOTONIC): busy and run_delay as shares of the span,
+// IPC (instructions over cycles) and LLC misses per millisecond; perf is false when the PMU gave no cycles.
+struct CpuWindow {
+  int cpu = 0;
+  double busy = 0;
+  double wait = 0;
+  double ipc = 0;
+  double llc_per_ms = 0;
+  bool perf = false;
+};
+
+// Every online CPU's window; empty when cpustat is off or no sample is new enough.
+std::vector<CpuWindow> cpustat_window(std::int64_t from_ns);
+
 // Record a daemon's cpuset; empty when the daemon is gone. Writes a placement line only when the set changed.
 void note_cpuset(const std::string& daemon_id, const std::vector<int>& cpus);
 

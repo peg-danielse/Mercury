@@ -245,6 +245,24 @@ std::string route(const std::string& request) {
   if (auto response = scale_route(request)) {
     return *response;
   }
+  if (auto response = throttle_route(request)) {
+    return *response;
+  }
+  if (auto response = shift_route(request)) {
+    return *response;
+  }
+  if (auto response = pool_route(request)) {
+    return *response;
+  }
+  if (auto response = degrade_route(request)) {
+    return *response;
+  }
+  if (auto response = llm_state_route(request)) {
+    return *response;
+  }
+  if (auto response = llm_act_route(request)) {
+    return *response;
+  }
   if (auto response = map_route(request)) {
     return *response;
   }
@@ -331,6 +349,7 @@ int main(int argc, char** argv) {
       const char* cpu = std::getenv("MERCURY_CPUSTAT_CPU");
       init_cpustat(ring_archive_dir(), period != nullptr ? std::stoi(period) : 50, cpu != nullptr ? std::stoi(cpu) : -1);
     }
+    init_pool_from_env();
     serve(static_cast<std::uint16_t>(port_number), "mercury", route);
   } catch (const std::exception& error) {
     std::cerr << error.what() << std::endl;

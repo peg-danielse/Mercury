@@ -3,6 +3,8 @@
 #include "ring.hpp"
 
 #include <cstddef>
+#include <cstdint>
+#include <limits>
 #include <optional>
 #include <string>
 #include <vector>
@@ -107,6 +109,11 @@ struct ResourceRingView {
   std::vector<std::string> counters;
   std::vector<Sample> samples;
 };
+
+// Busy over busy + idle + iowait, summed over the named groups' samples newer than from_ns and not newer
+// than to_ns (CLOCK_MONOTONIC). Empty when no named group has such a sample.
+std::optional<double> groups_load(const std::vector<std::string>& names, std::int64_t from_ns,
+                                  std::int64_t to_ns = std::numeric_limits<std::int64_t>::max());
 
 // count is how many of the newest samples to copy. Zero copies every sample stored.
 std::vector<ResourceRingView> resource_rings(std::size_t count);

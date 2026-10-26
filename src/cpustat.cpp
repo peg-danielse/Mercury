@@ -42,6 +42,9 @@ struct CpuTarget {
 };
 
 bool enabled = false;
+// Every CPU's ring, for cpustat_window; set once by init_cpustat.
+std::vector<std::pair<int, std::shared_ptr<Ring>>> cpu_rings;
+int sample_period_ms = 50;
 // Disable/enable each CPU's perf group before reading it (see cpustat.hpp); MERCURY_CPUSTAT_KICK=0 turns it off.
 bool kick_perf = true;
 std::mutex placement_mu;
@@ -277,6 +280,7 @@ void init_cpustat(const std::string& dir, int period_ms, int cpu) {
     kick_perf = false;
   }
   placement_log.open(dir + "/placement.jsonl", std::ios::app);
+  sample_period_ms = period_ms;
   enabled = true;
   std::cout << "cpustat cpus=" << targets.size() << " perf=" << perf_cpus << " period_ms=" << period_ms
             << " sampler_cpu=" << cpu << " dir=" << dir
@@ -284,12 +288,58 @@ void init_cpustat(const std::string& dir, int period_ms, int cpu) {
   std::vector<std::shared_ptr<Ring>> rings;
   for (const auto& target : targets) {
     rings.push_back(target.ring);
+    cpu_rings.emplace_back(target.cpu, target.ring);
   }
   std::thread(flush_loop, std::move(rings)).detach();
   std::thread(sample_loop, std::move(targets), tick_ns, period_ms, cpu).detach();
 }
 
 bool cpustat_enabled() { return enabled; }
+
+std::vector<CpuWindow> cpustat_window(std::int64_t from_ns) {
+  std::vector<CpuWindow> out;
+  if (!enabled) {
+    return out;
+  }
+  constexpr int kCycles = 4;
+  constexpr int kInstructions = 5;
+  constexpr int kLlcMisses = 6;
+  const auto age_ms = std::max<std::int64_t>(0, (monotonic_ns() - from_ns) / 1000000);
+  const auto count = static_cast<std::size_t>(age_ms / sample_period_ms + 2);
+  for (const auto& [cpu, ring] : cpu_rings) {
+    // Each sample's values cover the gap before it, so the first sample in the window only opens the span.
+    double busy = 0, wait = 0, cycles = 0, instructions = 0, llc = 0;
+    std::int64_t first = 0, last = 0;
+    for (const auto& sample : ring->recent(count)) {
+      if (sample.timestamp_ns <= from_ns || sample.nvalues <= kLlcMisses) {
+        continue;
+      }
+      if (first == 0) {
+        first = sample.timestamp_ns;
+        continue;
+      }
+      busy += static_cast<double>(sample.value[kBusy]);
+      wait += static_cast<double>(sample.value[kRunDelay]);
+      cycles += static_cast<double>(sample.value[kCycles]);
+      instructions += static_cast<double>(sample.value[kInstructions]);
+      llc += static_cast<double>(sample.value[kLlcMisses]);
+      last = sample.timestamp_ns;
+    }
+    if (last <= first) {
+      continue;
+    }
+    const auto span = static_cast<double>(last - first);
+    CpuWindow window;
+    window.cpu = cpu;
+    window.busy = busy / span;
+    window.wait = wait / span;
+    window.perf = cycles > 0;
+    window.ipc = cycles > 0 ? instructions / cycles : 0;
+    window.llc_per_ms = llc / (span / 1e6);
+    out.push_back(window);
+  }
+  return out;
+}
 
 void note_cpuset(const std::string& daemon_id, const std::vector<int>& cpus) {
   if (!enabled) {

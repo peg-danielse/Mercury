@@ -2,6 +2,7 @@
 // gnn policy (SPEC.md "gnn policy"): the C++ forward pass of the trained per-thread demand model
 // and the per-daemon closed-loop controller (read, graph, infer, bin-pack, pin).
 
+#include "gru.hpp"
 #include "threadstat.hpp"
 
 #include <sys/types.h>
@@ -18,12 +19,22 @@ inline constexpr int kGnnFeatures = 17;  // must match train_gnn.py F_NAMES
 
 // weights.json from gnn-example/mercury/train_gnn.py: g1.W [K][F][H], g1.b [H], g2.W [K][H][H],
 // g2.b [H], readout.weight [1][H], readout.bias [1].
+// A file with GRU keys (inp.*, gru.*, out.*: train_seq.py --model gru, exported by tools/export_gru.py) loads as the
+// gru autoscaler instead: gru is set and the graph weights are empty.
 struct GnnWeights {
   int K = 0, F = 0, H = 0;
   std::vector<float> W1, b1, W2, b2, wr;
   float br = 0;
+  std::shared_ptr<const GruWeights> gru;
 };
 std::shared_ptr<const GnnWeights> load_gnn_weights(const std::string& path, std::string& error);
+
+// A JSON object of numeric (nested) arrays, flattened with their shapes: the weight-file format, also used by tests.
+struct JsonArray {
+  std::vector<int> shape;
+  std::vector<float> data;
+};
+bool load_json_arrays(const std::string& path, std::unordered_map<std::string, JsonArray>& out, std::string& error);
 
 struct GnnNode {
   long key = 0;  // tid, or -1 for the aggregate node
@@ -101,6 +112,8 @@ class GnnController {
   GnnConfig cfg_;
   ThreadStats reader_;
   GnnModel model_;
+  std::unique_ptr<GruModel> gru_;  // the gru autoscaler, when the weights are a GRU: sizes only, pins nothing
+  GruFeatures gru_features_;
   std::unordered_map<pid_t, int> last_busy_tick_;  // node membership with hold
   std::vector<std::vector<pid_t>> bins_;           // busy threads per bin, from the last observe
   std::unordered_map<pid_t, int> pinned_;          // tid -> CPU it is pinned to

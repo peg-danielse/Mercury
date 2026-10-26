@@ -21,7 +21,7 @@ function(mercury_test name)
   set_target_properties(${name} PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_SOURCE_DIR}/build/test")
 endfunction()
 
-mercury_executable(mercury src/mercury.cpp src/daemons.cpp src/counters.cpp src/ring.cpp src/ring_archive.cpp src/policy.cpp src/resources.cpp src/threadstat.cpp src/gnn.cpp src/cpustat.cpp)
+mercury_executable(mercury src/mercury.cpp src/daemons.cpp src/counters.cpp src/ring.cpp src/ring_archive.cpp src/policy.cpp src/resources.cpp src/threadstat.cpp src/gnn.cpp src/gru.cpp src/cpustat.cpp)
 mercury_executable(speculator src/speculator.cpp)
 target_link_libraries(mercury PRIVATE mercury_http Threads::Threads)
 mercury_executable(perfcount src/perfcount.cpp)
@@ -44,7 +44,12 @@ mercury_executable(threadtrace src/threadtrace.cpp src/threadstat.cpp src/counte
 target_link_libraries(threadtrace PRIVATE Threads::Threads)
 # The gnn controller runs every 10 ms inside mercury: optimise its sources even in the default (unoptimised) build.
 set_source_files_properties(src/gnn.cpp src/threadstat.cpp PROPERTIES COMPILE_OPTIONS "-O2")
-mercury_executable(gnnreplay src/gnnreplay.cpp src/gnn.cpp src/threadstat.cpp src/counters.cpp src/ring.cpp src/ring_archive.cpp)
+# The gru autoscaler's matrix-vector products: -O3 vectorizes them (no -ffast-math: results stay bit-for-bit).
+set_source_files_properties(src/gru.cpp PROPERTIES COMPILE_OPTIONS "-O3")
+mercury_executable(gnnreplay src/gnnreplay.cpp src/gnn.cpp src/gru.cpp src/threadstat.cpp src/counters.cpp src/ring.cpp src/ring_archive.cpp)
+mercury_test(gru_test src/test/gru.cpp src/gnn.cpp src/gru.cpp src/threadstat.cpp src/counters.cpp src/ring.cpp src/ring_archive.cpp)
+target_include_directories(gru_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_compile_definitions(gru_test PRIVATE MERCURY_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 mercury_test(gnnload src/test/workloads/gnnload.cpp)
 target_link_libraries(gnnload PRIVATE Threads::Threads)
 
@@ -54,6 +59,7 @@ target_link_libraries(gnnload PRIVATE Threads::Threads)
 # The shell tests re-execute themselves with sudo -n for cgroup writes.
 enable_testing()
 add_test(NAME policy_test COMMAND policy_test)
+add_test(NAME gru_test COMMAND gru_test)
 add_test(NAME resources_test COMMAND resources_test)
 add_test(NAME ring_test COMMAND ring_test)
 add_test(NAME cpustat_test COMMAND cpustat_test)
