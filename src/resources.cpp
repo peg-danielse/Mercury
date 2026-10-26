@@ -790,6 +790,33 @@ std::vector<int> allocatable_cpus() {
   return cpus;
 }
 
+std::optional<double> groups_load(const std::vector<std::string>& names, std::int64_t from_ns, std::int64_t to_ns) {
+  if (!ready) {
+    return std::nullopt;
+  }
+  // One sample per kSampleMs, plus slack for jitter; anything older is filtered below.
+  const auto age_ms = std::max<std::int64_t>(0, (monotonic_ns() - from_ns) / 1000000);
+  const auto count = static_cast<std::size_t>(age_ms / kSampleMs + 2);
+  std::uint64_t busy = 0;
+  std::uint64_t span = 0;
+  for (const auto& group : groups) {
+    if (!group.ring || std::find(names.begin(), names.end(), group.name) == names.end()) {
+      continue;
+    }
+    for (const auto& sample : group.ring->recent(std::min(count, group.ring->size()))) {
+      if (sample.timestamp_ns <= from_ns || sample.timestamp_ns > to_ns || sample.nvalues <= kBusy) {
+        continue;
+      }
+      busy += sample.value[kBusy];
+      span += sample.value[kBusy] + sample.value[kIdle] + sample.value[kIowait];
+    }
+  }
+  if (span == 0) {
+    return std::nullopt;
+  }
+  return static_cast<double>(busy) / static_cast<double>(span);
+}
+
 std::vector<ResourceRingView> resource_rings(std::size_t count) {
   std::vector<ResourceRingView> views;
   if (!ready) {

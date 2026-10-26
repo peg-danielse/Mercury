@@ -166,6 +166,39 @@ std::shared_ptr<const GnnWeights> load_gnn_weights(const std::string& path, std:
   const auto text = ss.str();
   std::unordered_map<std::string, Arr> m;
   if (!Parser(text).object(m)) { error = "bad json in " + path; return nullptr; }
+  if (m.count("gru.weight_ih_l0")) {
+    auto g = std::make_shared<GruWeights>();
+    const auto& inp = m["inp.weight"];
+    if (inp.shape.size() != 2 || inp.shape[1] != kGruDaemonFeatures) { error = "gru: inp.weight must be [d][25]"; return nullptr; }
+    g->d = inp.shape[0];
+    g->in = inp.shape[1];
+    g->inp_w = inp.data;
+    g->inp_b = m["inp.bias"].data;
+    const auto d = static_cast<std::size_t>(g->d);
+    for (int l = 0;; ++l) {
+      const auto sfx = "_l" + std::to_string(l);
+      if (!m.count("gru.weight_ih" + sfx)) break;
+      GruWeights::Layer L;
+      L.w_ih = m["gru.weight_ih" + sfx].data;
+      L.w_hh = m["gru.weight_hh" + sfx].data;
+      L.b_ih = m["gru.bias_ih" + sfx].data;
+      L.b_hh = m["gru.bias_hh" + sfx].data;
+      if (L.w_ih.size() != 3 * d * d || L.w_hh.size() != 3 * d * d || L.b_ih.size() != 3 * d || L.b_hh.size() != 3 * d) {
+        error = "gru: layer " + std::to_string(l) + " shapes do not match d=" + std::to_string(g->d);
+        return nullptr;
+      }
+      g->layers.push_back(std::move(L));
+    }
+    if (g->inp_b.size() != d || m["out.weight"].data.size() != d || m["out.bias"].data.size() != 1 || g->layers.empty()) {
+      error = "gru: unexpected inp.bias, out.weight or out.bias";
+      return nullptr;
+    }
+    g->out_w = m["out.weight"].data;
+    g->out_b = m["out.bias"].data[0];
+    auto w = std::make_shared<GnnWeights>();
+    w->gru = std::move(g);
+    return w;
+  }
   for (const char* k : {"g1.W", "g1.b", "g2.W", "g2.b", "readout.weight", "readout.bias"}) {
     if (!m.count(k)) { error = std::string("missing ") + k; return nullptr; }
   }
@@ -183,6 +216,17 @@ std::shared_ptr<const GnnWeights> load_gnn_weights(const std::string& path, std:
   w->W1 = g1.data; w->b1 = m["g1.b"].data; w->W2 = g2.data; w->b2 = m["g2.b"].data;
   w->wr = m["readout.weight"].data; w->br = m["readout.bias"].data[0];
   return w;
+}
+
+bool load_json_arrays(const std::string& path, std::unordered_map<std::string, JsonArray>& out, std::string& error) {
+  std::ifstream in(path);
+  if (!in) { error = "cannot read " + path; return false; }
+  std::stringstream ss;
+  ss << in.rdbuf();
+  std::unordered_map<std::string, Arr> m;
+  if (!Parser(ss.str()).object(m)) { error = "bad json in " + path; return false; }
+  for (auto& [k, a] : m) out[k] = JsonArray{std::move(a.shape), std::move(a.data)};
+  return true;
 }
 
 std::vector<std::vector<double>> numa_distance() {
@@ -316,7 +360,8 @@ std::vector<std::vector<int>> ffd_bins(const std::vector<double>& items) {
 
 GnnController::GnnController(std::string daemon_id, std::shared_ptr<const GnnWeights> weights, GnnConfig config)
     : daemon_id_(std::move(daemon_id)), cfg_(config), reader_("/sys/fs/cgroup/mercury/" + daemon_id_),
-      model_(std::move(weights), numa_distance()) {
+      model_(weights, numa_distance()) {
+  if (weights->gru) gru_ = std::make_unique<GruModel>(weights->gru);
   // Tuning overrides for experiments (process environment only; nothing persistent).
   auto env_int = [](const char* n, int d) { const char* v = std::getenv(n); return v && *v ? std::atoi(v) : d; };
   cfg_.hold_ticks = env_int("MERCURY_GNN_HOLD_TICKS", cfg_.hold_ticks);
@@ -399,6 +444,29 @@ int GnnController::observe(int current_cores, int min_cores, int max_cores, GnnT
     n.x[6] = psi;
     n.x[7] = static_cast<float>(cpus) / 16.f;
     if (n.numa >= 0 && n.numa < 8) n.x[9 + n.numa] = 1.f;
+  }
+  if (gru_) {
+    // gru autoscaler: the daemon's demand from daemon-level features of the same nodes; it sizes the cpuset
+    // directly (no bins, nothing pinned, no extra hysteresis: the model was trained to change rarely).
+    bins_.clear();
+    st.infer_ns = 0;
+    st.nodes = static_cast<int>(in.size());
+    st.threads = static_cast<int>(r.threads.size());
+    if (iv <= 0) { st.target = current_cores; return current_cores; }
+    std::vector<GruThread> threads;
+    threads.reserve(nodes.size());
+    for (std::size_t i = 0; i < nodes.size(); ++i) {
+      const auto& x = in[i].x;
+      threads.push_back({x[0], x[1], x[2], x[3], x[4], in[i].numa});
+    }
+    const auto features = gru_features_.tick(threads, static_cast<float>(other_run), static_cast<float>(other_wait), occ, psi, cpus);
+    const float demand = gru_->step(features);
+    st.pred_sum = demand;
+    st.demand_sum = demand;
+    st.required = std::clamp(gru_request(demand), min_cores, max_cores);
+    st.target = st.required;
+    st.infer_ns = mono() - t0;
+    return st.target;
   }
   const auto pred = iv > 0 ? model_.step(in) : std::vector<float>(in.size(), 0.f);
   // Items: every thread node's predicted demand, plus the aggregate's measured run+wait.
