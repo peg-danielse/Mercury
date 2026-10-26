@@ -5,8 +5,8 @@
 [submodule "deathstar-hotelReservations"]
 	path = deathstar-hotelReservations
 	url = git@github.com:peg-danielse/Benchmarks.git
-	branch = hotel/mercury-loadgen
+	branch = hotel/main
 [submodule "deathstar-socialNetwork"]
 	path = deathstar-socialNetwork
 	url = git@github.com:peg-danielse/Benchmarks.git
-	branch = social/mercury-operator
+	branch = social/main
