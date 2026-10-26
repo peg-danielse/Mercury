@@ -1,12 +1,12 @@
 [submodule "benchmarks"]
-	path = benchmarks
+	path = benchmarks/perturb
 	url = git@github.com:peg-danielse/Benchmarks.git
 	branch = perturb-dtn01
 [submodule "deathstar-hotelReservations"]
-	path = deathstar-hotelReservations
+	path = benchmarks/deathstar-hotelReservations
 	url = git@github.com:peg-danielse/Benchmarks.git
 	branch = hotel/main
 [submodule "deathstar-socialNetwork"]
-	path = deathstar-socialNetwork
+	path = benchmarks/deathstar-socialNetwork
 	url = git@github.com:peg-danielse/Benchmarks.git
 	branch = social/main
