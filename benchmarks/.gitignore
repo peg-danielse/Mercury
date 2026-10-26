@@ -14,7 +14,7 @@ perturb/labels/
 demo/lib/
 demo/opt/
 demo/state/
-# stress-ng build products. The sources stay; make writes these beside them.
+# stress-ng build products. The submodule ignores these too; make writes them beside the sources.
 stress-ng/stress-ng
 stress-ng/stress-ng.exe
 stress-ng/**/*.o

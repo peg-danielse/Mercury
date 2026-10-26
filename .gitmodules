@@ -34,3 +34,7 @@
 	path = benchmarks/train-ticket
 	url = git@github.com:peg-danielse/Benchmarks.git
 	branch = train-ticket
+[submodule "stress-ng"]
+	path = benchmarks/stress-ng
+	url = git@github.com:peg-danielse/Benchmarks.git
+	branch = stress-ng
