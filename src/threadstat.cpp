@@ -76,11 +76,15 @@ struct KeptFile {
     return static_cast<long>(got);
   }
   std::string text() const {
-    std::string out(65536, 0);
+    char stack[4096];
+    const auto n = read(stack, sizeof(stack));
+    if (n < 0) return {};
+    if (static_cast<std::size_t>(n) + 1 < sizeof(stack)) return std::string(stack, static_cast<std::size_t>(n));
+    std::string out(65536, '\0');
     for (;;) {
-      const auto n = read(out.data(), out.size());
-      if (n < 0) return {};
-      if (static_cast<std::size_t>(n) + 1 < out.size()) { out.resize(static_cast<std::size_t>(n)); return out; }
+      const auto m = read(out.data(), out.size());
+      if (m < 0) return {};
+      if (static_cast<std::size_t>(m) + 1 < out.size()) { out.resize(static_cast<std::size_t>(m)); return out; }
       out.resize(out.size() * 2);
     }
   }

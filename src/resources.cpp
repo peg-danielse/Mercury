@@ -446,8 +446,21 @@ std::optional<ResourceGroupState> least_among(ResourceLevel level, const std::ve
   return best;
 }
 
-std::unordered_map<int, Ticks> read_proc_stat() {
-  std::unordered_map<int, Ticks> ticks;
+// One slot per Linux CPU number. seen is 0 when /proc/stat had no line for that CPU.
+struct ProcStat {
+  std::vector<Ticks> ticks;
+  std::vector<char> seen;
+};
+
+const Ticks* proc_ticks(const ProcStat& stat, int cpu) {
+  if (cpu < 0 || static_cast<std::size_t>(cpu) >= stat.seen.size() || stat.seen[static_cast<std::size_t>(cpu)] == 0) {
+    return nullptr;
+  }
+  return &stat.ticks[static_cast<std::size_t>(cpu)];
+}
+
+ProcStat read_proc_stat() {
+  ProcStat stat;
   std::ifstream in("/proc/stat");
   std::string line;
   while (std::getline(in, line)) {
@@ -460,33 +473,46 @@ std::unordered_map<int, Ticks> read_proc_stat() {
     row >> label >> sample.user >> sample.nice >> sample.system >> sample.idle >> sample.iowait >> sample.irq >>
         sample.softirq;
     try {
-      ticks.emplace(std::stoi(label.substr(3)), sample);
+      const int cpu = std::stoi(label.substr(3));
+      if (cpu < 0) {
+        continue;
+      }
+      const auto index = static_cast<std::size_t>(cpu);
+      if (index >= stat.ticks.size()) {
+        stat.ticks.resize(index + 1);
+        stat.seen.resize(index + 1);
+      }
+      if (stat.seen[index] != 0) {
+        continue;  // first line wins, same as unordered_map::emplace
+      }
+      stat.ticks[index] = sample;
+      stat.seen[index] = 1;
     } catch (const std::exception&) {
     }
   }
-  return ticks;
+  return stat;
 }
 
-void sample_once(const std::vector<MetricTarget>& targets, const std::unordered_map<int, Ticks>& previous,
-                 const std::unordered_map<int, Ticks>& now, std::uint64_t tick_ns) {
+void sample_once(const std::vector<MetricTarget>& targets, const ProcStat& previous, const ProcStat& now,
+                 std::uint64_t tick_ns) {
   const auto stamp = monotonic_ns();
   for (const auto& target : targets) {
     Ticks sum;
     bool any = false;
     for (const int cpu : target.linux_cpus) {
-      const auto before = previous.find(cpu);
-      const auto after = now.find(cpu);
-      if (before == previous.end() || after == now.end()) {
+      const auto* before = proc_ticks(previous, cpu);
+      const auto* after = proc_ticks(now, cpu);
+      if (before == nullptr || after == nullptr) {
         continue;
       }
       any = true;
-      sum.user += tick_delta(after->second.user, before->second.user);
-      sum.nice += tick_delta(after->second.nice, before->second.nice);
-      sum.system += tick_delta(after->second.system, before->second.system);
-      sum.idle += tick_delta(after->second.idle, before->second.idle);
-      sum.iowait += tick_delta(after->second.iowait, before->second.iowait);
-      sum.irq += tick_delta(after->second.irq, before->second.irq);
-      sum.softirq += tick_delta(after->second.softirq, before->second.softirq);
+      sum.user += tick_delta(after->user, before->user);
+      sum.nice += tick_delta(after->nice, before->nice);
+      sum.system += tick_delta(after->system, before->system);
+      sum.idle += tick_delta(after->idle, before->idle);
+      sum.iowait += tick_delta(after->iowait, before->iowait);
+      sum.irq += tick_delta(after->irq, before->irq);
+      sum.softirq += tick_delta(after->softirq, before->softirq);
     }
     if (!any || !target.ring) {
       continue;

@@ -1159,6 +1159,56 @@ bool remove_core(const std::string& daemon_id, int min_cores, int& cores_after, 
   return false;
 }
 
+// A cgroup file kept open for the life of one sampler. Each read is a pread from offset 0.
+struct CgroupFile {
+  int fd = -1;
+  explicit CgroupFile(const std::string& path) : fd(::open(path.c_str(), O_RDONLY | O_CLOEXEC)) {}
+  CgroupFile(const CgroupFile&) = delete;
+  CgroupFile& operator=(const CgroupFile&) = delete;
+  ~CgroupFile() {
+    if (fd >= 0) {
+      ::close(fd);
+    }
+  }
+  std::string text() const {
+    if (fd < 0) {
+      return {};
+    }
+    char stack[4096];
+    std::size_t got = 0;
+    while (got + 1 < sizeof(stack)) {
+      const auto n = ::pread(fd, stack + got, sizeof(stack) - 1 - got, static_cast<off_t>(got));
+      if (n < 0) {
+        if (errno == EINTR) {
+          continue;
+        }
+        return {};
+      }
+      if (n == 0) {
+        return std::string(stack, got);
+      }
+      got += static_cast<std::size_t>(n);
+    }
+    std::string out(stack, got);
+    for (;;) {
+      const auto have = out.size();
+      out.resize(have + 4096);
+      const auto n = ::pread(fd, out.data() + have, 4096, static_cast<off_t>(have));
+      if (n < 0) {
+        if (errno == EINTR) {
+          out.resize(have);
+          continue;
+        }
+        return {};
+      }
+      out.resize(have + static_cast<std::size_t>(n));
+      if (static_cast<std::size_t>(n) < 4096) {
+        return out;
+      }
+    }
+  }
+};
+
 // cpu.stat is the kernel total for every task in the daemon cgroup.
 struct CgroupCpu {
   std::uint64_t usage_usec = 0;
@@ -1166,8 +1216,7 @@ struct CgroupCpu {
   std::uint64_t system_usec = 0;
 };
 
-std::optional<CgroupCpu> read_cgroup_cpu(const std::string& daemon_id) {
-  const auto text = read_file("/sys/fs/cgroup/mercury/" + daemon_id + "/cpu.stat");
+std::optional<CgroupCpu> parse_cgroup_cpu(const std::string& text) {
   if (text.empty()) {
     return std::nullopt;
   }
@@ -1193,8 +1242,7 @@ std::optional<CgroupCpu> read_cgroup_cpu(const std::string& daemon_id) {
 }
 
 // "some total" of the daemon cgroup cpu.pressure, in microseconds. Empty when PSI is unavailable.
-std::optional<std::uint64_t> read_cgroup_pressure(const std::string& daemon_id) {
-  const auto text = read_file("/sys/fs/cgroup/mercury/" + daemon_id + "/cpu.pressure");
+std::optional<std::uint64_t> parse_cgroup_pressure(const std::string& text) {
   const auto line = text.find("some ");
   if (line == std::string::npos) {
     return std::nullopt;
@@ -1258,8 +1306,18 @@ std::uint64_t usec_delta_ns(std::uint64_t after, std::uint64_t before) {
 std::string ring_archive_dir() { return rings_dir(); }
 
 void monitor_daemon(const std::string& daemon_id, pid_t root) {
+  const auto cgroup = "/sys/fs/cgroup/mercury/" + daemon_id;
+  CgroupFile cpu_stat_file(cgroup + "/cpu.stat");
+  CgroupFile cpu_pressure_file(cgroup + "/cpu.pressure");
+  CgroupFile cpuset_file(cgroup + "/cpuset.cpus");
+  const auto read_cpu = [&] { return parse_cgroup_cpu(cpu_stat_file.text()); };
+  const auto read_pressure = [&] { return parse_cgroup_pressure(cpu_pressure_file.text()); };
+  const auto read_cpus = [&] {
+    const auto have = parse_cpuset(trimmed(cpuset_file.text()));
+    return have ? *have : std::vector<int>{};
+  };
   // PSI decides the fourth counter for the life of this daemon: pressure, or runnable without PSI.
-  const bool use_psi = read_cgroup_pressure(daemon_id).has_value();
+  const bool use_psi = read_pressure().has_value();
   // cores is the cpuset size when the sample was taken, so the archive shows allocation beside use.
   const std::vector<std::string> daemon_names{"task-clock", "user", "system", use_psi ? "pressure" : "runnable", "cores"};
   std::shared_ptr<RingArchive> archive;
@@ -1282,8 +1340,8 @@ void monitor_daemon(const std::string& daemon_id, pid_t root) {
   }
   auto daemon_ring = std::make_shared<Ring>(kRingSlots, daemon_names, archive);
   std::cout << "counters daemon_id=" << daemon_id << " cgroup " << daemon_names.back() << std::endl;
-  auto previous_cpu = read_cgroup_cpu(daemon_id);
-  auto previous_pressure = use_psi ? read_cgroup_pressure(daemon_id) : std::nullopt;
+  auto previous_cpu = read_cpu();
+  auto previous_pressure = use_psi ? read_pressure() : std::nullopt;
   std::unique_ptr<GnnController> gnn;  // only while the gnn policy is attached; its destructor restores affinity
   long gnn_ticks = 0, gnn_logged = 0, gnn_warned = 0;
   std::int64_t gnn_read_ns = 0, gnn_infer_ns = 0, gnn_act_ns = 0, gnn_cpuset_ns = 0, gnn_last_log = 0;
@@ -1293,10 +1351,19 @@ void monitor_daemon(const std::string& daemon_id, pid_t root) {
       if (!daemon_running(daemon_id, root)) {
         break;
       }
-      const auto current_cpu = read_cgroup_cpu(daemon_id);
-      const auto current_pressure = use_psi ? read_cgroup_pressure(daemon_id) : std::nullopt;
+      const auto current_cpu = read_cpu();
+      const auto current_pressure = use_psi ? read_pressure() : std::nullopt;
       const bool pressure_ok =
           !use_psi || (previous_pressure && current_pressure && *current_pressure >= *previous_pressure);
+      // One cpuset read for this tick. Saturate reuses it; a gnn tick re-reads only after it may have
+      // rewritten the set, or after attaching the controller (that can take longer than this tick).
+      std::optional<std::vector<int>> tick_cpus;
+      const auto cpus_this_tick = [&] {
+        if (!tick_cpus) {
+          tick_cpus = read_cpus();
+        }
+        return *tick_cpus;
+      };
       if (previous_cpu && current_cpu && current_cpu->usage_usec >= previous_cpu->usage_usec && pressure_ok) {
         Sample total;
         total.timestamp_ns = monotonic_ns();
@@ -1305,7 +1372,7 @@ void monitor_daemon(const std::string& daemon_id, pid_t root) {
         total.value[1] = usec_delta_ns(current_cpu->user_usec, previous_cpu->user_usec);
         total.value[2] = usec_delta_ns(current_cpu->system_usec, previous_cpu->system_usec);
         total.value[3] = use_psi ? usec_delta_ns(*current_pressure, *previous_pressure) : count_runnable(root);
-        const auto cpus = cpuset_of(daemon_id);
+        const auto cpus = cpus_this_tick();
         total.value[kCgroupCores] = static_cast<std::uint64_t>(cpus.size());
         note_cpuset(daemon_id, cpus);
         daemon_ring->push(total);
@@ -1336,6 +1403,7 @@ void monitor_daemon(const std::string& daemon_id, pid_t root) {
         continue;
       }
       if (scale.gnn) {
+        bool attached = false;
         if (!gnn) {
           std::string error;
           const auto weights = gnn_weights(error);
@@ -1347,13 +1415,17 @@ void monitor_daemon(const std::string& daemon_id, pid_t root) {
           }
           gnn = std::make_unique<GnnController>(daemon_id, weights);
           gnn_ticks = 0;
+          attached = true;
           std::cout << "gnn daemon_id=" << daemon_id << " attached tick_ms=" << scale.gnn_tick_ms << std::endl;
         }
         if (++gnn_ticks % std::max(1, scale.gnn_tick_ms / kSampleMs) != 0) {
           continue;
         }
         const auto t0 = monotonic_ns();
-        int cores = cpuset_cores(daemon_id);
+        if (attached) {
+          tick_cpus.reset();
+        }
+        int cores = static_cast<int>(cpus_this_tick().size());
         GnnTickStats st;
         const int target = gnn->observe(cores, scale.min_cores, scale.max_cores, st);
         if (target < 0) {
@@ -1375,9 +1447,10 @@ void monitor_daemon(const std::string& daemon_id, pid_t root) {
           }
         }
         const auto t1 = monotonic_ns();
-        if (const auto cpus = parse_cpuset(trimmed(read_file("/sys/fs/cgroup/mercury/" + daemon_id + "/cpuset.cpus")))) {
+        const auto cpus = read_cpus();
+        if (!cpus.empty()) {
           if (scale.gnn_pin) {
-            gnn->pin(*cpus);
+            gnn->pin(cpus);
           } else {
             gnn->restore();  // no pins: widen anything pinned earlier (cheap when nothing is)
           }
@@ -1402,7 +1475,7 @@ void monitor_daemon(const std::string& daemon_id, pid_t root) {
         continue;
       }
       OccupancyWindow window;
-      window.cores = cpuset_cores(daemon_id);
+      window.cores = static_cast<int>(cpus_this_tick().size());
       window.min_cores = scale.min_cores;
       window.max_cores = scale.max_cores;
       window.runnable = !use_psi;
