@@ -10,3 +10,23 @@
 	path = benchmarks/deathstar-socialNetwork
 	url = git@github.com:peg-danielse/Benchmarks.git
 	branch = social/main
+[submodule "runtime-jaeger"]
+	path = benchmarks/runtime/jaeger
+	url = git@github.com:peg-danielse/Benchmarks.git
+	branch = runtime/jaeger
+[submodule "runtime-memcached"]
+	path = benchmarks/runtime/memcached
+	url = git@github.com:peg-danielse/Benchmarks.git
+	branch = runtime/memcached
+[submodule "runtime-redis"]
+	path = benchmarks/runtime/redis
+	url = git@github.com:peg-danielse/Benchmarks.git
+	branch = runtime/redis
+[submodule "runtime-rabbitmq"]
+	path = benchmarks/runtime/rabbitmq
+	url = git@github.com:peg-danielse/Benchmarks.git
+	branch = runtime/rabbitmq
+[submodule "runtime-mongodb"]
+	path = benchmarks/runtime/mongodb
+	url = git@github.com:peg-danielse/Benchmarks.git
+	branch = runtime/mongodb
