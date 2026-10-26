@@ -1,0 +1,25 @@
+started 2026-10-26T14:29:43+01:00 hotel hotels,reservation,recommendations,review,restaurants,museums,cinema 100req/s systems=[saturate] PHASES=12 OFF=20 ON=30 WARMUP=30 seed=1 kinds=same,smt,l3,membw victims=[frontend,search,geo,rate,profile,reservation,mongod] autoscaler=gnn-nopin@/home/pager/Documents/Mercury/models/gru_slo4_mft.json repeats=1 stop_at=none llm_pool_max=none pool_start=4 critical=hotels,reservation dsb_root=/home/pager/Documents/Mercury/benchmarks db=fresh run 660s mercury zero-ctl_baselines working tree 2026-10-22T23:43:39+02:00 (llm shedding gated at budget, slice latency)
+  saturate pool=fixed,start=4,seed_cpu=2,exempt=hotel-loadgen
+  saturate pool=fixed,start=4,seed_cpu=2,exempt=hotel-loadgen
+
+system    pool pool core-s | critical p95 off  p95 on  p99 on   err% | optional p95 off  p95 on   err%
+saturate    28       17762 |            100.7    83.9   151.0   0.00 |              2.0     2.0   0.00
+  critical = the CRITICAL routes; pool = the largest pool (CPUs) in the run; pool core-s = the pool's size
+  integrated over the measured windows (its cost); off/on = outside/inside antagonist phases
+
+system     n    p50    p95    p99 | p95 off  p95 on  p99 on |   req/s   err% |   alloc   used  util | changes
+saturate   1    1.3   27.3  109.1 |    27.3    23.1    92.3 |     694   0.00 |   66503   2327    3% | saturate 11, gru 2906
+
+p95 (ms) during each antagonist phase, paired across systems (median over repeats; critical routes only when CRITICAL is set):
+  phase                   saturate
+   0 smt2 frontend            23.1
+   5 same1 reservation        58.7
+   6 l31 mongod               75.5
+   7 smt1 frontend            83.9
+  11 same1 profile           151.0
+  against saturate, phase by phase (at or below its p95 / compared; geometric mean of the p95 ratio):
+
+medians over n repeats; latency in ms (histogram bucket upper bounds); on/off = windows inside/outside antagonist ON phases;
+alloc/used = core-seconds of the application's daemons (load generator excluded); changes = cpuset or cpu.max
+changes from mercury.log by mechanism (saturate = one CPU added or removed by the autoscaler; gru = a resize
+pool = one L3 domain added to the l3 pool).

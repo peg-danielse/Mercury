@@ -67,9 +67,12 @@ def extract(run: str, bin_s: float) -> dict:
                for d, t in re.findall(r"^degrade daemon_id=\S+ (?:disabled|enabled) \S+ load=\S+ disabled=\[([^\]]*)\] t_ns=(\d+)",
                                       log, re.M)]
     alloc = used = 0.0
+    window = None
     path = os.path.join(run, "alloc_vs_use.txt")
     if os.path.exists(path):
         for line in open(path):
+            if line.startswith("window "):  # "window 674.6 s, 16 daemons": the span alloc and used cover
+                window = float(line.split()[1])
             p = line.split()
             if len(p) > 3 and re.match(r"^(hotel|social)-", p[0]) and not p[0].endswith("loadgen"):
                 try:
@@ -86,7 +89,8 @@ def extract(run: str, bin_s: float) -> dict:
     ser = {route: [{"t_s": b * bin_s, **v} for b, v in sorted(bins.items())] for route, bins in series.items()}
     return {"path": run, "duration_s": sec(max(w["t1_ns"] for w in windows)), "routes": routes, "phases": phases,
             "series": ser, "pool": pool, "swaps": swaps, "degrade": degrade,
-            "cpu": {"alloc_core_s": alloc, "used_core_s": used}, "llm_episodes": episodes,
+            "cpu": {"alloc_core_s": alloc, "used_core_s": used, "window_s": window or sec(max(w["t1_ns"] for w in windows))},
+            "llm_episodes": episodes,
             "llm_api_errors": api_errors}
 
 

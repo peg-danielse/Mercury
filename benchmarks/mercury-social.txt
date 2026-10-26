@@ -1,0 +1,21 @@
+# Social deployment for goperate and operate (-file): exec_path hostname, one program per line, in start order.
+# Paths are relative to this repository's benchmarks directory. The run/ scripts cd into the
+# social tree so the C++ services find config/service-config.json.
+runtime/memcached/11311 Apollo
+runtime/memcached/11312 Apollo
+runtime/memcached/11313 Apollo
+runtime/mongodb/mongod Apollo
+runtime/redis/redis-server Apollo
+runtime/rabbitmq/rabbitmq-server Apollo
+deathstar-socialNetwork/run/UniqueIdService Apollo
+deathstar-socialNetwork/run/MediaService Apollo
+deathstar-socialNetwork/run/TextService Apollo
+deathstar-socialNetwork/run/UrlShortenService Apollo
+deathstar-socialNetwork/run/UserService Apollo
+deathstar-socialNetwork/run/UserMentionService Apollo
+deathstar-socialNetwork/run/SocialGraphService Apollo
+deathstar-socialNetwork/run/PostStorageService Apollo
+deathstar-socialNetwork/run/UserTimelineService Apollo
+deathstar-socialNetwork/run/WriteHomeTimelineService Apollo
+deathstar-socialNetwork/run/HomeTimelineService Apollo
+deathstar-socialNetwork/run/ComposePostService Apollo

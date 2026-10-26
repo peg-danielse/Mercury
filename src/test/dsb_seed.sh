@@ -9,12 +9,14 @@
 # fan-out, SAVE redis) with every service up. hotel: operate start then stop (the services insert their data on start).
 # Both apps share MongoDB's data directory (runtime/mongodb/27017/db); the directory in place is moved aside to
 # db.aside-<time> (kept), so the snapshot holds only this app's seed. The seeded state is left in place.
-# Env: DSB_ROOT [/home/paul/Benchmarks]  POOL [1-60]  PORT [8080]
+# Env: DSB_ROOT [this repository's benchmarks/]  POOL [hosts/$(hostname -s).env, else 1-60]  PORT [8080]
 set -u
 APP=$1; SNAP=$(realpath -m "$2"); shift 2
 POSTS=10; [ "${1:-}" = --posts ] && POSTS=$2
-B=${DSB_ROOT:-/home/paul/Benchmarks}; M=$(cd "$(dirname "$(readlink -f "$0")")/../.." && pwd)
-POOL=${POOL:-$(seq 1 60)}; PORT=${PORT:-8080}
+M=$(cd "$(dirname "$(readlink -f "$0")")/../.." && pwd)
+. "$M/src/test/host_layout.sh"
+B=${DSB_ROOT:-$M/benchmarks}
+PORT=${PORT:-8080}
 MDB=$B/runtime/mongodb/27017/db; RDIR=$B/runtime/redis/6379
 case $APP in
   social) WD=$B/deathstar-socialNetwork; OP=$WD/goperate/bin/goperate; FILL="-seed-posts $POSTS seed";;

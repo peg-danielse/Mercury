@@ -84,6 +84,11 @@ endfunction()
 runtime_wrapper(runtime_mongod ${RUNTIME}/mongodb/mongod.c ${RUNTIME}/mongodb mongod)
 runtime_wrapper(runtime_redis ${RUNTIME}/redis/redis-server.c ${RUNTIME}/redis redis-server)
 runtime_wrapper(runtime_memcached ${RUNTIME}/memcached/memcached-server.c ${RUNTIME}/memcached memcached-server)
+foreach(port 11211 11212 11213 11214 11311 11312 11313)
+  if(NOT EXISTS ${RUNTIME}/memcached/${port})
+    file(CREATE_LINK memcached-server ${RUNTIME}/memcached/${port} SYMBOLIC)
+  endif()
+endforeach()
 runtime_wrapper(runtime_rabbitmq ${RUNTIME}/rabbitmq/rabbitmq-server.c ${RUNTIME}/rabbitmq rabbitmq-server)
 
 # --- Social network C++ services -------------------------------------------

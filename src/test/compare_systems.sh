@@ -14,7 +14,8 @@
 #      DEGRADE_ROUTES [recommendations,restaurants,museums,cinema,review]: the optional routes degrade sheds, in order
 #      DB [fresh]: fresh deletes MongoDB's data before every run (dsb_ab.sh FRESH_DB=1; needs a DSB_ROOT of these
 #        experiments, not ~/Benchmarks); seed restores ~/.seed_<system> (dsb_ab.sh SEED)
-#      DSB_ROOT [~/Benchmarks-zeroctl when it exists]: the Benchmarks tree; degrade needs its frontend, which sheds the
+#      DSB_ROOT [this repository's benchmarks/]: the benchmarks tree; the Linux CPU layout is
+#        benchmarks/perturb/perturb/hosts/$(hostname -s).env, same as dsb_ab.sh. degrade needs its frontend, which sheds the
 #        routes Mercury disables in MERCURY_POLICY  ROUTE [hotels]  RATE [1600]  PHASES [12]  OFF [20]  ON [30]
 #      WARMUP [30]  SEED_N [1]  GEN_CORES [12]  LLM_ARGS ["--every 0.5"]
 #      AUTOSCALER [saturate]: saturate, or gru (the services run policy gnn without pinning on GRU_MODEL
@@ -44,13 +45,14 @@
 set -u
 OUT=$(realpath -m "$1"); SYS=${2:-hotel}
 M=$(cd "$(dirname "$(readlink -f "$0")")/../.." && pwd)
+. "$M/src/test/host_layout.sh"
 SYSTEMS=${SYSTEMS:-saturate l3 shift l3shift degrade llm}
-[ -z "${DSB_ROOT:-}" ] && [ -d "$HOME/Benchmarks-zeroctl" ] && DSB_ROOT=$HOME/Benchmarks-zeroctl
+DSB_ROOT=${DSB_ROOT:-$M/benchmarks}
 export DSB_ROOT
 # hotel starts every run from an empty database; social restores its seed (the social graph and 10 posts per user,
 # which the routes need: an empty social network has no one to follow or read).
 DB=${DB:-$([ "$SYS" = social ] && echo seed || echo fresh)}
-if [ "$DB" = fresh ] && [ "$(realpath -m "${DSB_ROOT:-/home/paul/Benchmarks}")" = "$(realpath -m "$HOME/Benchmarks")" ]; then
+if [ "$DB" = fresh ] && [ "$(realpath -m "$DSB_ROOT")" = "$(realpath -m "$HOME/Benchmarks")" ]; then
   echo "DB=fresh would delete the database of $HOME/Benchmarks: set DSB_ROOT to a tree of these experiments"; exit 2
 fi
 RATE=${RATE:-1600}
@@ -62,13 +64,13 @@ case $AUTOSCALER in
   *) echo "unknown AUTOSCALER $AUTOSCALER"; exit 2;;
 esac
 case $SYS in
-  hotel)  ENTRY="-entry frontend"; SEEDDIR=$(cat ~/.seed_hotel);  PFX=hotel-;  VICTIMS=${VICTIMS-frontend,search,geo,rate,profile,reservation,mongod}
+  hotel)  ENTRY="-entry frontend"; PFX=hotel-;  VICTIMS=${VICTIMS-frontend,search,geo,rate,profile,reservation,mongod}
           CRITICAL=${CRITICAL:-hotels,reservation}
           DEGRADE_ROUTES=${DEGRADE_ROUTES:-recommendations,restaurants,museums,cinema,review}; DEGRADE_DAEMONS=frontend;;
   # social: no frontend (the load generator calls the services over Thrift); the optional routes are shed by the
   # services that serve them, and only by their route's methods (ReadUserTimeline; Follow/Unfollow), so compose-post's
   # own calls into those services go on.
-  social) ENTRY="";                SEEDDIR=${SOCIAL_SEED:-$(cat ~/.seed_social)}; PFX=social-
+  social) ENTRY="";                PFX=social-
           VICTIMS=${VICTIMS-ComposePostService,HomeTimelineService,UserTimelineService,PostStorageService,SocialGraphService,mongod,redis-server}
           CRITICAL=${CRITICAL:-compose-post,read-home-timeline}
           DEGRADE_ROUTES=${DEGRADE_ROUTES:-follow,read-user-timeline}; DEGRADE_DAEMONS=SocialGraphService,UserTimelineService;;
@@ -76,7 +78,11 @@ case $SYS in
 esac
 [ "$SYS" = social ] && ROUTE=${ROUTE:-compose-post,read-home-timeline,read-user-timeline,follow}
 ROUTE=${ROUTE:-hotels}
-DBENV="FRESH_DB=1"; [ "$DB" = seed ] && DBENV="SEED=$SEEDDIR"
+DBENV="FRESH_DB=1"
+if [ "$DB" = seed ]; then
+  if [ "$SYS" = hotel ]; then SEEDDIR=${SEEDDIR:-$(cat ~/.seed_hotel)}; else SEEDDIR=${SOCIAL_SEED:-$(cat ~/.seed_social)}; fi
+  DBENV="SEED=$SEEDDIR"
+fi
 POOL_START=${POOL_START:-8}
 POOL_COMMON="start=$POOL_START,seed_cpu=2,exempt=${PFX}loadgen"
 pool_for() {  # the MERCURY_POOL of one system
@@ -101,7 +107,7 @@ if [[ " $SYSTEMS " =~ \ llm(deg)?[0-9]*[-\ ] ]]; then
 fi
 mkdir -p "$OUT"
 DUR=$((WARMUP + PHASES * (OFF + ON) + 30))
-echo "started $(date -Is) $SYS $ROUTE ${RATE}req/s systems=[$SYSTEMS] PHASES=$PHASES OFF=$OFF ON=$ON WARMUP=$WARMUP seed=$SEED_N kinds=${KINDS:-same,smt,l3,membw} victims=[$VICTIMS] autoscaler=$SCALER repeats=${REPEATS:-1} stop_at=${STOP_AT:-none} llm_pool_max=${LLM_POOL_MAX:-none} pool_start=${NOPOOL:+none}${NOPOOL:-$POOL_START} critical=${CRITICAL:-} dsb_root=${DSB_ROOT:-/home/paul/Benchmarks} db=$DB run ${DUR}s mercury $(cat $M/SOURCE 2>/dev/null || git -C $M log --oneline -1)" >> "$OUT/meta.txt"
+echo "started $(date -Is) $SYS $ROUTE ${RATE}req/s systems=[$SYSTEMS] PHASES=$PHASES OFF=$OFF ON=$ON WARMUP=$WARMUP seed=$SEED_N kinds=${KINDS:-same,smt,l3,membw} victims=[$VICTIMS] autoscaler=$SCALER repeats=${REPEATS:-1} stop_at=${STOP_AT:-none} llm_pool_max=${LLM_POOL_MAX:-none} pool_start=${NOPOOL:+none}${NOPOOL:-$POOL_START} critical=${CRITICAL:-} dsb_root=$DSB_ROOT db=$DB run ${DUR}s mercury $(cat $M/SOURCE 2>/dev/null || git -C $M log --oneline -1)" >> "$OUT/meta.txt"
 REPEATS=${REPEATS:-1}
 for r in $(seq 1 $REPEATS); do for sysname in $SYSTEMS; do
   D=$OUT/$sysname/r$r

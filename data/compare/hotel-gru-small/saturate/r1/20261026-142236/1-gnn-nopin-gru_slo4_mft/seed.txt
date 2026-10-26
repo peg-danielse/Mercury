@@ -1,0 +1,1 @@
+fresh: empty database /home/pager/Documents/Mercury/benchmarks/runtime/mongodb/27017/db 2026-10-26T14:22:36+01:00

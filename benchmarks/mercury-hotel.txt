@@ -1,17 +1,17 @@
 # Hotel deployment for operate (-file): exec_path hostname, one program per line, in start order.
-# Recreated 2026-10-19 from the demo runs' generated copies and the 11:58 dtn-01 run log.
-/home/pager/Documents/Benchmarks/runtime/memcached/11211 Apollo
-/home/pager/Documents/Benchmarks/runtime/memcached/11212 Apollo
-/home/pager/Documents/Benchmarks/runtime/memcached/11213 Apollo
-/home/pager/Documents/Benchmarks/runtime/memcached/11214 Apollo
-/home/pager/Documents/Benchmarks/runtime/mongodb/mongod Apollo
-/home/pager/Documents/Benchmarks/deathstar-hotelReservations/bin/geo Apollo
-/home/pager/Documents/Benchmarks/deathstar-hotelReservations/bin/profile Apollo
-/home/pager/Documents/Benchmarks/deathstar-hotelReservations/bin/rate Apollo
-/home/pager/Documents/Benchmarks/deathstar-hotelReservations/bin/recommendation Apollo
-/home/pager/Documents/Benchmarks/deathstar-hotelReservations/bin/user Apollo
-/home/pager/Documents/Benchmarks/deathstar-hotelReservations/bin/reservation Apollo
-/home/pager/Documents/Benchmarks/deathstar-hotelReservations/bin/search Apollo
-/home/pager/Documents/Benchmarks/deathstar-hotelReservations/bin/review Apollo
-/home/pager/Documents/Benchmarks/deathstar-hotelReservations/bin/attractions Apollo
-/home/pager/Documents/Benchmarks/deathstar-hotelReservations/bin/frontend Apollo
+# Paths are relative to this repository's benchmarks directory.
+runtime/memcached/11211 Apollo
+runtime/memcached/11212 Apollo
+runtime/memcached/11213 Apollo
+runtime/memcached/11214 Apollo
+runtime/mongodb/mongod Apollo
+deathstar-hotelReservations/bin/geo Apollo
+deathstar-hotelReservations/bin/profile Apollo
+deathstar-hotelReservations/bin/rate Apollo
+deathstar-hotelReservations/bin/recommendation Apollo
+deathstar-hotelReservations/bin/user Apollo
+deathstar-hotelReservations/bin/reservation Apollo
+deathstar-hotelReservations/bin/search Apollo
+deathstar-hotelReservations/bin/review Apollo
+deathstar-hotelReservations/bin/attractions Apollo
+deathstar-hotelReservations/bin/frontend Apollo

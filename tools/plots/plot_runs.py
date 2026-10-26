@@ -141,6 +141,10 @@ class Metrics:
         kind, _, spec = metric.partition(":")
         if kind == "pool":
             return pool_core_s(run["pool"], run["duration_s"]) / 1000
+        if kind == "cores":  # mean cores allocated to the application's daemons over the measured window
+            return run["cpu"]["alloc_core_s"] / run["cpu"]["window_s"]
+        if kind == "tput":  # requests sent per second, all routes (errors included)
+            return sum(r["sent"] for r in run["routes"].values()) / run["duration_s"]
         part = self.part(run["routes"], spec)
         if kind == "err":
             return 100 * part["errors"] / max(part["sent"], 1)
@@ -150,6 +154,10 @@ class Metrics:
         kind, _, spec = metric.partition(":")
         if kind == "pool":
             return "pool (1000 core-s)"
+        if kind == "cores":
+            return "cpuset cores (sum)"
+        if kind == "tput":
+            return "throughput (req/s)"
         what = spec.replace("+", " + ")
         return f"{what} errors (%)" if kind == "err" else f"{what} {kind} (ms)"
 
@@ -166,7 +174,8 @@ class Metrics:
     def row(self, run: dict, metrics: list[str]) -> dict:
         lat, c, o = self.part(run["routes"], self.latency), self.crit(run["routes"]), self.opt(run["routes"])
         pool = run["pool"]
-        return {"p95": self.p(lat), "p99": self.p(lat, 0.99), "crit_err": 100 * c["errors"] / max(c["sent"], 1),
+        return {"p50": self.p(lat, 0.5), "p95": self.p(lat), "p99": self.p(lat, 0.99),
+                "crit_err": 100 * c["errors"] / max(c["sent"], 1),
                 "opt_err": 100 * o["errors"] / max(o["sent"], 1), "pool_cs": pool_core_s(pool, run["duration_s"]),
                 "pool_max": max(n for _, n in pool) if pool else float("nan"),
                 **{k: self.value(run, k) for k in metrics}}
@@ -366,7 +375,7 @@ def main() -> int:
     ap.add_argument("-d", "--dir", default="figs")
     ap.add_argument("--width", type=float, default=3.4, help="column width in inches")
     ap.add_argument("--critical", default="hotels,reservation")
-    ap.add_argument("--summary", default="p95:hotels,err:reservation,err:optional,pool")
+    ap.add_argument("--summary", default="p50:hotels,p95:hotels,tput,cores,err:reservation,err:optional,pool")
     ap.add_argument("--latency", default="hotels", help="routes of the cost, phases and timeline latency")
     ap.add_argument("--errors-as-ms", type=float, default=None)
     ap.add_argument("--smooth", type=int, default=3, help="timeline: bins merged per point")
@@ -396,11 +405,14 @@ def main() -> int:
     fig_phases(systems, runs, m, path("phases"), a.width)
     shown = [s for s in systems if not a.timeline_systems or s in a.timeline_systems.split(",")]
     fig_timeline(shown, runs, rows, m, path("timeline"), a.width, a.smooth)
-    print(f"{'system':10} {'n':>3} {"p95":>7} {"p99":>7} {'crit err%':>9} {'opt err%':>8} {'pool max':>8} {'pool kcs':>8}")
+    print(f"{'system':10} {'n':>3} {'p50':>7} {'p95':>7} {'p99':>7} {'crit err%':>9} {'opt err%':>8} {'pool max':>8} "
+          f"{'pool kcs':>8} {'req/s':>7} {'cores':>6}")
     for s in systems:
         med = lambda k: statistics.median(r[k] for r in rows[s])
-        print(f"{look(s)[3]:10} {len(rows[s]):3} {med('p95'):7.1f} {med('p99'):7.1f} {med('crit_err'):9.2f} "
-              f"{med('opt_err'):8.2f} {med('pool_max'):8.0f} {med('pool_cs') / 1000:8.2f}")
+        print(f"{look(s)[3]:10} {len(rows[s]):3} {med('p50'):7.1f} {med('p95'):7.1f} {med('p99'):7.1f} "
+              f"{med('crit_err'):9.2f} {med('opt_err'):8.2f} {med('pool_max'):8.0f} {med('pool_cs') / 1000:8.2f} "
+              f"{statistics.median(m.value(r, 'tput') for r in runs if r['system'] == s):7.1f} "
+              f"{statistics.median(m.value(r, 'cores') for r in runs if r['system'] == s):6.2f}")
     print(f"wrote {', '.join(path(n) for n in ['summary', 'cost', 'phases', 'timeline'])}")
     return 0
 

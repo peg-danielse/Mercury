@@ -1,0 +1,33 @@
+flag provided but not defined: -policy
+usage: operate [flags] start|stop|test|scale|autoscale
+
+  -advertise-port int
+    	Port this service listens on and advertises
+  -client string
+    	autoscale load generator: mercury (bin/loadgen as a Mercury daemon) or inproc (this process pinned to CPUs 60-63) (default "mercury")
+  -cold-cache
+    	leave odd hotel ids uncached so requests still read MongoDB (HOTEL_COLD_CACHE) (default true)
+  -config string
+    	hotel address file (default "/home/pager/Documents/Mercury/benchmarks/deathstar-hotelReservations/config.json")
+  -conns int
+    	gRPC connections each route shares among its workers; 0 = one per worker (old behaviour) (default 16)
+  -cpu int
+    	daemon CPU number Mercury was given (not the CPU Mercury pinned itself to)
+  -file string
+    	deployment list (default "/home/pager/Documents/Mercury/benchmarks/mercury-hotel.txt")
+  -gen-bin string
+    	loadgen binary for -client mercury (default "/home/pager/Documents/Mercury/benchmarks/deathstar-hotelReservations/bin/loadgen")
+  -gen-cpu int
+    	loadgen home Linux CPU (default 60)
+  -gen-max int
+    	loadgen saturate max cores (default 8)
+  -gen-min int
+    	loadgen saturate min cores (default 2)
+  -gen-out string
+    	loadgen output file (default output/loadgen-<unix>.out)
+  -gen-procs int
+    	loadgen GOMAXPROCS (keep >= gen-max so busy threads can exceed cores) (default 8)
+  -mercury string
+    	Mercury host:port (default "127.0.0.1:8080")
+  -users int
+    	maximum concurrent users on each autoscale route (default 1024)

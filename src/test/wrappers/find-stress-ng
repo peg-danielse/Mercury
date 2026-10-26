@@ -1,20 +1,12 @@
 # Sets found to an executable stress-ng, or leaves it empty.
-# sudo replaces HOME with /root, so the invoking user's home is searched too.
+# The binary is this repository's benchmarks/stress-ng/stress-ng. DSB_ROOT overrides that tree.
 found=${found:-}
-look_home() {
-  home=$1
-  [ -n "${home}" ] || return 1
-  for dir in "${home}/benchmarks/stress-ng" "${home}/Benchmarks/stress-ng"; do
-    if [ -x "${dir}/stress-ng" ]; then
-      found=${dir}/stress-ng
-      return 0
-    fi
-  done
-  return 1
-}
 if [ -z "${found}" ]; then
-  look_home "${HOME:-}" || true
-fi
-if [ -z "${found}" ] && [ -n "${SUDO_USER:-}" ]; then
-  look_home "$(getent passwd "${SUDO_USER}" 2>/dev/null | cut -d: -f6)" || true
+  here=$(CDPATH= cd "$(dirname "$0")" && pwd)
+  repo=$(CDPATH= cd "$here/../../.." && pwd)
+  if [ -n "${DSB_ROOT:-}" ] && [ -x "$DSB_ROOT/stress-ng/stress-ng" ]; then
+    found=$DSB_ROOT/stress-ng/stress-ng
+  elif [ -x "$repo/benchmarks/stress-ng/stress-ng" ]; then
+    found=$repo/benchmarks/stress-ng/stress-ng
+  fi
 fi

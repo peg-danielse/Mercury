@@ -21,6 +21,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
@@ -29,11 +30,27 @@ import (
 )
 
 const (
-	root   = "/home/paul/Benchmarks/gomaxprocs"
-	binary = root + "/bin/server"
 	listen = "127.0.0.1:19091"
 	daemon = "gomaxprocs32"
 )
+
+func serverBinary() string {
+	if exe, err := os.Executable(); err == nil {
+		if exe, err = filepath.EvalSymlinks(exe); err == nil {
+			dir := filepath.Dir(exe)
+			if filepath.Base(dir) == "bin" {
+				return filepath.Join(filepath.Dir(dir), "bin", "server")
+			}
+		}
+	}
+	if _, file, _, ok := runtime.Caller(0); ok {
+		// operate/main.go lives one directory under gomaxprocs.
+		return filepath.Join(filepath.Dir(filepath.Dir(file)), "bin", "server")
+	}
+	fmt.Fprintln(os.Stderr, "cannot find gomaxprocs/bin/server")
+	os.Exit(1)
+	return ""
+}
 
 func main() {
 	mercury := flag.String("mercury", "127.0.0.1:8080", "Mercury host:port")
@@ -254,7 +271,7 @@ func start(base string, cpu int) (int, error) {
 	}
 	status, body, err := post(base, "/start", map[string]any{
 		"daemon_id": daemon,
-		"exec_path": binary,
+		"exec_path": serverBinary(),
 		"cpu":       cpu,
 	})
 	if err != nil {

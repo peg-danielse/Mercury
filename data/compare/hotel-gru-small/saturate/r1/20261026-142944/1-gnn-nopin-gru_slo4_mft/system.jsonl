@@ -1,0 +1,2 @@
+{"event": "start", "system": "saturate", "interfere": "python3 /home/pager/Documents/Mercury/src/test/interfere.py --phases 12 --off 20 --on 30 --warmup 30 --seed 1 --actions none --victims-cycle frontend,search,geo,rate,profile,reservation,mongod", "llm_args": null, "llm_shed": null, "degrade_routes": null, "t_ns": 88472360869521}
+{"event": "stopped", "t_ns": 89143095575901}

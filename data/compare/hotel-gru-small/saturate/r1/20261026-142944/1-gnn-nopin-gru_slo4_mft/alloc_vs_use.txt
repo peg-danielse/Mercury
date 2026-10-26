@@ -1,0 +1,20 @@
+window 672.7 s, 16 daemons, 10 ms samples
+daemon                       alloc core-s used core-s   util  mean/max cores  pressure>=.1   short
+hotel-11211                         672.7         3.3     0%     1.00/1               4.0%    0.0%
+hotel-11212                         671.8         2.1     0%     1.00/1               7.8%    0.0%
+hotel-11213                        1076.0         6.1     1%     1.60/2               0.2%    0.0%
+hotel-11214                         669.7         3.0     0%     1.00/1               1.1%    0.0%
+hotel-attractions                  6606.5        69.4     1%     9.90/10              0.6%    0.0%
+hotel-frontend                     5985.0       163.6     3%     8.97/11              1.1%    0.0%
+hotel-geo                          3875.4        16.7     0%     5.80/7               0.6%    0.0%
+hotel-loadgen                      8001.5        80.3     1%    12.00/12              0.2%    0.0%
+hotel-mongod                       6536.7      1791.2    27%     9.76/12              3.2%    0.7%
+hotel-profile                      7149.8        45.7     1%    10.70/11              0.3%    0.0%
+hotel-rate                         6466.5        28.1     0%     9.68/10              0.2%    0.0%
+hotel-recommendation               2728.8        14.3     1%     4.09/6               0.4%    0.0%
+hotel-reservation                  6615.2        80.6     1%     9.91/10              1.1%    0.0%
+hotel-review                       4017.4        14.8     0%     6.02/8               0.3%    0.0%
+hotel-search                       6807.2        35.3     1%    10.20/11              0.2%    0.0%
+hotel-user                         6624.0        52.6     1%     9.92/11              0.4%    0.0%
+util = used/allocated core-seconds; pressure = time with a thread waiting for a CPU; short = pressure while every allocated core was >= 85% busy (demand above allocation)
+wrote /home/pager/Documents/Mercury/data/compare/hotel-gru-small/saturate/r1/20261026-142944/1-gnn-nopin-gru_slo4_mft/alloc_vs_use.png

@@ -59,7 +59,7 @@ Models (--llm):
   openrouter        OpenRouter's chat completions (OpenAI format), any model with tool calling (e.g. google/gemini-3.8-flash,
                     openai/gpt-6-luna, qwen/qwen3.8-flash): OPENROUTER_API_KEY; --model or OPENROUTER_MODEL; each
                     call's cost is logged; --thinking low/high is passed as a reasoning effort.
-  distilled         a small local transformer distilled from an llm's decisions (tools/distill/train.py): --model
+  distilled         a small local transformer distilled from an llm's decisions (tools/learn/distill/train.py): --model
                     MODEL.pt; needs torch; decides in milliseconds, no network.
   mock              no network: the prompt's rules as code (for tests).
 """
@@ -611,8 +611,8 @@ DISTILLED: dict[str, Any] = {}
 
 
 def distilled_episode(args: argparse.Namespace, mercury: Mercury, log: Log, trigger: str, opening: dict[str, Any]) -> str:
-    """One decision by a small local transformer distilled from the llm's decisions (tools/distill/train.py; --model
-    is its model.pt; needs torch). The live state is turned into the training features (tools/distill/train.py
+    """One decision by a small local transformer distilled from the llm's decisions (tools/learn/distill/train.py; --model
+    is its model.pt; needs torch). The live state is turned into the training features (tools/learn/distill/train.py
     encode), the action and its targets are decoded with every invalid choice masked (a shrink names a pool domain, a
     swap a pool domain and a free one, a move a service and a domain it is on), and the call runs through execute()
     like a model's. "none" is a hold."""

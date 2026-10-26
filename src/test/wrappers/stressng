@@ -19,12 +19,13 @@ running). Ground truth per worker is L/100 of a core.
 import json, os, re, subprocess, sys, time
 
 def find():
-    for home in (os.environ.get("HOME", ""), os.path.expanduser("~" + os.environ.get("SUDO_USER", "")) if os.environ.get("SUDO_USER") else ""):
-        for d in ("benchmarks/stress-ng", "Benchmarks/stress-ng"):
-            p = os.path.join(home, d, "stress-ng")
-            if home and os.access(p, os.X_OK):
-                return p
-    for p in ("/home/paul/Benchmarks/stress-ng/stress-ng",):
+    here = os.path.dirname(os.path.realpath(__file__))
+    repo = os.path.abspath(os.path.join(here, "..", "..", ".."))
+    candidates = []
+    if os.environ.get("DSB_ROOT"):
+        candidates.append(os.path.join(os.environ["DSB_ROOT"], "stress-ng", "stress-ng"))
+    candidates.append(os.path.join(repo, "benchmarks", "stress-ng", "stress-ng"))
+    for p in candidates:
         if os.access(p, os.X_OK):
             return p
     sys.exit("stress-ng binary not found")

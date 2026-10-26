@@ -1,0 +1,1 @@
+no hotel-*.mring with samples in /home/pager/Documents/Mercury/data/compare/hotel-gru-small/saturate/r1/20261026-142236/1-gnn-nopin-gru_slo4_mft/rings

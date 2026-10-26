@@ -1,22 +1,25 @@
 #!/bin/bash
 # DSB closed-loop A/B under Mercury: alternating saturate/gnn repeats with a DSB operator.
 #   dsb_ab.sh hotel|social OUT REPEATS "operator extra args" [--trace]
-# Starts its own mercury (port 8080, pool CPUs 1-60, worker CPU 0) per run, the operator's autoscale
-# (which starts and kills every service), and dsb_sample.py on CPU 63. Stops mercury with SIGTERM.
-# The defaults are dtn-01's layout. Another host overrides them, e.g. a 32-CPU laptop:
-#   DSB_ROOT=~/Documents/Benchmarks POOL="$(seq 1 29)" GEN_CPU=29 OP_CPU=30 TRACE_CPUS=31 SAMPLE_CPU=31
-# DSB_ROOT: Benchmarks checkout (default /home/paul/Benchmarks); Mercury is this script's repository.
-# POOL: Mercury's daemon CPUs (default 1-60; Mercury itself takes CPU 0). GEN_CPU: the loadgen home
-# CPU, in POOL (default 60). OP_CPU: the operator (61). TRACE_CPUS: threadtrace (62,63). SAMPLE_CPU:
-# dsb_sample.py (63). The last three stay outside POOL. PORT: Mercury's port (default 8080).
-# Each run dir gets rings/ (Mercury's 10 ms archives) and alloc_vs_use.{png,txt} from tools/plot_rings.py.
+# Starts its own mercury (port 8080, worker CPU 0) per run, the operator's autoscale
+# (which starts and kills every service), and dsb_sample.py. Stops mercury with SIGTERM.
+# The Linux CPU layout comes from benchmarks/perturb/perturb/hosts/$(hostname -s).env
+# (Apollo and dtn-01). HOST_ENV selects another file. Names that file leaves unset keep
+# dtn-01: POOL 1-60, GEN_CPU 60, OP_CPU 61, TRACE_CPUS 62,63, SAMPLE_CPU 63.
+# DSB_ROOT: benchmarks directory (default: this repository's benchmarks/).
+# POOL: Mercury's daemon CPUs (Mercury itself takes CPU 0). GEN_CPU: the loadgen home
+# CPU, inside POOL. OP_CPU: the operator. TRACE_CPUS: threadtrace. SAMPLE_CPU: dsb_sample.py.
+# The last three stay outside POOL. PORT: Mercury's port (default 8080).
+# Each run dir gets rings/ (Mercury's 10 ms archives) and alloc_vs_use.{png,txt} from tools/plots/rings/plot_rings.py.
 # EXTERNAL=1: use the mercury already listening on PORT instead of starting and stopping one per run.
 #   GEN_CPU and CPU 2 must be in its pool; its log stays its own; gnn@model tokens are refused (the
 #   model is that process's environment). Its ring archives are copied into each run dir.
 set -u
 SYS=$1; OUT=$2; REPS=$3; EXTRA=$4; TRACE=${5:-}
-B=${DSB_ROOT:-/home/paul/Benchmarks}; M=$(cd "$(dirname "$(readlink -f "$0")")/../.." && pwd)
-POOL=${POOL:-$(seq 1 60)}; GEN_CPU=${GEN_CPU:-60}; OP_CPU=${OP_CPU:-61}; TRACE_CPUS=${TRACE_CPUS:-62,63}; SAMPLE_CPU=${SAMPLE_CPU:-63}; PORT=${PORT:-8080}
+M=$(cd "$(dirname "$(readlink -f "$0")")/../.." && pwd)
+. "$M/src/test/host_layout.sh"
+B=${DSB_ROOT:-$M/benchmarks}
+PORT=${PORT:-8080}
 export DSB_ROOT=$B
 case $SYS in
   hotel) WD=$B/deathstar-hotelReservations; OP=$WD/bin/loadgen; PFX=hotel-; TR="hotel-frontend hotel-search hotel-geo hotel-profile hotel-rate";;
@@ -112,8 +115,8 @@ for r in $(seq 1 $REPS); do for pol in ${POLICIES:-saturate gnn}; do
   killcg
   # The external mercury appends every run to the same archives; plot_rings.py keeps the newest run.
   [ -n "${EXTERNAL:-}" ] && { mkdir -p $D/rings; sudo -n cp $XRINGS/$PFX*.mring $D/rings/ 2>/dev/null; sudo -n chown -R $(id -u):$(id -g) $D/rings; }
-  # 10 ms cores-vs-use per daemon from this run's ring archives (tools/plot_rings.py).
-  python3 $M/tools/plot_rings.py $D/rings --prefix $PFX --since-ns $T0 --until-ns $T1 --out $D/alloc_vs_use.png > $D/alloc_vs_use.txt 2>&1 \
+  # 10 ms cores-vs-use per daemon from this run's ring archives (tools/plots/rings/plot_rings.py).
+  python3 $M/tools/plots/rings/plot_rings.py $D/rings --prefix $PFX --since-ns $T0 --until-ns $T1 --out $D/alloc_vs_use.png > $D/alloc_vs_use.txt 2>&1 \
     && echo "  $(tail -1 $D/alloc_vs_use.txt)"
   echo "  numa_balancing=$(cat /proc/sys/kernel/numa_balancing)"
   sleep 3
