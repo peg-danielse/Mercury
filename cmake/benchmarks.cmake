@@ -379,12 +379,14 @@ set_target_properties(social_operate PROPERTIES
 # --- Media microservices ---------------------------------------------------
 # Upstream cmake looks for libjaegertracing.so, libmongoc-1.0 and a Thrift
 # installed under /usr/local. Build the services here against the same
-# libraries as the social network. Generated code is Thrift 0.12 and names
-# apache::thrift::stdcxx, which 0.22 removed.
+# libraries as the social network. Generated code is Thrift 0.12 and includes
+# <thrift/stdcxx.h> and names apache::thrift::stdcxx, which the Thrift that
+# ships with this system no longer has. The shim below provides that header.
 
 set(MEDIA ${CMAKE_SOURCE_DIR}/benchmarks/deathstar-mediaMicroservices)
 set(MEDIA_GEN ${MEDIA}/gen-cpp)
-file(WRITE ${CMAKE_BINARY_DIR}/media-thrift-compat.h
+file(MAKE_DIRECTORY ${CMAKE_BINARY_DIR}/media-compat/thrift)
+file(WRITE ${CMAKE_BINARY_DIR}/media-compat/thrift/stdcxx.h
 "#pragma once
 #include <memory>
 namespace apache { namespace thrift { namespace stdcxx {
@@ -408,6 +410,7 @@ function(media_bin name)
     OpenSSL::SSL OpenSSL::Crypto
     cpp_redis Threads::Threads)
   target_include_directories(media_${name} BEFORE PRIVATE
+    ${CMAKE_BINARY_DIR}/media-compat
     ${CMAKE_BINARY_DIR}/system-thrift
     ${CMAKE_BINARY_DIR}/mongocompat
     ${MEDIA}/src ${MEDIA_GEN}
@@ -417,8 +420,7 @@ function(media_bin name)
     ${CMAKE_BINARY_DIR}/bsoncompat)
   target_compile_definitions(media_${name} PRIVATE BOOST_ALL_DYN_LINK BOOST_LOG_DYN_LINK)
   target_compile_options(media_${name} PRIVATE
-    -O2 -Wno-unused-parameter -Wno-deprecated-declarations
-    -include ${CMAKE_BINARY_DIR}/media-thrift-compat.h)
+    -O2 -Wno-unused-parameter -Wno-deprecated-declarations)
   target_compile_features(media_${name} PRIVATE cxx_std_17)
   set_target_properties(media_${name} PROPERTIES
     OUTPUT_NAME ${name}
