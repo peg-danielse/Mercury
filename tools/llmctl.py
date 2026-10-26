@@ -620,7 +620,7 @@ def distilled_episode(args: argparse.Namespace, mercury: Mercury, log: Log, trig
     t0 = _time.perf_counter()
     if not DISTILLED:
         import torch
-        sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "distill"))
+        sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "learn", "distill"))
         import train as distill
         torch.set_num_threads(1)
         ckpt = torch.load(args.model, map_location="cpu", weights_only=False)

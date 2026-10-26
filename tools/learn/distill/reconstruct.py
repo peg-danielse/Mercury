@@ -31,7 +31,7 @@ import sys
 
 import numpy as np
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
 import llmctl  # noqa: E402  (Latency: the same latency summary the model saw)
 
 NCPU, NDOM = 64, 16
