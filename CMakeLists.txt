@@ -1,5 +1,12 @@
 cmake_minimum_required(VERSION 3.16)
-project(mercury LANGUAGES CXX)
+project(mercury LANGUAGES C CXX)
+
+# rabbitmq-c writes Release into this cache when the type is empty. Drop that
+# once so mercury keeps compiler defaults unless a type is passed on the command line.
+if(NOT DEFINED CACHE{MERCURY_BUILD_TYPE_INITIALIZED})
+  set(CMAKE_BUILD_TYPE "" CACHE STRING "Choose the type of build." FORCE)
+  set(MERCURY_BUILD_TYPE_INITIALIZED TRUE CACHE INTERNAL "")
+endif()
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -69,3 +76,5 @@ set_tests_properties(smoke_integration PROPERTIES
 add_test(NAME saturate_integration COMMAND ${CMAKE_SOURCE_DIR}/src/test/saturate_it.sh)
 set_tests_properties(saturate_integration PROPERTIES
   ENVIRONMENT "MERCURY_BIN=$<TARGET_FILE:mercury>;SPIN_BIN=$<TARGET_FILE:spinner>" TIMEOUT 600 LABELS slow)
+
+include(${CMAKE_SOURCE_DIR}/cmake/benchmarks.cmake)

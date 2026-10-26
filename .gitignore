@@ -21,3 +21,24 @@ libmercury_http.a
 __pycache__/
 /data/analysis/**/*.png
 SATURATE_PROPOSAL.*
+
+# Benchmark binaries and compiler products. Sources stay; build output does not.
+benchmarks/**/bin/
+benchmarks/**/target/
+benchmarks/**/node_modules/
+benchmarks/**/CMakeFiles/
+benchmarks/**/CMakeCache.txt
+benchmarks/**/cmake_install.cmake
+benchmarks/deathstar-socialNetwork/operate/operate
+benchmarks/deathstar-socialNetwork/operate/obj/
+benchmarks/stress-ng/stress-ng
+benchmarks/stress-ng/stress-ng.exe
+benchmarks/stress-ng/**/*.o
+benchmarks/stress-ng/config
+benchmarks/stress-ng/config.h
+benchmarks/stress-ng/configs/
+benchmarks/stress-ng/core-config.c
+benchmarks/stress-ng/core-perf-event.h
+benchmarks/stress-ng/personality.h
+benchmarks/stress-ng/io-uring.h
+benchmarks/stress-ng/git-commit-id.h
