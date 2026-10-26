@@ -1,0 +1,12 @@
+[submodule "benchmarks"]
+	path = benchmarks
+	url = git@github.com:peg-danielse/Benchmarks.git
+	branch = perturb-dtn01
+[submodule "deathstar-hotelReservations"]
+	path = deathstar-hotelReservations
+	url = git@github.com:peg-danielse/Benchmarks.git
+	branch = hotel/mercury-loadgen
+[submodule "deathstar-socialNetwork"]
+	path = deathstar-socialNetwork
+	url = git@github.com:peg-danielse/Benchmarks.git
+	branch = social/mercury-operator
