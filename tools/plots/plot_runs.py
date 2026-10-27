@@ -176,7 +176,7 @@ class Metrics:
         pool = run["pool"]
         return {"p50": self.p(lat, 0.5), "p95": self.p(lat), "p99": self.p(lat, 0.99),
                 "crit_err": 100 * c["errors"] / max(c["sent"], 1),
-                "opt_err": 100 * o["errors"] / max(o["sent"], 1), "pool_cs": pool_core_s(pool, run["duration_s"]),
+                "opt_err": 100 * o["errors"] / max(o["sent"], 1), "alloc_cs": run["cpu"]["alloc_core_s"],  # core-seconds allocated to the daemons (load generator excluded)
                 "pool_max": max(n for _, n in pool) if pool else float("nan"),
                 **{k: self.value(run, k) for k in metrics}}
 
@@ -257,7 +257,7 @@ def fig_cost(systems, rows, m: Metrics, out, width) -> None:
     medians = []
     for s in systems:
         color, marker, filled, name = look(s)
-        xs, ys = [r["pool_cs"] / 1000 for r in rows[s]], [r["p95"] for r in rows[s]]
+        xs, ys = [r["alloc_cs"] / 1000 for r in rows[s]], [r["p95"] for r in rows[s]]
         ax.scatter(xs, ys, s=10, marker=marker, linewidths=0.6, alpha=0.45,
                    facecolors=color if filled else "white", edgecolors=color, zorder=2)
         mx, my = statistics.median(xs), statistics.median(ys)
@@ -265,7 +265,7 @@ def fig_cost(systems, rows, m: Metrics, out, width) -> None:
                    edgecolors=INK if filled else color, zorder=4)
         medians.append((mx, my, name))
     place_labels(fig, ax, medians)
-    ax.set_xlabel("pool held (1000 core-seconds per run)")
+    ax.set_xlabel("cores allocated (1000 core-seconds per run)")
     ax.set_ylabel(m.label(f"p95:{m.latency}"))
     ax.set_xlim(left=0); ax.set_ylim(bottom=0)
     fig.tight_layout()
@@ -351,12 +351,12 @@ def fig_timeline(systems, runs, rows, m: Metrics, out, width, smooth: int) -> No
             continue  # fixed pools: one shared reference line below
         ax.step(xs, ys, where="post", color=color, lw=1.0, ls=dash(s))
         labelled.append((ys[-1], name, color))
-    start = min(c for r in picks.values() for _, c in r["pool"][:1])
+    start = min((c for r in picks.values() for _, c in r["pool"][:1]), default=None)  # None: no pool lines in the logs
     fixed = [look(s)[3] for s in systems if len({c for _, c in picks[s]["pool"]}) == 1]
-    if fixed:
+    if fixed and start is not None:
         ax.axhline(start, color=MUTED, lw=0.8, ls=":")
         labelled.append((start, ", ".join(fixed), MUTED))
-    top = max([y for y, _, _ in labelled] + [start])
+    top = max([y for y, _, _ in labelled] + [start or 0])
     for (_, name, ink), y in zip(labelled, spread([y for y, _, _ in labelled], top * 0.16)):
         ax.text(end, y, " " + name, va="center", fontsize=6.5 if ink != MUTED else 6, color=INK if ink != MUTED else MUTED)
     ax.set_ylabel("pool (CPUs)")
@@ -406,11 +406,11 @@ def main() -> int:
     shown = [s for s in systems if not a.timeline_systems or s in a.timeline_systems.split(",")]
     fig_timeline(shown, runs, rows, m, path("timeline"), a.width, a.smooth)
     print(f"{'system':10} {'n':>3} {'p50':>7} {'p95':>7} {'p99':>7} {'crit err%':>9} {'opt err%':>8} {'pool max':>8} "
-          f"{'pool kcs':>8} {'req/s':>7} {'cores':>6}")
+          f"{'alloc kcs':>9} {'req/s':>7} {'cores':>6}")
     for s in systems:
         med = lambda k: statistics.median(r[k] for r in rows[s])
         print(f"{look(s)[3]:10} {len(rows[s]):3} {med('p50'):7.1f} {med('p95'):7.1f} {med('p99'):7.1f} "
-              f"{med('crit_err'):9.2f} {med('opt_err'):8.2f} {med('pool_max'):8.0f} {med('pool_cs') / 1000:8.2f} "
+              f"{med('crit_err'):9.2f} {med('opt_err'):8.2f} {med('pool_max'):8.0f} {med('alloc_cs') / 1000:8.2f} "
               f"{statistics.median(m.value(r, 'tput') for r in runs if r['system'] == s):7.1f} "
               f"{statistics.median(m.value(r, 'cores') for r in runs if r['system'] == s):6.2f}")
     print(f"wrote {', '.join(path(n) for n in ['summary', 'cost', 'phases', 'timeline'])}")
