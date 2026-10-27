@@ -793,6 +793,8 @@ def openai_episode(args: argparse.Namespace, mercury: Mercury, log: Log, trigger
         if args.llm == "openrouter":
             payload["usage"] = {"include": True}
             payload["provider"] = {"sort": "latency"}  # a decision that arrives late is stale for control
+            payload["seed"] = args.seed  # best effort: the provider may ignore it
+            payload["temperature"] = 0
             if args.thinking == "off":
                 payload["reasoning"] = {"enabled": False}
             elif args.thinking != "default":
@@ -819,7 +821,7 @@ def openai_episode(args: argparse.Namespace, mercury: Mercury, log: Log, trigger
         message = choice.get("message") or {}
         usage = data.get("usage") or {}
         log.write(event="turn", turn=turn, finish=choice.get("finish_reason"), model=data.get("model", args.model),
-                  provider=data.get("provider"), input_tokens=usage.get("prompt_tokens"),
+                  provider=data.get("provider"), fingerprint=data.get("system_fingerprint"), seed=payload.get("seed"), input_tokens=usage.get("prompt_tokens"),
                   output_tokens=usage.get("completion_tokens"),
                   reasoning_tokens=(usage.get("completion_tokens_details") or {}).get("reasoning_tokens"),
                   cost_usd=usage.get("cost"))
@@ -1071,6 +1073,7 @@ def main() -> int:
     parser.add_argument("--max-actions", type=int, default=6, help="placement actions per episode")
     parser.add_argument("--max-turns", type=int, default=1,
                         help="model turns per episode (1: one decision, checked by the next cycle; more lets it inspect and retry)")
+    parser.add_argument("--seed", type=int, default=1, help="openrouter: the request's seed (best effort; logged per turn)")
     parser.add_argument("--thinking", choices=("off", "low", "high", "default"), default="low",
                         help="Gemini thinking: low is fastest (thinkingLevel low on 3.x, thinkingBudget 0 on 2.5); "
                              "openrouter: a reasoning effort, off disables reasoning (Gemini treats off as low)")
