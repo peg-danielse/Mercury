@@ -108,7 +108,7 @@ def summarize(name: str, run: str) -> dict:
     if os.path.exists(path):
         for line in open(path):
             parts = line.split()
-            if len(parts) > 3 and parts[0].startswith(("hotel-", "social-")) and not parts[0].endswith("loadgen"):
+            if len(parts) > 3 and parts[0].startswith(("hotel-", "social-", "media-")) and not parts[0].endswith("loadgen"):
                 try:
                     alloc += float(parts[1])
                     used += float(parts[2])

@@ -1,6 +1,6 @@
 #!/bin/bash
 # DSB closed-loop A/B under Mercury: alternating saturate/gnn repeats with a DSB operator.
-#   dsb_ab.sh hotel|social OUT REPEATS "operator extra args" [--trace]
+#   dsb_ab.sh hotel|social|media OUT REPEATS "operator extra args" [--trace]
 # Starts its own mercury (port 8080, worker CPU 0) per run, the operator's autoscale
 # (which starts and kills every service), and dsb_sample.py. Stops mercury with SIGTERM.
 # The Linux CPU layout comes from benchmarks/perturb/perturb/hosts/$(hostname -s).env
@@ -24,6 +24,11 @@ export DSB_ROOT=$B
 case $SYS in
   hotel) WD=$B/deathstar-hotelReservations; OP=$WD/bin/loadgen; PFX=hotel-; TR="hotel-frontend hotel-search hotel-geo hotel-profile hotel-rate";;
   social) WD=$B/deathstar-socialNetwork; OP=$WD/goperate/bin/goperate; PFX=social-; TR="social-ComposePostService social-HomeTimelineService social-UserTimelineService social-PostStorageService social-SocialGraphService";;
+  media) WD=$B/deathstar-mediaMicroservices; OP=$WD/goperate/bin/mediaoperate; PFX=media-; TR="media-PageService media-ComposeReviewService media-MovieReviewService media-MovieInfoService media-ReviewStorageService";;
+esac
+case $SYS in
+  media) MONGO_DIR=$B/runtime/mongodb/27018/db; REDIS_DUMP=$WD/run/data/redis/dump.rdb;;
+  *) MONGO_DIR=$B/runtime/mongodb/27017/db; REDIS_DUMP=$B/runtime/redis/6379/dump.rdb;;
 esac
 OUT=$(realpath -m $OUT); RUN=$OUT/$(date +%Y%m%d-%H%M%S); mkdir -p $RUN
 killcg() { for c in /sys/fs/cgroup/mercury/$PFX*; do [ -d $c ] && echo 1 | sudo -n tee $c/cgroup.kill >/dev/null; done; sleep 1; for c in /sys/fs/cgroup/mercury/$PFX*; do [ -d $c ] && sudo -n rmdir $c 2>/dev/null; done; }
@@ -65,17 +70,17 @@ for r in $(seq 1 $REPS); do for pol in ${POLICIES:-saturate gnn}; do
   D=$RUN/$r-$NAME; mkdir -p $D
   if [ -n "${FRESH_DB:-}" ]; then
     pgrep -x mongod >/dev/null && { echo "mongod is running: cannot start from an empty database"; exit 1; }
-    sudo -n rm -rf $B/runtime/mongodb/27017/db
-    sudo -n rm -f $B/runtime/redis/6379/dump.rdb
-    mkdir -p $B/runtime/mongodb/27017/db
-    echo "fresh: empty database $B/runtime/mongodb/27017/db $(date -Is)" > $D/seed.txt
+    sudo -n rm -rf $MONGO_DIR
+    sudo -n rm -f $REDIS_DUMP
+    mkdir -p $MONGO_DIR
+    echo "fresh: empty database $MONGO_DIR $(date -Is)" > $D/seed.txt
   elif [ -n "${SEED:-}" ]; then
     pgrep -x mongod >/dev/null && { echo "mongod is running: cannot restore SEED"; exit 1; }
     [ -d "$SEED/mongodb" ] || { echo "SEED $SEED has no mongodb/"; exit 1; }
-    sudo -n mkdir -p $B/runtime/mongodb/27017/db $B/runtime/redis/6379
-    sudo -n rsync -a --delete "$SEED/mongodb/" $B/runtime/mongodb/27017/db/
-    if [ -f "$SEED/redis/dump.rdb" ]; then sudo -n cp -p "$SEED/redis/dump.rdb" $B/runtime/redis/6379/dump.rdb
-    else sudo -n rm -f $B/runtime/redis/6379/dump.rdb; fi
+    sudo -n mkdir -p $MONGO_DIR $(dirname $REDIS_DUMP)
+    sudo -n rsync -a --delete "$SEED/mongodb/" $MONGO_DIR/
+    if [ -f "$SEED/redis/dump.rdb" ]; then sudo -n cp -p "$SEED/redis/dump.rdb" $REDIS_DUMP
+    else sudo -n rm -f $REDIS_DUMP; fi
     echo "seed $SEED restored $(date -Is)" > $D/seed.txt
   fi
   if [ -n "${EXTERNAL:-}" ]; then
