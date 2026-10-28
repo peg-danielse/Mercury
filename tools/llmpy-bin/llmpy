@@ -1,0 +1,2 @@
+#!/bin/sh
+exec "${LLMPY_PYTHON:-$HOME/opt/torchenv/bin/python}" "$@"

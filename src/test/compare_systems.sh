@@ -8,7 +8,7 @@
 # on the one at i mod n) at that service's busiest CPU. The antagonists switch on and off but take no action of
 # their own (--actions none), so only the system moves daemons. Then compare_report.py OUT.
 #
-#   compare_systems.sh OUT [hotel|social]          (default: hotel)
+#   compare_systems.sh OUT [hotel|social|media]    (default: hotel)
 #
 # Env: SYSTEMS [saturate l3 shift l3shift degrade llm] (throttle: cut every service's CPU time instead)
 #      DEGRADE_ROUTES [recommendations,restaurants,museums,cinema,review]: the optional routes degrade sheds, in order
@@ -46,12 +46,14 @@ set -u
 OUT=$(realpath -m "$1"); SYS=${2:-hotel}
 M=$(cd "$(dirname "$(readlink -f "$0")")/../.." && pwd)
 . "$M/src/test/host_layout.sh"
-SYSTEMS=${SYSTEMS:-saturate l3 shift l3shift degrade llm}
+SYSTEMS=${SYSTEMS:-$([ "$SYS" = media ] && echo "saturate l3 shift l3shift llm" || echo "saturate l3 shift l3shift degrade llm")}
+# degrade sheds optional routes at the entry daemon; the media benchmark has no front end to shed at.
+if [ "$SYS" = media ] && [[ " $SYSTEMS " =~ \ degrade\  ]]; then echo "degrade has no front end in the media benchmark: leave it out of SYSTEMS"; exit 2; fi
 DSB_ROOT=${DSB_ROOT:-$M/benchmarks}
 export DSB_ROOT
 # hotel starts every run from an empty database; social restores its seed (the social graph and 10 posts per user,
 # which the routes need: an empty social network has no one to follow or read).
-DB=${DB:-$([ "$SYS" = social ] && echo seed || echo fresh)}
+DB=${DB:-$([ "$SYS" = social ] || [ "$SYS" = media ] && echo seed || echo fresh)}
 if [ "$DB" = fresh ] && [ "$(realpath -m "$DSB_ROOT")" = "$(realpath -m "$HOME/Benchmarks")" ]; then
   echo "DB=fresh would delete the database of $HOME/Benchmarks: set DSB_ROOT to a tree of these experiments"; exit 2
 fi
@@ -70,6 +72,10 @@ case $SYS in
   # social: no frontend (the load generator calls the services over Thrift); the optional routes are shed by the
   # services that serve them, and only by their route's methods (ReadUserTimeline; Follow/Unfollow), so compose-post's
   # own calls into those services go on.
+  media)  ENTRY="";                PFX=media-
+          VICTIMS=${VICTIMS-PageService,ComposeReviewService,MovieReviewService,ReviewStorageService,MovieInfoService,UserService,mongod}
+          CRITICAL=${CRITICAL:-read-page,compose-review}
+          DEGRADE_ROUTES=${DEGRADE_ROUTES:-}; DEGRADE_DAEMONS=;;
   social) ENTRY="";                PFX=social-
           VICTIMS=${VICTIMS-ComposePostService,HomeTimelineService,UserTimelineService,PostStorageService,SocialGraphService,mongod,redis-server}
           CRITICAL=${CRITICAL:-compose-post,read-home-timeline}
@@ -77,10 +83,16 @@ case $SYS in
   *) echo "unknown system $SYS"; exit 2;;
 esac
 [ "$SYS" = social ] && ROUTE=${ROUTE:-compose-post,read-home-timeline,read-user-timeline,follow}
+[ "$SYS" = media ] && ROUTE=${ROUTE:-read-page,compose-review,read-movie-reviews}
+[ "$SYS" = media ] && LLM_ARGS="$LLM_ARGS --app media"  # the controller describes the media application
 ROUTE=${ROUTE:-hotels}
 DBENV="FRESH_DB=1"
 if [ "$DB" = seed ]; then
-  if [ "$SYS" = hotel ]; then SEEDDIR=${SEEDDIR:-$(cat ~/.seed_hotel)}; else SEEDDIR=${SOCIAL_SEED:-$(cat ~/.seed_social)}; fi
+  case $SYS in
+    hotel) SEEDDIR=${SEEDDIR:-$(cat ~/.seed_hotel)};;
+    media) SEEDDIR=${MEDIA_SEED:-$(cat ~/.seed_media)};;
+    *) SEEDDIR=${SOCIAL_SEED:-$(cat ~/.seed_social)};;
+  esac
   DBENV="SEED=$SEEDDIR"
 fi
 POOL_START=${POOL_START:-8}

@@ -225,6 +225,22 @@ TOOLS.append({
 })
 ACTIONS = {"move_daemon", "grow_pool", "shrink_pool", "swap_domain", "shed_route", "restore_route"}
 
+# --app NAME: a description of the application that opens every episode, so the model knows what its routes are, which
+# are critical, and what its daemons do. Without --app the prompt is the generic one (the hotel and social runs).
+APPLICATIONS = {
+    "media": """The application is DeathStarBench's media microservices, a movie review site: 13 C++ Thrift services
+(CastInfo, ComposeReview, MovieId, MovieInfo, MovieReview, Page, Plot, Rating, ReviewStorage, Text, UniqueId, UserReview,
+User), each in its own daemon named media-<service>. Their data is in MongoDB (media-mongod); each service has its own
+memcached (media-11300 to media-11306); redis is media-redis-server. The load generator (media-loadgen) sends three routes:
+- read-page (critical): PageService.ReadPage for one movie. Page calls MovieInfo, Plot, CastInfo and MovieReview.
+- compose-review (critical): one review written by four uploads (User, Text, MovieId and UniqueId services). Each hands
+  its part to ComposeReview, which stores the review through ReviewStorage, MovieReview and UserReview.
+- read-movie-reviews (optional): MovieReview.ReadMovieReviews for one movie.
+There is no front end and nothing can be shed: every route is served or it is not. The end-to-end latency in the state is
+the load generator's; the critical routes' latency is what the objectives protect. Latency that does not show in the
+services' CPU use usually waits in mongod or memcached, and more CPUs for the services do not fix it.""",
+}
+
 SHED_SYSTEM = """
 
 Shedding is enabled: the application's optional routes ("degrade.sheddable") can be turned off. Requests to a
@@ -465,7 +481,8 @@ class Log:
 
 def opening_message(args: argparse.Namespace, trigger: str, opening: dict[str, Any]) -> str:
     previous = json.dumps(args.previous, separators=(",", ":")) if args.previous else "none"
-    return (f"{args.goal}\n\nWhy you were called: {trigger}\n\n"
+    app = APPLICATIONS[args.app] + "\n\n" if args.app else ""
+    return (f"{app}{args.goal}\n\nWhy you were called: {trigger}\n\n"
             f"Your previous episode's calls and their results: {previous}\n\n"
             "The machine now; \"since\" covers what happened after your previous episode (absent on the first), "
             "and \"cursor\" is the one to pass to inspect:\n" + json.dumps(opening, separators=(",", ":")))
@@ -1068,6 +1085,8 @@ def main() -> int:
                                         f"Claude Code's own default for claude-cli, XAI_MODEL or {XAI_MODEL} for grok, "
                                         f"OPENROUTER_MODEL or {OPENROUTER_MODEL} for openrouter")
     parser.add_argument("--effort", choices=("low", "medium", "high", "xhigh", "max"), default="medium")
+    parser.add_argument("--app", choices=("",) + tuple(APPLICATIONS), default="",
+                        help="the application this controller manages (its routes and daemons), opening every episode")
     parser.add_argument("--goal", default="Inspect the server and fix any L3 domain above 80% or daemon short of CPUs.")
     parser.add_argument("--window-ms", type=int, default=1000, help="averaging window of inspect")
     parser.add_argument("--max-actions", type=int, default=6, help="placement actions per episode")
