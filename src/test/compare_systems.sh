@@ -17,7 +17,11 @@
 #      DSB_ROOT [this repository's benchmarks/]: the benchmarks tree; the Linux CPU layout is
 #        benchmarks/perturb/perturb/hosts/$(hostname -s).env, same as dsb_ab.sh. degrade needs its frontend, which sheds the
 #        routes Mercury disables in MERCURY_POLICY  ROUTE [hotels]  RATE [1600]  PHASES [12]  OFF [20]  ON [30]
-#      WARMUP [30]  SEED_N [1]  GEN_CORES [12]  LLM_ARGS ["--every 0.5"]
+#      WARMUP [30; 50 when LEVELS has more than one rate]  SEED_N [1]  GEN_CORES [12]  LLM_ARGS ["--every 0.5"]
+#      LEVELS: comma-separated req/s per route, each held for STEP [2*(OFF+ON) seconds] and repeated until the run
+#        ends (-duration). Social's default, when RATE is unset, is 100,120,150. One level (the default RATE, or a
+#        single LEVELS entry) is held for the whole run. The first change falls at an antagonist off boundary when
+#        WARMUP is one phase (OFF+ON) and STEP is two.
 #      AUTOSCALER [saturate]: saturate, or gru (the services run policy gnn without pinning on GRU_MODEL
 #        [models/gru_slo4_mft.json]; the load generator stays on saturate)
 #      Scenario of 2026-10-21 (too little capacity plus a noisy neighbour): POOL_START=4 RATE=100 AUTOSCALER=gru
@@ -57,8 +61,9 @@ DB=${DB:-$([ "$SYS" = social ] || [ "$SYS" = media ] && echo seed || echo fresh)
 if [ "$DB" = fresh ] && [ "$(realpath -m "$DSB_ROOT")" = "$(realpath -m "$HOME/Benchmarks")" ]; then
   echo "DB=fresh would delete the database of $HOME/Benchmarks: set DSB_ROOT to a tree of these experiments"; exit 2
 fi
+RATE_SET=${RATE+x}
 RATE=${RATE:-1600}
-PHASES=${PHASES:-12}; OFF=${OFF:-20}; ON=${ON:-30}; WARMUP=${WARMUP:-30}; SEED_N=${SEED_N:-1}; GL=${GEN_CORES:-12}
+PHASES=${PHASES:-12}; OFF=${OFF:-20}; ON=${ON:-30}; WARMUP_SET=${WARMUP+x}; WARMUP=${WARMUP:-30}; SEED_N=${SEED_N:-1}; GL=${GEN_CORES:-12}
 LLM_ARGS=${LLM_ARGS:---every 0.5}; AUTOSCALER=${AUTOSCALER:-saturate}; GRU_MODEL=${GRU_MODEL:-$M/models/gru_slo4_mft.json}
 case $AUTOSCALER in
   saturate) SCALER=saturate;;
@@ -121,8 +126,20 @@ fi
 SNAP=$("$M/scripts/backup.sh") || { echo "snapshot failed: the experiment is not started"; exit 1; }
 mkdir -p "$OUT"
 echo "snapshot $SNAP" >> "$OUT/meta.txt"
+# Social, with RATE left unset, cycles low/medium/high (100, 120, 150 req/s per route). Any app cycles when LEVELS
+# has more than one entry. One entry is held for the whole run.
+if [ -z "${LEVELS:-}" ]; then
+  if [ "$SYS" = social ] && [ -z "$RATE_SET" ]; then LEVELS=100,120,150; else LEVELS=$RATE; fi
+fi
+case $LEVELS in
+  *,*)
+    STEP=${STEP:-$((2 * (OFF + ON)))}
+    [ -z "$WARMUP_SET" ] && WARMUP=$((OFF + ON))
+    ;;
+esac
 DUR=$((WARMUP + PHASES * (OFF + ON) + 30))
-echo "started $(date -Is) $SYS $ROUTE ${RATE}req/s systems=[$SYSTEMS] PHASES=$PHASES OFF=$OFF ON=$ON WARMUP=$WARMUP seed=$SEED_N kinds=${KINDS:-same,smt,l3,membw} victims=[$VICTIMS] autoscaler=$SCALER repeats=${REPEATS:-1} stop_at=${STOP_AT:-none} llm_pool_max=${LLM_POOL_MAX:-none} pool_start=${NOPOOL:+none}${NOPOOL:-$POOL_START} critical=${CRITICAL:-} dsb_root=$DSB_ROOT db=$DB run ${DUR}s mercury $(cat $M/SOURCE 2>/dev/null || git -C $M log --oneline -1)" >> "$OUT/meta.txt"
+if [ -n "${STEP:-}" ]; then LOAD_STEP=${STEP}s; LOAD_DUR="-duration ${DUR}s"; else LOAD_STEP=${DUR}s; LOAD_DUR=""; fi
+echo "started $(date -Is) $SYS $ROUTE levels=$LEVELS step=${STEP:-all}s systems=[$SYSTEMS] PHASES=$PHASES OFF=$OFF ON=$ON WARMUP=$WARMUP seed=$SEED_N kinds=${KINDS:-same,smt,l3,membw} victims=[$VICTIMS] autoscaler=$SCALER repeats=${REPEATS:-1} stop_at=${STOP_AT:-none} llm_pool_max=${LLM_POOL_MAX:-none} pool_start=${NOPOOL:+none}${NOPOOL:-$POOL_START} critical=${CRITICAL:-} dsb_root=$DSB_ROOT db=$DB run ${DUR}s mercury $(cat $M/SOURCE 2>/dev/null || git -C $M log --oneline -1)" >> "$OUT/meta.txt"
 REPEATS=${REPEATS:-1}
 for r in $(seq 1 $REPEATS); do for sysname in $SYSTEMS; do
   D=$OUT/$sysname/r$r
@@ -158,7 +175,7 @@ for r in $(seq 1 $REPEATS); do for sysname in $SYSTEMS; do
     env $DBENV CPUSTAT=1 POLICIES=$SCALER SVC_ARGS="-svc-min 1 -svc-max 16" \
     SIDECAR="python3 $M/src/test/system_sidecar.py" \
     "$M/src/test/dsb_ab.sh" $SYS "$D" 1 \
-    "$ENTRY -routes $ROUTE -arrivals poisson -load list -levels $RATE -step ${DUR}s -window-ms 500 -hist -gen-min $GL -gen-max $GL" \
+    "$ENTRY -routes $ROUTE -arrivals poisson -load list -levels $LEVELS -step $LOAD_STEP $LOAD_DUR -window-ms 500 -hist -gen-min $GL -gen-max $GL" \
     > "$D/driver.log" 2>&1
   rd=$(ls -d "$D"/2026*/1-* 2>/dev/null | tail -1)
   n=$(grep -c '"event": "on"' "$rd/antagonists.jsonl" 2>/dev/null)
