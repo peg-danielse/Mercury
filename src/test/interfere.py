@@ -35,6 +35,20 @@ import argparse, itertools, json, os, random, signal, subprocess, sys, time, url
 CG = "/sys/fs/cgroup/mercury"
 
 
+def stress_ng():
+    """stress-ng built by cmake at benchmarks/stress-ng/stress-ng. STRESS_NG or DSB_ROOT selects another one."""
+    env = os.environ.get("STRESS_NG")
+    if env:
+        return env
+    root = os.environ.get("DSB_ROOT")
+    if root:
+        candidate = os.path.join(root, "stress-ng", "stress-ng")
+        if os.access(candidate, os.X_OK):
+            return candidate
+    here = os.path.dirname(os.path.realpath(__file__))
+    return os.path.abspath(os.path.join(here, "..", "..", "benchmarks", "stress-ng", "stress-ng"))
+
+
 def cpu_list(text):
     out = []
     for part in text.strip().split(","):
@@ -158,7 +172,10 @@ class Driver:
                 args = ["--cache", "1", "--cache-level", "3", "--cache-no-affinity"]
             else:
                 args = ["--stream", "1"]
-            self.procs.append(subprocess.Popen(["taskset", "-c", str(x), "stress-ng", *args, "-t", "0", "-q"],
+            binary = stress_ng()
+            if not os.access(binary, os.X_OK):
+                raise FileNotFoundError(f"stress-ng is not executable: {binary}")
+            self.procs.append(subprocess.Popen(["taskset", "-c", str(x), binary, *args, "-t", "0", "-q"],
                                                start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
 
     def stop(self):
@@ -267,7 +284,7 @@ class Driver:
         self.put_back()
 
     def run(self):
-        self.emit(event="start", args=vars(self.a), pool=self.pool)
+        self.emit(event="start", args=vars(self.a), pool=self.pool, stress_ng=stress_ng())
         time.sleep(self.a.warmup)
         for i in itertools.count() if self.a.phases == 0 else range(self.a.phases):
             time.sleep(self.a.off)
