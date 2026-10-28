@@ -42,3 +42,6 @@ benchmarks/stress-ng/core-perf-event.h
 benchmarks/stress-ng/personality.h
 benchmarks/stress-ng/io-uring.h
 benchmarks/stress-ng/git-commit-id.h
+
+# Backups made by scripts/backup.sh
+/data/backups/

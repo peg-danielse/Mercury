@@ -117,7 +117,10 @@ LLM_KEY_VARS=${LLM_KEY_VARS:-${LLM_KEY_VAR:-GEMINI_API_KEY}}
 if [[ " $SYSTEMS " =~ \ llm(deg)?[0-9]*[-\ ] ]]; then
   for v in $LLM_KEY_VARS; do [ -z "${!v:-}" ] && read -r "$v"; export "$v"; done
 fi
+# Snapshot the repository before the experiment: scripts/restore.sh SNAPSHOT restores the state it ran from.
+SNAP=$("$M/scripts/backup.sh") || { echo "snapshot failed: the experiment is not started"; exit 1; }
 mkdir -p "$OUT"
+echo "snapshot $SNAP" >> "$OUT/meta.txt"
 DUR=$((WARMUP + PHASES * (OFF + ON) + 30))
 echo "started $(date -Is) $SYS $ROUTE ${RATE}req/s systems=[$SYSTEMS] PHASES=$PHASES OFF=$OFF ON=$ON WARMUP=$WARMUP seed=$SEED_N kinds=${KINDS:-same,smt,l3,membw} victims=[$VICTIMS] autoscaler=$SCALER repeats=${REPEATS:-1} stop_at=${STOP_AT:-none} llm_pool_max=${LLM_POOL_MAX:-none} pool_start=${NOPOOL:+none}${NOPOOL:-$POOL_START} critical=${CRITICAL:-} dsb_root=$DSB_ROOT db=$DB run ${DUR}s mercury $(cat $M/SOURCE 2>/dev/null || git -C $M log --oneline -1)" >> "$OUT/meta.txt"
 REPEATS=${REPEATS:-1}
