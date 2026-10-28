@@ -10,7 +10,7 @@ Tested on Debian 13 (trixie), x86_64. Ubuntu is not tested.
 tools/setup/install-deps.sh          # apt packages (sudo), then libmongoc 2 and AMQP-CPP into ~/opt
 source ~/opt/env.sh
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build -j"$(nproc)"
+cmake --build build -j6
 ```
 
 `install-deps.sh` is safe to rerun: it skips anything already installed. `DRY_RUN=1` prints the steps without running them. The prefix can be changed with `PREFIX=/path`.
@@ -56,15 +56,15 @@ These need network access at configure time. The tags are in `cmake/benchmarks.c
 | cpp_redis | 4.3.1 |
 | tacopie | 3.2.0 |
 
-### Benchmark sources (git submodules)
+### Benchmark sources (git submodule)
 
-The service sources are submodules: `benchmarks/deathstar-hotelReservations`, `deathstar-socialNetwork`, `perturb`, `runtime/{jaeger,memcached,mongodb,rabbitmq,redis}`, `stress-ng`, and `train-ticket`. Check them out at the commits the superproject records:
+The apps, stressors, and runtimes are one submodule, `benchmarks`, checked out at the commit the superproject records:
 
 ```
-git submodule update --init
+git submodule update --init benchmarks
 ```
 
-We could not get a shallow (`--depth 1`) submodule update to land on the recorded commits, so use the full update. `benchmarks/README.md` describes the layout.
+`benchmarks/README.md` describes the layout. A shallow (`--depth 1`) update does not land on that commit.
 
 ### Thrift and the media services
 
@@ -73,8 +73,10 @@ The media services' generated code is Thrift 0.12, and it includes `<thrift/stdc
 ## Verifying the build
 
 ```
-cmake --build build -j"$(nproc)"
+cmake --build build -j6
 ```
+
+`-j6` on a 32 GB machine. stress-ng compiles with 4 jobs of its own inside this build, and `-j$(nproc)` exhausts that much RAM.
 
 Expect no errors. Targets that matter for the experiments are `mercury`, `hotel`, the social services, `goperate`, and `media_*`.
 
@@ -84,7 +86,7 @@ These are not needed to compile, but `src/test/dsb_ab.sh` and `compare_systems.s
 
 - `sudo` without a password, for the cgroup setup (`/sys/fs/cgroup/mercury`).
 - A host CPU layout file, `benchmarks/perturb/perturb/hosts/<hostname>.env`. dtn-01 is covered; other hosts need their own file.
-- A built DeathStarBench tree (`DSB_ROOT`) with the operator binaries and the MongoDB, memcached and redis runtimes built.
+- The built `benchmarks/` tree (`DSB_ROOT`, the default). Social and media also need `/usr/bin/redis-server` and `/usr/lib/rabbitmq/bin/rabbitmq-server`. `README.md` is the short path through a `compare_systems.sh` run.
 - Python 3: the tools use the standard library. Plotting needs `matplotlib`, and `tools/learn` needs `torch`. Neither is installed by the script.
 
 ## Not verified here
