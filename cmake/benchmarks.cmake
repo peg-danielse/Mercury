@@ -1,21 +1,39 @@
 # Hotel, social, media microservices, gomaxprocs, stress-ng, and the runtime
-# wrappers. Invoked from the top-level CMakeLists.
+# wrappers and servers. Invoked from the top-level CMakeLists.
 # Train Ticket is a Maven tree and is built only when java and mvn are on PATH.
 # Perturb is Python. The Jaeger all-in-one under benchmarks/runtime/jaeger/bin is
 # already built; its sources are not in the tree.
 
+find_program(GIT_EXECUTABLE git)
+if(NOT EXISTS ${CMAKE_SOURCE_DIR}/benchmarks/README.md)
+  if(GIT_EXECUTABLE AND EXISTS ${CMAKE_SOURCE_DIR}/.git)
+    message(STATUS "Initializing benchmarks submodule...")
+    execute_process(
+      COMMAND ${GIT_EXECUTABLE} submodule update --init benchmarks
+      WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+      RESULT_VARIABLE _submod_res)
+    if(NOT _submod_res EQUAL 0)
+      message(FATAL_ERROR "git submodule update --init benchmarks failed (${_submod_res})")
+    endif()
+  else()
+    message(FATAL_ERROR "benchmarks/ is not populated; run: git submodule update --init")
+  endif()
+endif()
+
 find_program(GO_EXECUTABLE go REQUIRED)
+find_program(PYTHON3_EXECUTABLE python3 REQUIRED)
 find_package(Threads REQUIRED)
 find_package(PkgConfig REQUIRED)
 
 set(HOTEL ${CMAKE_SOURCE_DIR}/benchmarks/deathstar-hotelReservations)
 set(SOCIAL ${CMAKE_SOURCE_DIR}/benchmarks/deathstar-socialNetwork)
+set(MEDIA ${CMAKE_SOURCE_DIR}/benchmarks/deathstar-mediaMicroservices)
 set(RUNTIME ${CMAKE_SOURCE_DIR}/benchmarks/runtime)
 
-# --- Go: hotel services and both operators ---------------------------------
+# --- Go: hotel services and operators --------------------------------------
 
 file(GLOB HOTEL_CMD_DIRS LIST_DIRECTORIES true ${HOTEL}/cmd/*)
-set(HOTEL_BINS ${HOTEL}/bin/loadgen)
+set(HOTEL_BINS ${HOTEL}/bin/loadgen ${HOTEL}/bin/experiment)
 foreach(dir ${HOTEL_CMD_DIRS})
   if(IS_DIRECTORY ${dir})
     get_filename_component(name ${dir} NAME)
@@ -24,7 +42,8 @@ foreach(dir ${HOTEL_CMD_DIRS})
 endforeach()
 
 file(GLOB_RECURSE HOTEL_GO CONFIGURE_DEPENDS
-  ${HOTEL}/operate/*.go ${HOTEL}/cmd/*.go ${HOTEL}/services/*.go
+  ${HOTEL}/operate/*.go ${HOTEL}/experiment/*.go ${HOTEL}/probe/*.go
+  ${HOTEL}/cmd/*.go ${HOTEL}/services/*.go
   ${HOTEL}/boot/*.go ${HOTEL}/tracing/*.go ${HOTEL}/dialer/*.go
   ${HOTEL}/data/*.go ${HOTEL}/tls/*.go ${HOTEL}/tune/*.go ${HOTEL}/cachepolicy/*.go)
 add_custom_command(
@@ -39,11 +58,22 @@ set(GOPERATE_BINS ${SOCIAL}/goperate/bin/goperate ${SOCIAL}/goperate/bin/loadgen
 file(GLOB GOPERATE_GO CONFIGURE_DEPENDS ${SOCIAL}/goperate/*.go)
 add_custom_command(
   OUTPUT ${GOPERATE_BINS}
-  COMMAND ${CMAKE_SOURCE_DIR}/cmake/build-goperate.sh ${SOCIAL}/goperate
+  COMMAND ${CMAKE_SOURCE_DIR}/cmake/build-goperate.sh ${SOCIAL}/goperate goperate
   DEPENDS ${CMAKE_SOURCE_DIR}/cmake/build-goperate.sh ${SOCIAL}/goperate/go.mod ${SOCIAL}/goperate/go.sum ${GOPERATE_GO}
   COMMENT "go build goperate"
   VERBATIM)
 add_custom_target(goperate ALL DEPENDS ${GOPERATE_BINS})
+
+set(MEDIAOPERATE_BINS ${MEDIA}/goperate/bin/mediaoperate ${MEDIA}/goperate/bin/loadgen)
+file(GLOB_RECURSE MEDIAOPERATE_GO CONFIGURE_DEPENDS ${MEDIA}/goperate/*.go)
+list(FILTER MEDIAOPERATE_GO EXCLUDE REGEX "/vendor/")
+add_custom_command(
+  OUTPUT ${MEDIAOPERATE_BINS}
+  COMMAND ${CMAKE_SOURCE_DIR}/cmake/build-goperate.sh ${MEDIA}/goperate mediaoperate
+  DEPENDS ${CMAKE_SOURCE_DIR}/cmake/build-goperate.sh ${MEDIA}/goperate/go.mod ${MEDIA}/goperate/go.sum ${MEDIAOPERATE_GO}
+  COMMENT "go build mediaoperate"
+  VERBATIM)
+add_custom_target(mediaoperate ALL DEPENDS ${MEDIAOPERATE_BINS})
 
 set(GOMAX ${CMAKE_SOURCE_DIR}/benchmarks/gomaxprocs)
 set(GOMAX_BINS ${GOMAX}/bin/server ${GOMAX}/bin/operate)
@@ -56,22 +86,21 @@ add_custom_command(
   VERBATIM)
 add_custom_target(gomaxprocs ALL DEPENDS ${GOMAX_BINS})
 
+# --- Stressors: stress-ng and synthetic workloads --------------------------
 # stress-ng's Makefile writes the binary and its objects into its own tree.
 set(STRESS ${CMAKE_SOURCE_DIR}/benchmarks/stress-ng)
 file(GLOB_RECURSE STRESS_SRC CONFIGURE_DEPENDS ${STRESS}/*.c ${STRESS}/*.h ${STRESS}/Makefile)
 list(FILTER STRESS_SRC EXCLUDE REGEX "/configs/")
 add_custom_command(
   OUTPUT ${STRESS}/stress-ng
-  # config.h is generated for this host. `make` refreshes it when it is missing.
-  # A config.h copied from another machine can define headers this libc does not
-  # ship (termio.h); delete it and re-run the build if compile errors name one.
-  COMMAND make -C ${STRESS} -j
-  DEPENDS ${STRESS_SRC}
+  COMMAND ${CMAKE_SOURCE_DIR}/cmake/build-stress-ng.sh ${STRESS}
+  DEPENDS ${CMAKE_SOURCE_DIR}/cmake/build-stress-ng.sh ${STRESS_SRC}
   COMMENT "make stress-ng"
   VERBATIM)
 add_custom_target(stress_ng ALL DEPENDS ${STRESS}/stress-ng)
+add_custom_target(stressors DEPENDS stress_ng spinner gnnload)
 
-# --- Runtime wrappers (the real servers are local binaries they exec) ------
+# --- Runtimes: wrappers and backing servers --------------------------------
 
 function(runtime_wrapper target src outdir outname)
   add_executable(${target} ${src})
@@ -90,6 +119,28 @@ foreach(port 11211 11212 11213 11214 11311 11312 11313)
   endif()
 endforeach()
 runtime_wrapper(runtime_rabbitmq ${RUNTIME}/rabbitmq/rabbitmq-server.c ${RUNTIME}/rabbitmq rabbitmq-server)
+
+add_custom_command(
+  OUTPUT ${RUNTIME}/memcached/local/bin/memcached
+  COMMAND ${CMAKE_SOURCE_DIR}/cmake/build-memcached.sh ${RUNTIME}/memcached ${CMAKE_BINARY_DIR}/memcached-build
+  DEPENDS ${CMAKE_SOURCE_DIR}/cmake/build-memcached.sh
+  COMMENT "runtime memcached server"
+  VERBATIM)
+add_custom_target(runtime_memcached_bin ALL DEPENDS ${RUNTIME}/memcached/local/bin/memcached)
+
+add_custom_command(
+  OUTPUT ${RUNTIME}/mongodb/bin/mongod
+  COMMAND ${CMAKE_SOURCE_DIR}/cmake/build-mongod.sh ${RUNTIME}/mongodb ${CMAKE_BINARY_DIR}/mongodb-fetch
+  DEPENDS ${CMAKE_SOURCE_DIR}/cmake/build-mongod.sh
+  COMMENT "runtime mongod server"
+  VERBATIM)
+add_custom_target(runtime_mongod_bin ALL DEPENDS ${RUNTIME}/mongodb/bin/mongod)
+
+add_custom_target(runtimes DEPENDS
+  runtime_mongod runtime_mongod_bin
+  runtime_redis
+  runtime_memcached runtime_memcached_bin
+  runtime_rabbitmq)
 
 # --- Social network C++ services -------------------------------------------
 
@@ -487,18 +538,38 @@ set_target_properties(media_MediaTextService PROPERTIES OUTPUT_NAME TextService)
 set_target_properties(media_MediaUniqueIdService PROPERTIES OUTPUT_NAME UniqueIdService)
 set_target_properties(media_MediaUserService PROPERTIES OUTPUT_NAME UserService)
 
-add_custom_target(benchmarks)
-add_dependencies(benchmarks
-  hotel goperate gomaxprocs stress_ng
-  runtime_mongod runtime_redis runtime_memcached runtime_rabbitmq
+set(MEDIA_RUN_OUT
+  ${MEDIA}/run/config/service-config.json
+  ${MEDIA}/run/config/jaeger-config.yml)
+add_custom_command(
+  OUTPUT ${MEDIA_RUN_OUT}
+  COMMAND ${PYTHON3_EXECUTABLE} ${MEDIA}/scripts/standalone_config.py
+  DEPENDS
+    ${MEDIA}/scripts/standalone_config.py
+    ${MEDIA}/config/service-config.json
+    ${MEDIA}/config/jaeger-config.yml
+    runtime_memcached
+  COMMENT "standalone_config.py media/run"
+  VERBATIM)
+add_custom_target(media_run ALL DEPENDS ${MEDIA_RUN_OUT})
+
+add_custom_target(social DEPENDS
+  goperate social_operate
   TextService UniqueIdService UserService SocialGraphService PostStorageService
   UserTimelineService ComposePostService UserMentionService UrlShortenService
-  MediaService HomeTimelineService WriteHomeTimelineService social_operate
+  MediaService HomeTimelineService WriteHomeTimelineService)
+
+add_custom_target(media DEPENDS
+  mediaoperate media_run
   media_CastInfoService media_ComposeReviewService media_MovieIdService
   media_MovieInfoService media_MovieReviewService media_PageService
   media_PlotService media_RatingService media_ReviewStorageService
   media_MediaTextService media_MediaUniqueIdService media_MediaUserService
   media_UserReviewService)
+
+add_custom_target(apps DEPENDS hotel social media gomaxprocs)
+
+add_custom_target(benchmarks DEPENDS apps stressors runtimes)
 
 find_program(JAVA_EXECUTABLE java)
 find_program(MVN_EXECUTABLE mvn)
@@ -507,7 +578,7 @@ if(JAVA_EXECUTABLE AND MVN_EXECUTABLE)
     COMMAND ${MVN_EXECUTABLE} -DskipTests package
     WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}/benchmarks/train-ticket
     COMMENT "mvn package train-ticket")
-  add_dependencies(benchmarks train-ticket)
+  add_dependencies(apps train-ticket)
 else()
   message(STATUS "train-ticket not built: java and mvn are not both on PATH")
 endif()
