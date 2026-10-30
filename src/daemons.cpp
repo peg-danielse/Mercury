@@ -118,6 +118,10 @@ struct Daemon {
   ScaleState scale;
   int cpu = 0;
   int listen_fd = -1;
+  // The port Mercury bound for this daemon (0: the process binds its own sockets, or it does not listen).
+  int listen_port = 0;
+  // Set on an added replica: the original daemon_id. Empty on the original.
+  std::string replica_of;
   bool counters_done = false;
   // Extra environment for the exec'd process. Empty keeps the inherited environment.
   std::vector<std::pair<std::string, std::string>> env;  // The cgroup ring monitor_daemon fills; /llm/state reads the daemon's CPU use from it.
@@ -886,6 +890,66 @@ std::optional<std::string> stat_route(const std::string& request) {
   return http_response(200, "OK", ok_json(running), kJson);
 }
 
+// MERCURY_REUSEPORT=1: every listen socket is bound with SO_REUSEPORT, so several processes of one
+// service can accept on its port and the kernel balances new connections across them (SPEC.md "LLM interface").
+bool port_lb_enabled() {
+  const char* env = std::getenv("MERCURY_REUSEPORT");
+  return env != nullptr && env[0] != '\0' && std::strcmp(env, "0") != 0;
+}
+
+std::string reuseport_library() {
+  char buf[4096];
+  const auto n = ::readlink("/proc/self/exe", buf, sizeof(buf) - 1);
+  if (n <= 0) {
+    return {};
+  }
+  std::string path(buf, static_cast<std::size_t>(n));
+  const auto slash = path.rfind('/');
+  if (slash == std::string::npos) {
+    return {};
+  }
+  path.resize(slash);
+  path += "/libreuseport.so";
+  if (::access(path.c_str(), R_OK) != 0) {
+    return {};
+  }
+  return path;
+}
+
+void apply_port_lb_env(std::vector<std::pair<std::string, std::string>>& env, const std::string& daemon_id) {
+  const auto set = [&](const std::string& name, const std::string& value) {
+    for (auto& entry : env) {
+      if (entry.first == name) {
+        entry.second = value;
+        return;
+      }
+    }
+    env.emplace_back(name, value);
+  };
+  set("MERCURY_DAEMON_ID", daemon_id);
+  if (!port_lb_enabled()) {
+    return;
+  }
+  const auto lib = reuseport_library();
+  if (lib.empty()) {
+    static bool noted = false;
+    if (!noted) {
+      noted = true;
+      std::cout << "port_lb libreuseport.so is not beside mercury; a service that binds its own port cannot share it"
+                << std::endl;
+    }
+    return;
+  }
+  std::string preload = lib;
+  for (const auto& entry : env) {
+    if (entry.first == "LD_PRELOAD" && !entry.second.empty()) {
+      preload = lib + " " + entry.second;
+      break;
+    }
+  }
+  set("LD_PRELOAD", preload);
+}
+
 int bind_loopback(int port) {
   const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
   if (fd < 0) {
@@ -893,6 +957,9 @@ int bind_loopback(int port) {
   }
   const int reuse = 1;
   ::setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+  if (port_lb_enabled()) {
+    ::setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &reuse, sizeof(reuse));
+  }
   sockaddr_in address{};
   address.sin_family = AF_INET;
   address.sin_port = htons(static_cast<std::uint16_t>(port));
@@ -1025,6 +1092,8 @@ void kill_daemon_cgroups_raw() {
 
 std::optional<Launched> launch(const std::string& daemon_id, const std::string& exec_path, int cpu, int listen_fd,
                                const std::vector<std::pair<std::string, std::string>>& env) {
+  auto child_env = env;
+  apply_port_lb_env(child_env, daemon_id);
   const int linux_cpu = cpu;
   const auto placement = prepare_placement(daemon_id, linux_cpu);
   if (placement) {
@@ -1104,7 +1173,7 @@ std::optional<Launched> launch(const std::string& daemon_id, const std::string& 
       }
     }
     raise_nofile();
-    exec_daemon(exec_path, listen_fd, env);
+    exec_daemon(exec_path, listen_fd, child_env);
   }
 
   ::close(out_pipe[1]);
@@ -2519,7 +2588,8 @@ void monitor_daemon(const std::string& daemon_id, pid_t root) {
 }
 
 void arm_daemon(const std::string& daemon_id, const std::string& exec_path, int cpu, int listen_fd, pid_t pid,
-                int out_fd, int err_fd, std::vector<std::pair<std::string, std::string>> env) {
+                int out_fd, int err_fd, std::vector<std::pair<std::string, std::string>> env, int listen_port = 0,
+                std::string replica_of = {}, const ScaleState* like = nullptr) {
   {
     std::lock_guard lock(daemons_mu);
     Daemon created;
@@ -2529,12 +2599,25 @@ void arm_daemon(const std::string& daemon_id, const std::string& exec_path, int 
     created.running = true;
     created.cpu = cpu;
     created.listen_fd = listen_fd;
+    created.listen_port = listen_port;
+    created.replica_of = std::move(replica_of);
     created.env = std::move(env);
     created.scale.enabled = true;
     created.scale.min_cores = 1;
     created.scale.max_cores = kDefaultMaxCores;
     created.scale.policy = make_policy("saturate");
     created.scale.changed_at_ns = monotonic_ns();
+    if (like != nullptr) {
+      created.scale.enabled = like->enabled;
+      created.scale.min_cores = like->min_cores;
+      created.scale.max_cores = like->max_cores;
+      created.scale.policy = like->policy;
+      created.scale.placement = like->placement;
+      created.scale.gnn = like->gnn;
+      created.scale.gnn_tick_ms = like->gnn_tick_ms;
+      created.scale.gnn_pin = like->gnn_pin;
+      created.scale.changed_at_ns = monotonic_ns();
+    }
     if (auto* daemon = find_daemon(daemon_id)) {
       if (daemon->listen_fd >= 0 && daemon->listen_fd != listen_fd) {
         ::close(daemon->listen_fd);
@@ -2604,17 +2687,17 @@ std::optional<std::string> start_route(const std::string& request) {
   }
 
   int listen_fd = -1;
+  int listen_port = 0;
   if (const auto port_text = json_value(body, "listen_port")) {
-    int port = 0;
     try {
-      port = std::stoi(*port_text);
+      listen_port = std::stoi(*port_text);
     } catch (const std::exception&) {
       return http_response(400, "Bad Request", R"({"pid":0})", kJson);
     }
-    if (port < 1 || port > 65535) {
+    if (listen_port < 1 || listen_port > 65535) {
       return http_response(400, "Bad Request", R"({"pid":0})", kJson);
     }
-    listen_fd = bind_loopback(port);
+    listen_fd = bind_loopback(listen_port);
     if (listen_fd < 0) {
       return http_response(500, "Internal Server Error", R"({"pid":0})", kJson);
     }
@@ -2627,7 +2710,8 @@ std::optional<std::string> start_route(const std::string& request) {
     }
     return http_response(500, "Internal Server Error", R"({"pid":0})", kJson);
   }
-  arm_daemon(*daemon_id, *exec_path, cpu, listen_fd, launched->pid, launched->out_fd, launched->err_fd, env.vars);
+  arm_daemon(*daemon_id, *exec_path, cpu, listen_fd, launched->pid, launched->out_fd, launched->err_fd, env.vars,
+             listen_port);
   return http_response(200, "OK", "{\"pid\":" + std::to_string(launched->pid) + "}", kJson);
 }
 
@@ -3580,37 +3664,30 @@ std::optional<std::string> rings_route(const std::string& request) {
   return http_response(200, "OK", rings_json(resource_rings(count)), kJson);
 }
 
-std::optional<std::string> kill_route(const std::string& request) {
-  if (request_target(request) != "/kill") {
-    return std::nullopt;
-  }
-  const auto daemon_id = json_value(request_body(request), "daemon_id");
-  if (!daemon_id || daemon_id->empty()) {
-    return http_response(400, "Bad Request", ok_json(false), kJson);
-  }
-
+// Stops one daemon the way /kill does. Empty when it was not running.
+std::optional<std::int64_t> stop_daemon(const std::string& daemon_id) {
   std::unique_lock lock(daemons_mu);
-  auto* daemon = find_daemon(*daemon_id);
+  auto* daemon = find_daemon(daemon_id);
   if (daemon == nullptr) {
-    return http_response(200, "OK", ok_json(false), kJson);
+    return std::nullopt;
   }
   if (!daemon->finished) {
     const auto pid = daemon->pid;
     ::kill(pid, SIGTERM);
     if (!daemons_cv.wait_for(lock, std::chrono::seconds(2), [&] {
-          daemon = find_daemon(*daemon_id);
+          daemon = find_daemon(daemon_id);
           return daemon != nullptr && daemon->finished.has_value();
         })) {
       ::kill(pid, SIGKILL);
       daemons_cv.wait(lock, [&] {
-        daemon = find_daemon(*daemon_id);
+        daemon = find_daemon(daemon_id);
         return daemon != nullptr && daemon->finished.has_value();
       });
     }
   }
   if (daemon != nullptr && !daemon->counters_done) {
     daemons_cv.wait_for(lock, std::chrono::seconds(2), [&] {
-      daemon = find_daemon(*daemon_id);
+      daemon = find_daemon(daemon_id);
       return daemon != nullptr && daemon->counters_done;
     });
   }
@@ -3619,9 +3696,24 @@ std::optional<std::string> kill_route(const std::string& request) {
     daemon->listen_fd = -1;
   }
   if (daemon == nullptr || !daemon->finished) {
+    return std::nullopt;
+  }
+  return daemon->finished;
+}
+
+std::optional<std::string> kill_route(const std::string& request) {
+  if (request_target(request) != "/kill") {
+    return std::nullopt;
+  }
+  const auto daemon_id = json_value(request_body(request), "daemon_id");
+  if (!daemon_id || daemon_id->empty()) {
+    return http_response(400, "Bad Request", ok_json(false), kJson);
+  }
+  const auto finished = stop_daemon(*daemon_id);
+  if (!finished) {
     return http_response(200, "OK", ok_json(false), kJson);
   }
-  return http_response(200, "OK", kill_json(*daemon->finished), kJson);
+  return http_response(200, "OK", kill_json(*finished), kJson);
 }
 
 // ---- LLM interface (SDK-free): GET /llm/state and POST /llm/act (SPEC.md "LLM interface") ----
@@ -3756,6 +3848,8 @@ std::optional<std::string> llm_state_route(const std::string& request) {
     bool shift = false;
     std::shared_ptr<Ring> ring;
     std::vector<int> cpus;
+    std::string set_id;
+    bool replica = false;
   };
   std::vector<Row> rows;
   {
@@ -3763,7 +3857,8 @@ std::optional<std::string> llm_state_route(const std::string& request) {
     for (const auto& daemon : daemons) {
       if (daemon.running) {
         rows.push_back({daemon.daemon_id, daemon.exec_path, policy_label(daemon.scale), daemon.scale.throttle_active,
-                        daemon.scale.shift, daemon.ring, {}});
+                        daemon.scale.shift, daemon.ring, {},
+                        daemon.replica_of.empty() ? daemon.daemon_id : daemon.replica_of, !daemon.replica_of.empty()});
       }
     }
   }
@@ -3824,7 +3919,8 @@ std::optional<std::string> llm_state_route(const std::string& request) {
     }
   }
   std::ostringstream out;
-  out << "{\"ok\":true,\"window_ms\":" << window_ms << ",\"host\":{\"cpus\":" << host.cpus
+  out << "{\"ok\":true,\"window_ms\":" << window_ms << ",\"port_lb\":" << (port_lb_enabled() ? "true" : "false")
+      << ",\"host\":{\"cpus\":" << host.cpus
       << ",\"load\":" << json_load(groups_load(host.names, from).value_or(0)) << ",\"mercury_cpu\":" << mercury_linux_cpu
       << ",\"pool\":";
   append_ints(out, daemon_cpus);
@@ -3887,7 +3983,8 @@ std::optional<std::string> llm_state_route(const std::string& request) {
       out << (waiting->psi ? ",\"pressure\":" : ",\"runnable\":") << json_load(waiting->value);
     }
     out << ",\"policy\":\"" << row.policy
-        << "\",\"throttled\":" << (row.throttle_active ? "true" : "false") << ",\"shift\":" << (row.shift ? "true" : "false");
+        << "\",\"throttled\":" << (row.throttle_active ? "true" : "false") << ",\"shift\":" << (row.shift ? "true" : "false")
+        << ",\"set\":\"" << json_escaped(row.set_id) << "\",\"replica\":" << (row.replica ? "true" : "false");
     append_counters(out, aggregate(row.cpus));
     out << '}';
   }
@@ -3933,6 +4030,162 @@ std::optional<std::string> llm_state_route(const std::string& request) {
 
 static std::string act_error(const std::string& message) {
   return "{\"ok\":false,\"error\":\"" + message + "\"}";
+}
+
+// A service's replica set is the original plus ids "<base>-rN" (N from 2). At most this many processes.
+constexpr int kMaxReplicaSet = 8;
+
+bool replica_denied(const std::string& id, const std::string& exec_path) {
+  const auto ends = [&](const char* suffix) {
+    const auto n = std::strlen(suffix);
+    return id.size() >= n && id.compare(id.size() - n, n, suffix) == 0;
+  };
+  if (ends("loadgen") || ends("jaeger")) {
+    return true;
+  }
+  for (const char* bit : {"mongod", "redis-server", "rabbitmq", "memcached", "jaeger"}) {
+    if (exec_path.find(bit) != std::string::npos) {
+      return true;
+    }
+  }
+  return false;
+}
+
+int replica_index(const std::string& id) {
+  const auto at = id.rfind("-r");
+  if (at == std::string::npos || at == 0) {
+    return 0;
+  }
+  const auto tail = id.substr(at + 2);
+  if (tail.empty() || !std::all_of(tail.begin(), tail.end(), [](unsigned char c) { return std::isdigit(c) != 0; })) {
+    return 0;
+  }
+  try {
+    return std::stoi(tail);
+  } catch (const std::exception&) {
+    return 0;
+  }
+}
+
+// add_replica starts one more process of a running service; remove_replica stops the one added last.
+// Each process is its own daemon. With MERCURY_REUSEPORT they share the service port.
+std::optional<std::string> replica_act(const std::string& action, const std::string& daemon_id) {
+  if (!port_lb_enabled()) {
+    return http_response(409, "Conflict", act_error("port load balancing is off"), kJson);
+  }
+  if (!resources_ready()) {
+    return http_response(500, "Internal Server Error", act_error("resource groups are not available"), kJson);
+  }
+  std::string base;
+  std::string exec_path;
+  std::vector<std::pair<std::string, std::string>> env;
+  int listen_port = 0;
+  ScaleState scale;
+  std::string new_id;
+  std::string drop_id;
+  int members = 0;
+  {
+    std::lock_guard lock(daemons_mu);
+    const auto* named = find_daemon(daemon_id);
+    if (named == nullptr || (!named->running && action == "add_replica")) {
+      return http_response(400, "Bad Request", act_error("no running daemon " + daemon_id), kJson);
+    }
+    base = named->replica_of.empty() ? named->daemon_id : named->replica_of;
+    const auto* source = find_daemon(base);
+    if (source == nullptr || !source->running) {
+      if (!named->running) {
+        return http_response(400, "Bad Request", act_error("no running daemon " + daemon_id), kJson);
+      }
+      source = named;
+    }
+    if (replica_denied(base, source->exec_path)) {
+      return http_response(409, "Conflict", act_error(base + " is not replicated"), kJson);
+    }
+    for (const auto& daemon : daemons) {
+      if (daemon.running && (daemon.daemon_id == base || daemon.replica_of == base)) {
+        ++members;
+      }
+    }
+    if (action == "remove_replica") {
+      int best = 0;
+      for (const auto& daemon : daemons) {
+        if (!daemon.running || daemon.replica_of != base) {
+          continue;
+        }
+        const int index = replica_index(daemon.daemon_id);
+        if (index >= best) {
+          best = index;
+          drop_id = daemon.daemon_id;
+        }
+      }
+      if (drop_id.empty()) {
+        return http_response(409, "Conflict", act_error(base + " has no replica to stop"), kJson);
+      }
+    } else if (members >= kMaxReplicaSet) {
+      return http_response(409, "Conflict", act_error(base + " already has " + std::to_string(kMaxReplicaSet) + " processes"), kJson);
+    } else {
+      exec_path = source->exec_path;
+      env = source->env;
+      listen_port = source->listen_port;
+      scale = source->scale;
+      scale.policy = make_policy(policy_label(source->scale));
+      scale.throttle = false;
+      scale.throttle_active = false;
+      scale.shift = false;
+      scale.changed_at_ns = monotonic_ns();
+      for (int n = 2; n < 1000; ++n) {
+        const auto id = base + "-r" + std::to_string(n);
+        const auto* existing = find_daemon(id);
+        if (existing == nullptr || !existing->running) {
+          new_id = id;
+          break;
+        }
+      }
+      if (new_id.empty() || !safe_daemon_id(new_id)) {
+        return http_response(409, "Conflict", act_error("no replica id left for " + base), kJson);
+      }
+    }
+  }
+  if (action == "remove_replica") {
+    if (!stop_daemon(drop_id)) {
+      return http_response(409, "Conflict", act_error("could not stop " + drop_id), kJson);
+    }
+    const auto detail = "stopped " + drop_id + ", set " + std::to_string(members - 1);
+    note_event(drop_id, "llm", "remove_replica: " + detail);
+    std::cout << "llm daemon_id=" << drop_id << " action=remove_replica " << detail << std::endl;
+    return http_response(200, "OK",
+                         "{\"ok\":true,\"action\":\"remove_replica\",\"daemon_id\":\"" + drop_id + "\",\"detail\":\"" +
+                             json_escaped(detail) + "\"}",
+                         kJson);
+  }
+  const auto excluded = pool_exclude(base);
+  const auto cpu = pool_pick(excluded, {});
+  if (!cpu) {
+    return http_response(409, "Conflict", act_error("no CPU to place a replica of " + base), kJson);
+  }
+  int listen_fd = -1;
+  if (listen_port > 0) {
+    listen_fd = bind_loopback(listen_port);
+    if (listen_fd < 0) {
+      return http_response(409, "Conflict", act_error("cannot bind port " + std::to_string(listen_port) + " for " + new_id), kJson);
+    }
+  }
+  const auto launched = launch(new_id, exec_path, *cpu, listen_fd, env);
+  if (!launched) {
+    if (listen_fd >= 0) {
+      ::close(listen_fd);
+    }
+    return http_response(500, "Internal Server Error", act_error("failed to start " + new_id), kJson);
+  }
+  arm_daemon(new_id, exec_path, *cpu, listen_fd, launched->pid, launched->out_fd, launched->err_fd, env, listen_port, base,
+             &scale);
+  const auto detail = "started " + new_id + " on CPU " + std::to_string(*cpu) + ", set " + std::to_string(members + 1);
+  note_event(new_id, "llm", "add_replica: " + detail);
+  std::cout << "llm daemon_id=" << new_id << " action=add_replica " << detail << std::endl;
+  std::ostringstream json;
+  json << "{\"ok\":true,\"action\":\"add_replica\",\"daemon_id\":\"" << new_id << "\",\"detail\":\"" << json_escaped(detail)
+       << "\",\"cpus\":\"" << *cpu << "\",\"cores\":1}";
+  return http_response(200, "OK", json.str(), kJson);
 }
 
 // POST /llm/act {action, daemon_id, ...}: one placement step chosen by a model.
@@ -4000,6 +4253,9 @@ std::optional<std::string> llm_act_route(const std::string& request) {
   const auto daemon_id = json_value(body, "daemon_id");
   if (!action || !daemon_id || !safe_daemon_id(*daemon_id)) {
     return http_response(400, "Bad Request", act_error("action and daemon_id are required"), kJson);
+  }
+  if (*action == "add_replica" || *action == "remove_replica") {
+    return replica_act(*action, *daemon_id);
   }
   bool bad = false;
   const int count = scale_int(body, "count", 1, bad);

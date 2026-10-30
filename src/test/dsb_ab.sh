@@ -55,6 +55,7 @@ fi
 #   CPUSTAT_MS [50] sampling period, CPUSTAT_CPU [SAMPLE_CPU] the sampler's CPU (off the operator's and Mercury's).
 # SIDECAR="cmd args": started once the services are up (the load generator's cgroup exists) with --run-dir D
 #   --prefix PFX --port PORT appended, on SAMPLE_CPU, output in D/sidecar.log; SIGTERM when the operator exits.
+# MERCURY_REUSEPORT=1: passed into Mercury so several processes of one service can share its port (SPEC.md "LLM interface").
 # POOL_POLICY="l3,start=8,..." : Mercury's l3 pool from its start (MERCURY_POOL, SPEC.md "l3 pool"); autoscaling
 #   hands out CPUs only from the pool, which gains whole L3 domains when it is busy.
 # FRESH_DB=1: before every run, delete MongoDB's data directory ($B/runtime/mongodb/27017/db) and redis's dump.rdb, so
@@ -87,7 +88,7 @@ for r in $(seq 1 $REPS); do for pol in ${POLICIES:-saturate gnn}; do
     echo "external mercury pid $XPID port $PORT from $(date +%T); its log is its own output" > $D/mercury.log
   else
     ss -ltnH | grep -q ":$PORT " && { echo "port $PORT busy"; exit 1; }
-    (cd $WD && exec sudo -n env MERCURY_RINGS=$D/rings ${MODEL:+MERCURY_GNN_MODEL=$MODEL} ${POOL_POLICY:+MERCURY_POOL=$POOL_POLICY} ${CPUSTAT:+MERCURY_CPUSTAT=$CPUSTAT MERCURY_CPUSTAT_MS=${CPUSTAT_MS:-50} MERCURY_CPUSTAT_CPU=${CPUSTAT_CPU:-$SAMPLE_CPU}} $M/build/mercury $PORT 0 $POOL) > $D/mercury.log 2>&1 &
+    (cd $WD && exec sudo -n env MERCURY_RINGS=$D/rings ${MODEL:+MERCURY_GNN_MODEL=$MODEL} ${POOL_POLICY:+MERCURY_POOL=$POOL_POLICY} ${MERCURY_REUSEPORT:+MERCURY_REUSEPORT=$MERCURY_REUSEPORT} ${CPUSTAT:+MERCURY_CPUSTAT=$CPUSTAT MERCURY_CPUSTAT_MS=${CPUSTAT_MS:-50} MERCURY_CPUSTAT_CPU=${CPUSTAT_CPU:-$SAMPLE_CPU}} $M/build/mercury $PORT 0 $POOL) > $D/mercury.log 2>&1 &
     sleep 1; MPID=$(pgrep -f "^$M/build/mercury $PORT 0" | head -1)
     for i in $(seq 50); do curl -s -m 1 127.0.0.1:$PORT/ping >/dev/null && break; sleep 0.2; done
   fi

@@ -10,6 +10,8 @@ cores to daemons that need them, and stop with a one-paragraph summary.
   add_l3_domain  POST /llm/act add_l3 all free CPUs of one more L3 domain
   add_cores      POST /llm/act add_cores
   remove_cores   POST /llm/act remove_cores
+  add_replica    POST /llm/act add_replica     one more process of a service, sharing its port (--replicas)
+  remove_replica POST /llm/act remove_replica  stop the replica added last (--replicas)
 
 Division of work: the daemons' autoscaling (saturate) keeps deciding how many CPUs each daemon gets;
 the model decides where they are. Its actions leave autoscaling attached.
@@ -223,7 +225,49 @@ TOOLS.append({
     },
     "strict": True,
 })
-ACTIONS = {"move_daemon", "grow_pool", "shrink_pool", "swap_domain", "shed_route", "restore_route"}
+ACTIONS = {"move_daemon", "grow_pool", "shrink_pool", "swap_domain", "shed_route", "restore_route",
+           "add_replica", "remove_replica"}
+
+REPLICA_SYSTEM = """
+
+Horizontal scaling is on (state "port_lb"). A service can run as several processes that share its port. The kernel
+sends each new connection to one of them. Each process is its own daemon, with its own cpuset, and the autoscaler
+sizes it the way it sizes the others. A daemon id ending in -rN (N from 2) is an added replica: "set" is the
+original id and "replica" is true. The original stays.
+- add_replica starts one more process of a service, on the pool CPU the fewest daemons hold. It starts with one
+  CPU and that service's autoscaler. Use it when the service is short and another process can take new connections.
+  A set holds at most 8 processes.
+- remove_replica stops the replica added last. It never stops the original. Use it when the extra processes are idle.
+Do not replicate the load generator, jaeger, or a data store (mongod, redis, rabbitmq, memcached). A connection a
+client already holds stays on the process that accepted it; new connections are the ones that spread."""
+
+REPLICA_TOOLS: list[dict[str, Any]] = [
+    {
+        "name": "add_replica",
+        "description": (
+            "Start one more process of a service. It shares that service's port, and the kernel balances new "
+            "connections across the set. The new process is its own daemon, on one CPU, with the service's autoscaler."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {"daemon_id": {"type": "string"}, "reason": {"type": "string"}},
+            "required": ["daemon_id", "reason"],
+            "additionalProperties": False,
+        },
+        "strict": True,
+    },
+    {
+        "name": "remove_replica",
+        "description": "Stop the replica of a service that was added last. The original process keeps running.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"daemon_id": {"type": "string"}, "reason": {"type": "string"}},
+            "required": ["daemon_id", "reason"],
+            "additionalProperties": False,
+        },
+        "strict": True,
+    },
+]
 
 # --app NAME: a description of the application that opens every episode, so the model knows what its routes are, which
 # are critical, and what its daemons do. Without --app the prompt is the generic one (the hotel and social runs).
@@ -433,6 +477,10 @@ def run_tool(mercury: Mercury, name: str, args: dict[str, Any]) -> dict[str, Any
         time.sleep(wait)
         return mercury.state(args.get("since_cursor") or None)
     daemon_id = str(args.get("daemon_id", ""))
+    if name == "add_replica":
+        return mercury.act({"action": "add_replica", "daemon_id": daemon_id})
+    if name == "remove_replica":
+        return mercury.act({"action": "remove_replica", "daemon_id": daemon_id})
     if name == "move_daemon":
         body = {"action": "move", "daemon_id": daemon_id, "from": args.get("from_l3"), "to": args.get("to_l3")}
     elif name == "grow_pool":
@@ -1116,6 +1164,8 @@ def main() -> int:
     parser.add_argument("--cooldown", type=float, default=None, help="seconds after an episode before the next (default: two windows)")
     parser.add_argument("--max-episodes", type=int, default=0, help="stop the cycle after this many episodes (0: never)")
     parser.add_argument("--rehold", type=float, default=60, help="after a hold, seconds before the same trouble calls the model again")
+    parser.add_argument("--replicas", action="store_true",
+                        help="offer add_replica and remove_replica (Mercury started with MERCURY_REUSEPORT=1)")
     parser.add_argument("--shed", default="", help="optional routes the model may shed (comma-separated; empty: no shedding)")
     parser.add_argument("--shed-daemons", default="", help="daemon ids that shed them (comma-separated)")
     parser.add_argument("--critical", default="", help="critical routes: the latency summary splits critical and optional")
@@ -1143,6 +1193,10 @@ def main() -> int:
         TOOLS[:] = [t for t in TOOLS if t["name"] != "inspect"]
         SYSTEM = SYSTEM.replace("Decide from it directly; call inspect only for something it does not show.",
                                 "Decide from it directly: it is all there is to see this episode.")
+        GEMINI_TOOLS = gemini_tools()
+    if args.replicas:
+        SYSTEM += REPLICA_SYSTEM
+        TOOLS[-1:-1] = REPLICA_TOOLS  # before hold
         GEMINI_TOOLS = gemini_tools()
     shed = [r for r in args.shed.split(",") if r]
     if shed:

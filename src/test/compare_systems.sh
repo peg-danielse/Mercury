@@ -10,7 +10,8 @@
 #
 #   compare_systems.sh OUT [hotel|social|media]    (default: hotel)
 #
-# Env: SYSTEMS [saturate l3 shift l3shift degrade llm] (throttle: cut every service's CPU time instead)
+# Env: SYSTEMS [saturate l3 shift l3shift degrade llm] (throttle: cut every service's CPU time instead;
+#        horiz: the llm, plus add_replica / remove_replica, with MERCURY_REUSEPORT=1)
 #      DEGRADE_ROUTES [recommendations,restaurants,museums,cinema,review]: the optional routes degrade sheds, in order
 #      DB [fresh]: fresh deletes MongoDB's data before every run (dsb_ab.sh FRESH_DB=1; needs a DSB_ROOT of these
 #        experiments, not ~/Benchmarks); seed restores ~/.seed_<system> (dsb_ab.sh SEED)
@@ -109,7 +110,7 @@ pool_for() {  # the MERCURY_POOL of one system
     l3) echo "l3,$POOL_COMMON";;
     l3shift) echo "l3,swap=1,$POOL_COMMON";;
     shift) echo "fixed,swap=1,$POOL_COMMON";;
-    llm) echo "fixed,$POOL_COMMON${LLM_POOL_MAX:+,max=$LLM_POOL_MAX}";;
+    llm|horiz) echo "fixed,$POOL_COMMON${LLM_POOL_MAX:+,max=$LLM_POOL_MAX}";;
     llm[0-9]*) echo "fixed,$POOL_COMMON,max=${1#llm}";;
     llmdeg[0-9]*) echo "fixed,$POOL_COMMON,max=${1#llmdeg}";;
     *) echo "fixed,$POOL_COMMON";;
@@ -120,7 +121,7 @@ STOP_EPOCH=""; [ -n "${STOP_AT:-}" ] && STOP_EPOCH=$(date -d "$STOP_AT" +%s)
 # names them (default GEMINI_API_KEY; e.g. "GEMINI_API_KEY OPENROUTER_API_KEY" when LLM_MODELS mixes providers;
 # XAI_API_KEY for grok).
 LLM_KEY_VARS=${LLM_KEY_VARS:-${LLM_KEY_VAR:-GEMINI_API_KEY}}
-if [[ " $SYSTEMS " =~ \ llm(deg)?[0-9]*[-\ ] ]]; then
+if [[ " $SYSTEMS " =~ \ llm(deg)?[0-9]*[-\ ] ]] || [[ " $SYSTEMS " =~ \ horiz[\ ] ]]; then
   for v in $LLM_KEY_VARS; do [ -z "${!v:-}" ] && read -r "$v"; export "$v"; done
 fi
 # Snapshot the repository before the experiment: scripts/restore.sh SNAPSHOT restores the state it ran from.
@@ -166,12 +167,13 @@ for r in $(seq 1 $REPEATS); do for sysname in $SYSTEMS; do
     provider=""; [[ $spec == *@* ]] && { provider=${spec##*@}; spec=${spec%@*}; }
     run_llm_args="$LLM_ARGS --model $spec${provider:+ --llm $provider}${think:+ --thinking $think}"
   fi
-  SC_SYS=$sysbase; SC_LLM_SHED=""
+  SC_SYS=$sysbase; SC_LLM_SHED=""; SC_REPLICAS=""
   [[ $sysbase == llm[0-9]* ]] && SC_SYS=llm
   [[ $sysbase == llmdeg[0-9]* ]] && SC_SYS=llm SC_LLM_SHED=1
+  [[ $sysbase == horiz ]] && SC_SYS=llm SC_REPLICAS=1
   POOL_POLICY=$(pool_for $sysbase); POOL_SHIFT=""; [ -n "$POOL_POLICY" ] && POOL_SHIFT=1
   echo "$sysname pool=${POOL_POLICY:-none}" >> "$OUT/meta.txt"
-  POOL_POLICY=$POOL_POLICY SC_POOL_SHIFT=$POOL_SHIFT SC_SYSTEM=$SC_SYS SC_LLM_SHED=$SC_LLM_SHED SC_CRITICAL=$CRITICAL SC_LLM_ARGS="$run_llm_args" SC_LLMCTL_PYTHON=${LLMCTL_PYTHON:-python3} SC_DEGRADE_ROUTES=$DEGRADE_ROUTES SC_DEGRADE_DAEMONS=$DEGRADE_DAEMONS \
+  POOL_POLICY=$POOL_POLICY SC_POOL_SHIFT=$POOL_SHIFT SC_SYSTEM=$SC_SYS SC_LLM_SHED=$SC_LLM_SHED SC_REPLICAS=$SC_REPLICAS ${SC_REPLICAS:+MERCURY_REUSEPORT=1} SC_CRITICAL=$CRITICAL SC_LLM_ARGS="$run_llm_args" SC_LLMCTL_PYTHON=${LLMCTL_PYTHON:-python3} SC_DEGRADE_ROUTES=$DEGRADE_ROUTES SC_DEGRADE_DAEMONS=$DEGRADE_DAEMONS \
     SC_INTERFERE="python3 $M/src/test/interfere.py --phases $PHASES --off $OFF --on $ON --warmup $WARMUP --seed $SEED_N --actions none${MIN_USE:+ --min-use $MIN_USE}${ANT_POOL:+ --pool $ANT_POOL}${VICTIMS:+ --victims-cycle $VICTIMS}${KINDS:+ --kinds $KINDS}" \
     env $DBENV CPUSTAT=1 POLICIES=$SCALER SVC_ARGS="${SVC_ARGS:--svc-min 1 -svc-max 16}" \
     SIDECAR="python3 $M/src/test/system_sidecar.py" \

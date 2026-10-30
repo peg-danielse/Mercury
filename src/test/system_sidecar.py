@@ -14,7 +14,9 @@ least_loaded), until SIGTERM.
             in shedding order) and those daemons reject them at once (hotel frontend: 503; social: ServiceException)
   l3shift   nothing here: the pool grows (l3) and swaps domains away from neighbours (MERCURY_POOL l3,swap=1)
   llm       tools/llmctl.py in its checking cycle (Gemini by default; GEMINI_API_KEY from the environment), with
-            the run's end-to-end latency (loadgen.hist.jsonl) and Mercury's per-CPU counters as context
+            the run's end-to-end latency (loadgen.hist.jsonl) and Mercury's per-CPU counters as context.
+            SC_REPLICAS=1 adds llmctl --replicas (add_replica / remove_replica). Mercury must be started with
+            MERCURY_REUSEPORT=1 so those processes share the service port.
 
 Daemons are found through GET /llm/state every second, so late starters are attached too; the load
 generator and jaeger are left alone. Each attach is one line in RUN/system.jsonl.
@@ -88,14 +90,16 @@ def main() -> int:
                 "--critical", env("SC_CRITICAL", "")]
     if a.system == "llm":
         out = open(os.path.join(a.run_dir, "llmctl.out"), "a")
+        replicas = ["--replicas"] if env("SC_REPLICAS") == "1" else []
         children.append(subprocess.Popen(
             # SC_LLMCTL_PYTHON: an interpreter with torch for llmctl --llm distilled.
             [env("SC_LLMCTL_PYTHON", sys.executable), "-I", LLMCTL, "--url", f"http://127.0.0.1:{a.port}",
              "--log", os.path.join(a.run_dir, "llmctl.jsonl"),
              # The load generator appends one histogram line per 500 ms window to this file during the run.
-             "--latency", os.path.join(a.run_dir, "loadgen.hist.jsonl")] + shed + shlex.split(a.llm_args),
+             "--latency", os.path.join(a.run_dir, "loadgen.hist.jsonl")] + replicas + shed + shlex.split(a.llm_args),
             stdout=out, stderr=subprocess.DEVNULL))
-    emit(event="start", system=a.system, interfere=a.interfere, llm_args=a.llm_args if a.system == "llm" else None, llm_shed=shed or None,
+    emit(event="start", system=a.system, interfere=a.interfere, llm_args=a.llm_args if a.system == "llm" else None,
+         replicas=env("SC_REPLICAS") == "1", llm_shed=shed or None,
          degrade_routes=a.degrade_routes if a.system == "degrade" else None)
 
     def stop(*_) -> None:
