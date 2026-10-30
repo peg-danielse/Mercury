@@ -39,6 +39,7 @@
 #      CRITICAL [hotels,reservation]: the routes compare_report.py reports as critical; the others are optional
 #      KINDS [same,smt,l3,membw]: antagonist kinds; add load for application-load phases (the load generator's rate
 #        x1.5 or x2 for the phase). Changing KINDS changes the shuffled schedule, so compare only runs with the same KINDS
+#      MIN_USE [0.05]: cores a victim must be using, or that phase is skipped. ANT_POOL [1-60]: CPUs the antagonist may use
 #      VICTIMS [hotel: frontend,search,geo,rate,profile,reservation,mongod; social: random by CPU use]
 #      GEMINI_API_KEY (llm; read from stdin when unset and llm is in SYSTEMS; never written to disk); LLM_KEY_VAR
 #        names another key variable for other providers (OPENROUTER_API_KEY, XAI_API_KEY)
@@ -171,8 +172,8 @@ for r in $(seq 1 $REPEATS); do for sysname in $SYSTEMS; do
   POOL_POLICY=$(pool_for $sysbase); POOL_SHIFT=""; [ -n "$POOL_POLICY" ] && POOL_SHIFT=1
   echo "$sysname pool=${POOL_POLICY:-none}" >> "$OUT/meta.txt"
   POOL_POLICY=$POOL_POLICY SC_POOL_SHIFT=$POOL_SHIFT SC_SYSTEM=$SC_SYS SC_LLM_SHED=$SC_LLM_SHED SC_CRITICAL=$CRITICAL SC_LLM_ARGS="$run_llm_args" SC_LLMCTL_PYTHON=${LLMCTL_PYTHON:-python3} SC_DEGRADE_ROUTES=$DEGRADE_ROUTES SC_DEGRADE_DAEMONS=$DEGRADE_DAEMONS \
-    SC_INTERFERE="python3 $M/src/test/interfere.py --phases $PHASES --off $OFF --on $ON --warmup $WARMUP --seed $SEED_N --actions none${VICTIMS:+ --victims-cycle $VICTIMS}${KINDS:+ --kinds $KINDS}" \
-    env $DBENV CPUSTAT=1 POLICIES=$SCALER SVC_ARGS="-svc-min 1 -svc-max 16" \
+    SC_INTERFERE="python3 $M/src/test/interfere.py --phases $PHASES --off $OFF --on $ON --warmup $WARMUP --seed $SEED_N --actions none${MIN_USE:+ --min-use $MIN_USE}${ANT_POOL:+ --pool $ANT_POOL}${VICTIMS:+ --victims-cycle $VICTIMS}${KINDS:+ --kinds $KINDS}" \
+    env $DBENV CPUSTAT=1 POLICIES=$SCALER SVC_ARGS="${SVC_ARGS:--svc-min 1 -svc-max 16}" \
     SIDECAR="python3 $M/src/test/system_sidecar.py" \
     "$M/src/test/dsb_ab.sh" $SYS "$D" 1 \
     "$ENTRY -routes $ROUTE -arrivals poisson -load list -levels $LEVELS -step $LOAD_STEP $LOAD_DUR -window-ms 500 -hist -gen-min $GL -gen-max $GL" \

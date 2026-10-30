@@ -273,6 +273,21 @@ FetchContent_Declare(tacopie
   GIT_TAG 3.2.0
   GIT_SHALLOW TRUE)
 mercury_populate(tacopie)
+# select() fd_sets hold 1024 fds. MovieReviewService crosses that and FD_SET
+# writes off the end of io_service, which segfaults the poll thread.
+set(_tacopie_poll_stamp "${tacopie_SOURCE_DIR}/.mercury-use-poll")
+if(NOT EXISTS "${_tacopie_poll_stamp}")
+  execute_process(
+    COMMAND patch -p1 --forward --input "${CMAKE_CURRENT_LIST_DIR}/tacopie-use-poll.patch"
+    WORKING_DIRECTORY "${tacopie_SOURCE_DIR}"
+    RESULT_VARIABLE _tacopie_patch_rc
+    OUTPUT_VARIABLE _tacopie_patch_out
+    ERROR_VARIABLE _tacopie_patch_err)
+  if(NOT _tacopie_patch_rc EQUAL 0)
+    message(FATAL_ERROR "tacopie poll patch failed (${_tacopie_patch_rc}): ${_tacopie_patch_out} ${_tacopie_patch_err}")
+  endif()
+  file(WRITE "${_tacopie_poll_stamp}" "select replaced with poll\n")
+endif()
 
 # Boost 1.91 ships boost_system as headers only, so it is not a component.
 cmake_policy(SET CMP0167 NEW)
@@ -280,7 +295,16 @@ cmake_policy(SET CMP0169 OLD)
 find_package(Boost REQUIRED COMPONENTS log log_setup program_options chrono thread filesystem)
 find_package(OpenSSL REQUIRED)
 find_package(nlohmann_json REQUIRED)
+# /usr/local is yaml-cpp 0.6. gcc searches its headers before /usr/include, and
+# that library crashes in YAML::LoadFile on this toolchain. The system package
+# is 0.8 and matches /usr/include.
+if(EXISTS /usr/lib/cmake/yaml-cpp/yaml-cpp-config.cmake)
+  set(yaml-cpp_DIR /usr/lib/cmake/yaml-cpp CACHE PATH "system yaml-cpp" FORCE)
+endif()
 find_package(yaml-cpp REQUIRED)
+if(TARGET yaml-cpp::yaml-cpp AND NOT TARGET yaml-cpp)
+  add_library(yaml-cpp ALIAS yaml-cpp::yaml-cpp)
+endif()
 pkg_check_modules(MONGOC REQUIRED IMPORTED_TARGET mongoc2)
 pkg_check_modules(LIBMEMCACHED REQUIRED IMPORTED_TARGET libmemcached)
 pkg_check_modules(THRIFT_PC REQUIRED IMPORTED_TARGET thrift)
@@ -329,7 +353,15 @@ if(NOT EXISTS ${CMAKE_BINARY_DIR}/system-thrift/thrift)
   file(CREATE_LINK /usr/include/thrift ${CMAKE_BINARY_DIR}/system-thrift/thrift SYMBOLIC)
 endif()
 
+# gcc searches /usr/local/include before /usr/include, so the 0.6 headers win
+# unless this directory is first. It holds only yaml-cpp, not the older Thrift
+# that also lives under /usr/local/include.
+file(MAKE_DIRECTORY ${CMAKE_BINARY_DIR}/yaml-cpp-inc)
+get_filename_component(_yaml_headers "${yaml-cpp_DIR}/../../../include/yaml-cpp" ABSOLUTE)
+file(REMOVE ${CMAKE_BINARY_DIR}/yaml-cpp-inc/yaml-cpp)
+file(CREATE_LINK ${_yaml_headers} ${CMAKE_BINARY_DIR}/yaml-cpp-inc/yaml-cpp SYMBOLIC)
 target_include_directories(jaeger_client BEFORE PUBLIC
+  ${CMAKE_BINARY_DIR}/yaml-cpp-inc
   ${CMAKE_BINARY_DIR}/system-thrift
   ${jaeger_cpp_SOURCE_DIR}/src
   ${jaeger_cpp_BINARY_DIR}/src

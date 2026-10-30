@@ -9,6 +9,7 @@ libmercury_http.a
 /CMakeFiles/
 /cmake_install.cmake
 /Makefile
+/data/mercury-runs/*
 /data/dsb/
 /data/gnn/**
 !/data/gnn/*/

@@ -1,0 +1,151 @@
+--- a/includes/tacopie/network/io_service.hpp
++++ b/includes/tacopie/network/io_service.hpp
+@@ -34,6 +34,7 @@
+ #ifdef _WIN32
+ #include <Winsock2.h>
+ #else
++#include <poll.h>
+ #include <sys/select.h>
+ #endif /* _WIN32 */
+ 
+@@ -229,6 +230,14 @@
+   //!
+   std::vector<fd_t> m_polled_fds;
+ 
++#ifndef _WIN32
++  //!
++  //! poll() set. select() only has room for fds below 1024; FD_SET past that
++  //! overruns this object and crashes the poll thread.
++  //!
++  std::vector<struct pollfd> m_pollfds;
++#endif
++
+   //!
+   //! data structure given to select (list of fds to poll for read)
+   //!
+--- a/sources/network/io_service.cpp
++++ b/sources/network/io_service.cpp
+@@ -107,6 +107,7 @@
+   while (!m_should_stop) {
+     int ndfs = init_poll_fds_info();
+ 
++#ifdef _WIN32
+     //! setup timeout
+     struct timeval* timeout_ptr = NULL;
+ #ifdef __TACOPIE_TIMEOUT
+@@ -122,6 +123,20 @@
+     else {
+       __TACOPIE_LOG(debug, "poll woke up, but nothing to process");
+     }
++#else
++    (void) ndfs;
++    int timeout_ms = -1;
++#ifdef __TACOPIE_TIMEOUT
++    timeout_ms = __TACOPIE_TIMEOUT / 1000;
++#endif /* __TACOPIE_TIMEOUT */
++    __TACOPIE_LOG(debug, "polling fds");
++    if (::poll(m_pollfds.data(), static_cast<nfds_t>(m_pollfds.size()), timeout_ms) > 0) {
++      process_events();
++    }
++    else {
++      __TACOPIE_LOG(debug, "poll woke up, but nothing to process");
++    }
++#endif /* _WIN32 */
+   }
+ 
+   __TACOPIE_LOG(debug, "stop poll() worker");
+@@ -137,6 +152,7 @@
+ 
+   __TACOPIE_LOG(debug, "processing events");
+ 
++#ifdef _WIN32
+   for (const auto& fd : m_polled_fds) {
+     if (fd == m_notifier.get_read_fd() && FD_ISSET(fd, &m_rd_set)) {
+       m_notifier.clr_buffer();
+@@ -162,6 +178,36 @@
+       m_wait_for_removal_condvar.notify_all();
+     }
+   }
++#else
++  for (const auto& pfd : m_pollfds) {
++    const fd_t fd = pfd.fd;
++
++    if (fd == m_notifier.get_read_fd() && (pfd.revents & POLLIN)) {
++      m_notifier.clr_buffer();
++      continue;
++    }
++
++    auto it = m_tracked_sockets.find(fd);
++
++    if (it == m_tracked_sockets.end()) { continue; }
++
++    auto& socket = it->second;
++    const bool ready = (pfd.revents & (POLLIN | POLLOUT | POLLERR | POLLHUP | POLLNVAL)) != 0;
++
++    if (ready && (pfd.revents & (POLLIN | POLLERR | POLLHUP | POLLNVAL)) && socket.rd_callback && !socket.is_executing_rd_callback) {
++      process_rd_event(fd, socket);
++    }
++    if (ready && (pfd.revents & (POLLOUT | POLLERR | POLLHUP | POLLNVAL)) && socket.wr_callback && !socket.is_executing_wr_callback) {
++      process_wr_event(fd, socket);
++    }
++
++    if (socket.marked_for_untrack && !socket.is_executing_rd_callback && !socket.is_executing_wr_callback) {
++      __TACOPIE_LOG(debug, "untrack socket");
++      m_tracked_sockets.erase(it);
++      m_wait_for_removal_condvar.notify_all();
++    }
++  }
++#endif /* _WIN32 */
+ }
+ 
+ void
+@@ -233,6 +279,8 @@
+   std::lock_guard<std::mutex> lock(m_tracked_sockets_mtx);
+ 
+   m_polled_fds.clear();
++
++#ifdef _WIN32
+   FD_ZERO(&m_rd_set);
+   FD_ZERO(&m_wr_set);
+ 
+@@ -264,6 +312,40 @@
+   }
+ 
+   return ndfs + 1;
++#else
++  m_pollfds.clear();
++  auto watch = [&](fd_t fd, short events) {
++    if (fd < 0) { return; }
++    struct pollfd pfd;
++    pfd.fd      = static_cast<int>(fd);
++    pfd.events  = events;
++    pfd.revents = 0;
++    m_pollfds.push_back(pfd);
++    m_polled_fds.push_back(fd);
++  };
++
++  int ndfs = (int) m_notifier.get_read_fd();
++  watch(m_notifier.get_read_fd(), POLLIN);
++
++  for (const auto& socket : m_tracked_sockets) {
++    const auto& fd          = socket.first;
++    const auto& socket_info = socket.second;
++
++    short events = 0;
++    if (socket_info.rd_callback && !socket_info.is_executing_rd_callback) { events = static_cast<short>(events | POLLIN); }
++    if (socket_info.wr_callback && !socket_info.is_executing_wr_callback) { events = static_cast<short>(events | POLLOUT); }
++
++    if (events != 0 || socket_info.marked_for_untrack) {
++      watch(fd, events);
++    }
++
++    if (events != 0 && (int) fd > ndfs) {
++      ndfs = (int) fd;
++    }
++  }
++
++  return ndfs + 1;
++#endif /* _WIN32 */
+ }
+ 
+ //!

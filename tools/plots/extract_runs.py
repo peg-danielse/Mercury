@@ -74,7 +74,7 @@ def extract(run: str, bin_s: float) -> dict:
             if line.startswith("window "):  # "window 674.6 s, 16 daemons": the span alloc and used cover
                 window = float(line.split()[1])
             p = line.split()
-            if len(p) > 3 and re.match(r"^(hotel|social)-", p[0]) and not p[0].endswith("loadgen"):
+            if len(p) > 3 and re.match(r"^(hotel|social|media)-", p[0]) and not p[0].endswith("loadgen"):
                 try:
                     alloc += float(p[1]); used += float(p[2])
                 except ValueError:
