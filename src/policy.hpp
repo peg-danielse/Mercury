@@ -16,6 +16,8 @@ inline constexpr double kAddPressure = 0.10;
 inline constexpr double kRemoveMargin = 0.05;
 inline constexpr double kRemovePressure = 0.02;
 inline constexpr double kRunnableAddMargin = 0.5;
+// Horizontal scale-up uses saturate's add test. A service's replica set holds at most this many processes.
+inline constexpr int kMaxReplicaSet = 8;
 // Cgroup ring layout: task-clock, user, system, then pressure (or runnable in the fallback), then
 // cores (the cpuset size at that sample).
 inline constexpr int kCgroupTaskClock = 0;
@@ -50,6 +52,9 @@ std::optional<WindowMeans> window_means(const std::vector<Sample>& cgroup, int c
 // The add and remove tests of saturate, without the min/max limits.
 bool saturate_add_test(const WindowMeans& means, int cores, bool runnable);
 bool saturate_remove_test(const WindowMeans& means, int cores, bool runnable);
+// Add a replica on the saturate scale-up test, while the set is still under kMaxReplicaSet.
+// members is the number of running processes in the set, including the original.
+bool replica_add_test(const WindowMeans& means, int cores, bool runnable, int members);
 
 class Policy {
  public:

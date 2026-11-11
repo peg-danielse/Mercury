@@ -7,8 +7,8 @@
 #
 # social: goperate seed (register the -graph users and follows, compose N posts per user, wait for the home-timeline
 # fan-out, SAVE redis) with every service up. hotel: operate start then stop (the services insert their data on start).
-# Both apps share MongoDB's data directory (runtime/mongodb/27017/db); the directory in place is moved aside to
-# db.aside-<time> (kept), so the snapshot holds only this app's seed. The seeded state is left in place.
+# Hotel uses runtime/mongodb/27017/db. Social uses one directory per database (27040-27044). The directory in place
+# is moved aside to db.aside-<time> (kept), so the snapshot holds only this app's seed. The seeded state is left in place.
 # Env: DSB_ROOT [this repository's benchmarks/]  POOL [hosts/$(hostname -s).env, else 1-60]  PORT [8080]
 set -u
 APP=$1; SNAP=$(realpath -m "$2"); shift 2
@@ -18,6 +18,7 @@ M=$(cd "$(dirname "$(readlink -f "$0")")/../.." && pwd)
 B=${DSB_ROOT:-$M/benchmarks}
 PORT=${PORT:-8080}
 MDB=$B/runtime/mongodb/27017/db; RDIR=$B/runtime/redis/6379
+SOCIAL_MONGO_PORTS="27040 27041 27042 27043 27044"
 case $APP in
   social) WD=$B/deathstar-socialNetwork; OP=$WD/goperate/bin/goperate; FILL="-seed-posts $POSTS seed";;
   hotel)  WD=$B/deathstar-hotelReservations; OP=$WD/bin/loadgen; FILL="start";;
@@ -27,7 +28,14 @@ esac
 pgrep -x mongod >/dev/null || pgrep -x redis-server >/dev/null && { echo "mongod or redis-server is running"; exit 1; }
 ss -ltnH | grep -q ":$PORT " && { echo "port $PORT busy"; exit 1; }
 TS=$(date +%Y%m%d-%H%M%S)
-[ -d "$MDB" ] && sudo -n mv "$MDB" "$MDB.aside-$TS" && echo "moved $MDB aside to $MDB.aside-$TS"
+if [ "$APP" = social ]; then
+  for p in $SOCIAL_MONGO_PORTS; do
+    d=$B/runtime/mongodb/$p/db
+    [ -d "$d" ] && sudo -n mv "$d" "$d.aside-$TS" && echo "moved $d aside to $d.aside-$TS"
+  done
+else
+  [ -d "$MDB" ] && sudo -n mv "$MDB" "$MDB.aside-$TS" && echo "moved $MDB aside to $MDB.aside-$TS"
+fi
 [ -f "$RDIR/dump.rdb" ] && sudo -n mv "$RDIR/dump.rdb" "$RDIR/dump.rdb.aside-$TS"
 mkdir -p "$SNAP"
 (cd "$WD" && exec sudo -n env MERCURY_RINGS=$SNAP/rings $M/build/mercury $PORT 0 $POOL) > "$SNAP/mercury.log" 2>&1 &
@@ -42,7 +50,14 @@ for c in /sys/fs/cgroup/mercury/$APP-*; do [ -d "$c" ] && echo 1 | sudo -n tee "
 sleep 2; pgrep -x mongod >/dev/null && { echo "mongod still running: snapshot not taken"; exit 1; }
 [ $rc = 0 ] || { echo "fill failed (rc $rc): snapshot not taken; see $SNAP/fill.log"; exit 1; }
 sudo -n mkdir -p "$SNAP/mongodb" "$SNAP/redis"
-sudo -n rsync -a "$MDB/" "$SNAP/mongodb/"
+if [ "$APP" = social ]; then
+  for p in $SOCIAL_MONGO_PORTS; do
+    sudo -n mkdir -p "$SNAP/mongodb/$p"
+    sudo -n rsync -a "$B/runtime/mongodb/$p/db/" "$SNAP/mongodb/$p/"
+  done
+else
+  sudo -n rsync -a "$MDB/" "$SNAP/mongodb/"
+fi
 [ -f "$RDIR/dump.rdb" ] && sudo -n cp -p "$RDIR/dump.rdb" "$SNAP/redis/dump.rdb"
 sudo -n chown -R "$(id -u):$(id -g)" "$SNAP"
 cat > "$SNAP/meta.txt" <<EOF

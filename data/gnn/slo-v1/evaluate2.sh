@@ -16,7 +16,7 @@ one() {  # dir policies reps users svc
   local D=$1; guard; mkdir -p $D; echo "$(date +%T) RUN $D"
   python3 $S/stamp_windows.py $D & local WP=$!
   POLICIES="$2" SVC_ARGS="$5" $M/src/test/dsb_ab.sh $B $D $3 "$4" > $D/driver.log 2>&1
-  echo "$(date +%T) END $D rc=$? redis: $(ls ~/Benchmarks/runtime/redis/6379/ | head -2)"
+  echo "$(date +%T) END $D rc=$? redis: $(ls ~/Mercury/benchmarks/runtime/redis/6379/ | head -2)"
   touch $D/.stamp_stop; wait $WP; rm -f $D/.stamp_stop
 }
 P="saturate gnn-nopin@$M/models/gnn_v3.json gnn-nopin@$M/models/gnn_slo_v1.json"

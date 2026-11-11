@@ -59,6 +59,28 @@ void expect_decision(const OccupancyWindow& window, Decision want, const std::st
   check(got == want, label + ": want " + name_of(want) + " got " + name_of(got));
 }
 
+void test_replica_add() {
+  const auto hot = window_means(synthetic(4, 0.85, 0.10).cgroup, 4, kScaleWindow, false);
+  check(hot && replica_add_test(*hot, 4, false, 1), "replica add lines are inclusive");
+  const auto low = window_means(synthetic(4, 0.84, 0.50).cgroup, 4, kScaleWindow, false);
+  check(low && !replica_add_test(*low, 4, false, 1), "occupancy below 0.85 does not add a replica");
+  const auto quiet = window_means(synthetic(4, 0.90, 0.09).cgroup, 4, kScaleWindow, false);
+  check(quiet && !replica_add_test(*quiet, 4, false, 1), "pressure below 0.10 does not add a replica");
+  check(hot && replica_add_test(*hot, 4, false, kMaxReplicaSet - 1), "seven processes can take one more");
+  check(hot && !replica_add_test(*hot, 4, false, kMaxReplicaSet), "a full set does not add a replica");
+  check(hot && !replica_add_test(*hot, 4, false, 0), "an empty set does not add a replica");
+  // At the cpuset cap saturate holds, and the replica test still passes: the cap is the set size.
+  auto capped = synthetic(4, 1.0, 1.0);
+  capped.max_cores = 4;
+  expect_decision(capped, Decision::Hold, "at max no core is added");
+  const auto capped_means = window_means(capped.cgroup, 4, kScaleWindow, false);
+  check(capped_means && replica_add_test(*capped_means, 4, false, 1), "at max cores a replica is still added");
+  const auto runnable_add = window_means(synthetic(2, 1.0, 3, kScaleWindow + 1, true).cgroup, 2, kScaleWindow, true);
+  check(runnable_add && replica_add_test(*runnable_add, 2, true, 1), "runnable cores+0.5 adds a replica");
+  const auto runnable_hold = window_means(synthetic(2, 1.0, 2, kScaleWindow + 1, true).cgroup, 2, kScaleWindow, true);
+  check(runnable_hold && !replica_add_test(*runnable_hold, 2, true, 1), "runnable at the core count holds");
+}
+
 void test_decide_synthetic() {
   expect_decision(synthetic(1, 1.0, 1.0, kScaleWindow), Decision::Hold, "64 samples is not a full window");
   expect_decision(synthetic(1, 1.0, 1.0), Decision::AddCore, "6 threads on 1 cpu adds");
@@ -385,6 +407,7 @@ void test_pool_swap() {
 }
 
 int main() {
+  test_replica_add();
   test_decide_synthetic();
   test_decide_traces();
   test_l3();

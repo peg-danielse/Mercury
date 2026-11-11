@@ -175,13 +175,16 @@ def main():
     if not args.show:
         matplotlib.use("Agg")
     import matplotlib.pyplot as plt
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    from ieee_style import FULL, apply as apply_ieee
+    print(f"figure font: {apply_ieee()}")
 
     n = len(series) + 1
-    fig, axes = plt.subplots(n, 1, figsize=(14, 1.9 * n + 1), sharex=True, squeeze=False)
+    fig, axes = plt.subplots(n, 1, figsize=(FULL, 1.35 * n + 0.6), sharex=True, squeeze=False)
     axes = axes[:, 0]
     secs = (grid - t_from) / 1e9
     ax = axes[0]
-    ax.plot(secs, smooth(total_used, args.smooth), lw=0.6, color="C0", label="used (sum)")
+    ax.plot(secs, smooth(total_used, args.smooth), lw=1.0, color="C0", label="used (sum)")
     if has_cores:
         ax.step(secs, total_cores, where="post", lw=1.2, color="k", label="cores (sum of cpusets)")
     ax.set_ylabel("all daemons\ncores")
@@ -194,8 +197,8 @@ def main():
             twin.fill_between(x, 0, smooth(pressure, args.smooth), step="post", color="C3", alpha=0.25, lw=0)
             twin.set_ylim(0, 1)
             twin.set_yticks([0, 1])
-            twin.tick_params(labelsize=7, colors="C3")
-        ax.plot(x, smooth(used, args.smooth), lw=0.6, color="C0")
+            twin.tick_params(labelsize=8, colors="C3")
+        ax.plot(x, smooth(used, args.smooth), lw=1.0, color="C0")
         if cores is not None:
             ax.step(x, cores, where="post", lw=1.2, color="k")
         ax.set_ylabel(d, rotation=0, ha="right", va="center", fontsize=8)
@@ -203,11 +206,16 @@ def main():
         ax.grid(alpha=0.3)
     axes[-1].set_xlabel("seconds")
     label = f"10 ms samples, moving mean {args.smooth:g} ms" if args.smooth else "raw 10 ms samples"
-    fig.suptitle(f"cores allocated (black) vs used (blue), pressure share (red, right axis): {label}", fontsize=10)
+    fig.suptitle(f"cores allocated (black) vs used (blue), pressure share (red, right axis): {label}", fontsize=8)
     fig.tight_layout(rect=(0, 0, 1, 0.985))
     out = args.out or os.path.join(args.rings_dir, "alloc_vs_use.png")
-    fig.savefig(out, dpi=120)
+    fig.savefig(out)
     print(f"wrote {out}")
+    stem, ext = os.path.splitext(out)
+    twin = stem + (".pdf" if ext.lower() == ".png" else ".png")
+    if twin != out:
+        fig.savefig(twin)
+        print(f"wrote {twin}")
     if args.show:
         plt.show()
 

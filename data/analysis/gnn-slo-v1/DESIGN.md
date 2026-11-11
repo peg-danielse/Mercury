@@ -20,7 +20,7 @@ The operator ramps users 1, 2, 4, ..., max, ..., 1 (4 x 1 s windows per level).
   and the default 1024 for both.
 
 ## Jaeger
-Jaeger v2.22.0 all-in-one (`~/Benchmarks/jaeger`, operator patches applied to the working trees), flags
+Jaeger v2.22.0 all-in-one (`~/Mercury/benchmarks/runtime/jaeger`, operator patches applied to the working trees), flags
 `-jaeger -jaeger-port-offset 20000 -jaeger-cpus 62 -trace-sample 0.02` (bare mode, 2 % probabilistic sampling, ports
 24317-36686 on 127.0.0.1, none in 8080/18180-18199; CPU 62 is outside the Mercury pool 1-60, shared with threadtrace helpers).
 Used in every sweep and evaluation run for every policy, so its overhead is the same everywhere. Per window the operator

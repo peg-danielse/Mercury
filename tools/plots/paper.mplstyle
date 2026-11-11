@@ -1,0 +1,39 @@
+# IEEE Computer Society Transactions art, including Transactions on Services Computing.
+# Figure text is 8 pt. ieee_style.apply then loads latexify: Computer Modern Roman
+# through usetex. This file is the base that latexify overrides.
+# Canvas width is 3.39 in (single) or 6.90 in (double). Height follows the content, at most 8.0 in.
+# Do not draw larger and scale in LaTeX. Do not use a tight bbox: it changes the PDF page size.
+# pdf.fonttype 42 embeds TrueType. Data curves are at least 1 pt (lines.linewidth).
+
+font.family: sans-serif
+font.sans-serif: Helvetica, Arial, Liberation Sans
+font.size: 8
+axes.labelsize: 8
+axes.titlesize: 8
+xtick.labelsize: 8
+ytick.labelsize: 8
+legend.fontsize: 8
+
+pdf.fonttype: 42
+ps.fonttype: 42
+savefig.dpi: 300
+# The page is the figure size. Tight cropping changes that size, and LaTeX then rescales the type.
+savefig.bbox: standard
+savefig.pad_inches: 0.02
+figure.facecolor: white
+axes.facecolor: white
+savefig.facecolor: white
+
+axes.linewidth: 0.6
+lines.linewidth: 1.0
+xtick.major.width: 0.6
+ytick.major.width: 0.6
+
+axes.spines.top: False
+axes.spines.right: False
+axes.grid: False
+axes.axisbelow: True
+grid.linewidth: 0.4
+
+legend.frameon: False
+legend.handlelength: 1.2

@@ -20,7 +20,7 @@ run() {  # bench name policies users svc
   python3 $S/stamp_windows.py $OUT/$PHASE-$B-$N & WP=$!
   POLICIES="$P" SVC_ARGS="$SV" TRACEALL=$T TRACE_SLOW="$SL" $M/src/test/dsb_ab.sh $B $OUT/$PHASE-$B-$N 1 "$U"
   touch $OUT/$PHASE-$B-$N/.stamp_stop; wait $WP; rm -f $OUT/$PHASE-$B-$N/.stamp_stop
-  ls ~/Benchmarks/runtime/redis/6379/ | head -2
+  ls ~/Mercury/benchmarks/runtime/redis/6379/ | head -2
 }
 U=""; [ "$PHASE" = train ] && U="-users 768"
 for B in hotel social; do

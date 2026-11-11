@@ -100,6 +100,10 @@ struct ScaleState {
   double shift_above = kShiftAbove;
   int shift_window_ms = kShiftWindowMs;
   std::int64_t shift_at_ns = 0;
+  // replicas (SPEC.md "Horizontal scaling"): the original adds a process on saturate's add test.
+  // replica_at_ns is the last replica add, so the next one waits for a fresh window.
+  bool replicas = false;
+  std::int64_t replica_at_ns = 0;
 };
 
 }  // namespace
@@ -717,9 +721,8 @@ std::string node_list(const std::vector<int>& nodes) {
   return out;
 }
 
-// cpuset.mems follows cpuset.cpus: the NUMA nodes whose CPUs the cpuset uses.
-// Order keeps every intermediate state valid: mems grows to old|new before
-// cpus is written, and shrinks to new only after.
+// cpuset.mems only grows. A shrink migrates the daemon's pages inside the write,
+// and that write holds the cgroup lock the accept thread needs for the next act.
 const std::vector<std::pair<int, std::vector<int>>>& numa_node_cpus() {
   static const std::vector<std::pair<int, std::vector<int>>> nodes = [] {
     std::vector<std::pair<int, std::vector<int>>> out;
@@ -754,27 +757,45 @@ std::vector<int> nodes_for_cpus(const std::vector<int>& cpus) {
 }
 
 bool write_cpus_and_mems(const std::string& dir, const std::string& cpus_spec) {
+  const auto started = std::chrono::steady_clock::now();
   const auto want = parse_cpuset(trimmed(cpus_spec));
   const auto nodes = want ? nodes_for_cpus(*want) : std::vector<int>{};
+  std::string mems_note = "kept";
+  bool ok = true;
   if (nodes.empty()) {
-    return write_sysfs(dir + "/cpuset.cpus", cpus_spec);
+    ok = write_sysfs(dir + "/cpuset.cpus", cpus_spec);
+  } else {
+    const auto old = parse_cpuset(trimmed(read_file(dir + "/cpuset.mems")));
+    bool covers = old.has_value();
+    if (covers) {
+      for (const int node : nodes) {
+        if (std::find(old->begin(), old->end(), node) == old->end()) {
+          covers = false;
+          break;
+        }
+      }
+    }
+    // Widen before cpus, so the new CPU's node is allowed. Never shrink: pages stay
+    // where they were allocated, and the reply does not wait for migration.
+    if (!covers) {
+      std::vector<int> grown = nodes;
+      if (old) {
+        grown.insert(grown.end(), old->begin(), old->end());
+        std::sort(grown.begin(), grown.end());
+        grown.erase(std::unique(grown.begin(), grown.end()), grown.end());
+      }
+      mems_note = "widen " + node_list(grown);
+      if (!write_sysfs(dir + "/cpuset.mems", node_list(grown))) {
+        std::cerr << "cpuset.mems " << dir << " grow to " << node_list(grown) << " failed" << std::endl;
+      }
+    }
+    ok = write_sysfs(dir + "/cpuset.cpus", cpus_spec);
   }
-  std::vector<int> grown = nodes;
-  if (const auto old = parse_cpuset(trimmed(read_file(dir + "/cpuset.mems")))) {
-    grown.insert(grown.end(), old->begin(), old->end());
-    std::sort(grown.begin(), grown.end());
-    grown.erase(std::unique(grown.begin(), grown.end()), grown.end());
+  const auto us = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - started).count();
+  if (!ok || mems_note != "kept" || us >= 1000) {
+    std::cout << "cpuset write dir=" << dir << " cpus=" << cpus_spec << " mems=" << mems_note << " us=" << us << std::endl;
   }
-  if (!write_sysfs(dir + "/cpuset.mems", node_list(grown))) {
-    std::cerr << "cpuset.mems " << dir << " grow to " << node_list(grown) << " failed" << std::endl;
-  }
-  if (!write_sysfs(dir + "/cpuset.cpus", cpus_spec)) {
-    return false;
-  }
-  if (grown != nodes && !write_sysfs(dir + "/cpuset.mems", node_list(nodes))) {
-    std::cerr << "cpuset.mems " << dir << " shrink to " << node_list(nodes) << " failed" << std::endl;
-  }
-  return true;
+  return ok;
 }
 
 // The cgroup is restricted before the new process is allowed to widen its mask.
@@ -895,6 +916,12 @@ std::optional<std::string> stat_route(const std::string& request) {
 bool port_lb_enabled() {
   const char* env = std::getenv("MERCURY_REUSEPORT");
   return env != nullptr && env[0] != '\0' && std::strcmp(env, "0") != 0;
+}
+
+// MERCURY_HORIZ=1: every daemon starts with replica scale-up on (the saturate add test). /scale can change it.
+bool horiz_replicas() {
+  const char* env = std::getenv("MERCURY_HORIZ");
+  return env != nullptr && std::strcmp(env, "1") == 0;
 }
 
 std::string reuseport_library() {
@@ -1276,8 +1303,23 @@ bool add_core(const std::string& daemon_id, int max_cores, int& cores_after, std
   if (!have || have->empty() || static_cast<int>(have->size()) >= max_cores) {
     return false;
   }
-  // Another daemon may already run on the CPU placement returns. With an l3 pool, only pool CPUs are offered.
-  auto next = request_cpu_for(placement, *have, pool_exclude(daemon_id));
+  // Stay on a node the daemon already occupies when one of its CPUs is free. A new node
+  // widens cpuset.mems; the cpus-only write is the fast path. Fall back when the node is full.
+  auto exclude = pool_exclude(daemon_id);
+  std::optional<int> next;
+  if (const auto home = nodes_for_cpus(*have); !home.empty()) {
+    auto stay = exclude;
+    for (const int cpu : allocatable_cpus()) {
+      const auto node = nodes_for_cpus({cpu});
+      if (node.empty() || std::find(home.begin(), home.end(), node.front()) == home.end()) {
+        stay.push_back(cpu);
+      }
+    }
+    next = request_cpu_for(placement, *have, stay);
+  }
+  if (!next) {
+    next = request_cpu_for(placement, *have, exclude);
+  }
   if (!next) {
     return false;
   }
@@ -2276,6 +2318,11 @@ std::uint64_t usec_delta_ns(std::uint64_t after, std::uint64_t before) {
 
 std::string ring_archive_dir() { return rings_dir(); }
 
+bool replica_denied(const std::string& id, const std::string& exec_path);
+std::optional<std::string> replica_act(const std::string& action, const std::string& daemon_id,
+                                       const std::string& source = "llm");
+void consider_replica(const std::string& daemon_id, const std::shared_ptr<Ring>& ring, int cores, bool runnable);
+
 void monitor_daemon(const std::string& daemon_id, pid_t root) {
   const auto cgroup = "/sys/fs/cgroup/mercury/" + daemon_id;
   CgroupFile cpu_stat_file(cgroup + "/cpu.stat");
@@ -2555,6 +2602,9 @@ void monitor_daemon(const std::string& daemon_id, pid_t root) {
           window.cgroup.push_back(sample);
         }
       }
+      if (scale.replicas) {
+        consider_replica(daemon_id, daemon_ring, window.cores, window.runnable);
+      }
       const int before = window.cores;
       const auto decision = scale.policy->decide(window);
       if (decision == Decision::Hold) {
@@ -2606,6 +2656,7 @@ void arm_daemon(const std::string& daemon_id, const std::string& exec_path, int 
     created.scale.min_cores = 1;
     created.scale.max_cores = kDefaultMaxCores;
     created.scale.policy = make_policy("saturate");
+    created.scale.replicas = horiz_replicas();
     created.scale.changed_at_ns = monotonic_ns();
     if (like != nullptr) {
       created.scale.enabled = like->enabled;
@@ -2616,6 +2667,7 @@ void arm_daemon(const std::string& daemon_id, const std::string& exec_path, int 
       created.scale.gnn = like->gnn;
       created.scale.gnn_tick_ms = like->gnn_tick_ms;
       created.scale.gnn_pin = like->gnn_pin;
+      created.scale.replicas = like->replicas;
       created.scale.changed_at_ns = monotonic_ns();
     }
     if (auto* daemon = find_daemon(daemon_id)) {
@@ -2948,6 +3000,17 @@ std::optional<std::string> scale_route(const std::string& request) {
   const int tick_ms = scale_int(body, "tick_ms", 10, bad);
   const auto pin_text = json_value(body, "pin");
   const bool gnn_pin = !(pin_text && (*pin_text == "false" || *pin_text == "0"));
+  const auto replicas_text = json_value(body, "replicas");
+  std::optional<bool> replicas;
+  if (replicas_text) {
+    if (*replicas_text == "true" || *replicas_text == "1") {
+      replicas = true;
+    } else if (*replicas_text == "false" || *replicas_text == "0") {
+      replicas = false;
+    } else {
+      return http_response(400, "Bad Request", ok_json(false), kJson);
+    }
+  }
   const auto policy_name = json_value(body, "policy");
   const std::string name = policy_name ? *policy_name : "saturate";
   // placement is optional; omitted keeps the daemon's current placement.
@@ -2982,6 +3045,7 @@ std::optional<std::string> scale_route(const std::string& request) {
     return http_response(500, "Internal Server Error", ok_json(false), kJson);
   }
 
+  bool replicas_on = false;
   {
     std::lock_guard lock(daemons_mu);
     auto* daemon = find_daemon(*daemon_id);
@@ -3000,6 +3064,10 @@ std::optional<std::string> scale_route(const std::string& request) {
     } else if (is_gnn) {
       daemon->scale.placement = CpuPlacement::LeastLoaded;  // gnn defaults to the least_loaded hand-out policy
     }
+    if (replicas) {
+      daemon->scale.replicas = *replicas;
+    }
+    replicas_on = daemon->scale.replicas;
     placement = daemon->scale.placement;
   }
   // Written after the policy is detached above, so the monitor no longer adds or removes cores.
@@ -3026,7 +3094,8 @@ std::optional<std::string> scale_route(const std::string& request) {
             << resource_choice(least_loaded(ResourceLevel::L3)) << " core "
             << resource_choice(least_loaded(ResourceLevel::Core)) << std::endl;
   auto json = scale_json(min_cores, max_cores, cpuset_cores(*daemon_id), 0);
-  json.insert(json.size() - 1, std::string(",\"placement\":\"") + placement_name(*placement) + "\",\"policy\":\"" + name + "\"" +
+  json.insert(json.size() - 1, std::string(",\"placement\":\"") + placement_name(*placement) + "\",\"policy\":\"" + name +
+                                   "\",\"replicas\":" + (replicas_on ? "true" : "false") +
                                    (is_gnn ? ",\"tick_ms\":" + std::to_string((tick_ms / kSampleMs) * kSampleMs) + ",\"pin\":" + (gnn_pin ? "true" : "false") : std::string()));
   return http_response(200, "OK", json, kJson);
 }
@@ -3846,6 +3915,7 @@ std::optional<std::string> llm_state_route(const std::string& request) {
     std::string policy;
     bool throttle_active = false;
     bool shift = false;
+    bool replicas = false;
     std::shared_ptr<Ring> ring;
     std::vector<int> cpus;
     std::string set_id;
@@ -3857,7 +3927,7 @@ std::optional<std::string> llm_state_route(const std::string& request) {
     for (const auto& daemon : daemons) {
       if (daemon.running) {
         rows.push_back({daemon.daemon_id, daemon.exec_path, policy_label(daemon.scale), daemon.scale.throttle_active,
-                        daemon.scale.shift, daemon.ring, {},
+                        daemon.scale.shift, daemon.scale.replicas, daemon.ring, {},
                         daemon.replica_of.empty() ? daemon.daemon_id : daemon.replica_of, !daemon.replica_of.empty()});
       }
     }
@@ -3984,6 +4054,7 @@ std::optional<std::string> llm_state_route(const std::string& request) {
     }
     out << ",\"policy\":\"" << row.policy
         << "\",\"throttled\":" << (row.throttle_active ? "true" : "false") << ",\"shift\":" << (row.shift ? "true" : "false")
+        << ",\"replicas\":" << (row.replicas ? "true" : "false")
         << ",\"set\":\"" << json_escaped(row.set_id) << "\",\"replica\":" << (row.replica ? "true" : "false");
     append_counters(out, aggregate(row.cpus));
     out << '}';
@@ -4032,9 +4103,7 @@ static std::string act_error(const std::string& message) {
   return "{\"ok\":false,\"error\":\"" + message + "\"}";
 }
 
-// A service's replica set is the original plus ids "<base>-rN" (N from 2). At most this many processes.
-constexpr int kMaxReplicaSet = 8;
-
+// A service's replica set is the original plus ids "<base>-rN" (N from 2). At most kMaxReplicaSet processes.
 bool replica_denied(const std::string& id, const std::string& exec_path) {
   const auto ends = [&](const char* suffix) {
     const auto n = std::strlen(suffix);
@@ -4069,7 +4138,8 @@ int replica_index(const std::string& id) {
 
 // add_replica starts one more process of a running service; remove_replica stops the one added last.
 // Each process is its own daemon. With MERCURY_REUSEPORT they share the service port.
-std::optional<std::string> replica_act(const std::string& action, const std::string& daemon_id) {
+std::optional<std::string> replica_act(const std::string& action, const std::string& daemon_id,
+                                       const std::string& source) {
   if (!port_lb_enabled()) {
     return http_response(409, "Conflict", act_error("port load balancing is off"), kJson);
   }
@@ -4151,8 +4221,8 @@ std::optional<std::string> replica_act(const std::string& action, const std::str
       return http_response(409, "Conflict", act_error("could not stop " + drop_id), kJson);
     }
     const auto detail = "stopped " + drop_id + ", set " + std::to_string(members - 1);
-    note_event(drop_id, "llm", "remove_replica: " + detail);
-    std::cout << "llm daemon_id=" << drop_id << " action=remove_replica " << detail << std::endl;
+    note_event(drop_id, source, "remove_replica: " + detail);
+    std::cout << source << " daemon_id=" << drop_id << " action=remove_replica " << detail << std::endl;
     return http_response(200, "OK",
                          "{\"ok\":true,\"action\":\"remove_replica\",\"daemon_id\":\"" + drop_id + "\",\"detail\":\"" +
                              json_escaped(detail) + "\"}",
@@ -4180,12 +4250,66 @@ std::optional<std::string> replica_act(const std::string& action, const std::str
   arm_daemon(new_id, exec_path, *cpu, listen_fd, launched->pid, launched->out_fd, launched->err_fd, env, listen_port, base,
              &scale);
   const auto detail = "started " + new_id + " on CPU " + std::to_string(*cpu) + ", set " + std::to_string(members + 1);
-  note_event(new_id, "llm", "add_replica: " + detail);
-  std::cout << "llm daemon_id=" << new_id << " action=add_replica " << detail << std::endl;
+  note_event(new_id, source, "add_replica: " + detail);
+  std::cout << source << " daemon_id=" << new_id << " action=add_replica " << detail << std::endl;
   std::ostringstream json;
   json << "{\"ok\":true,\"action\":\"add_replica\",\"daemon_id\":\"" << new_id << "\",\"detail\":\"" << json_escaped(detail)
        << "\",\"cpus\":\"" << *cpu << "\",\"cores\":1}";
   return http_response(200, "OK", json.str(), kJson);
+}
+
+// The original daemon adds one replica when its own window passes saturate's scale-up test.
+// Samples must be newer than the last replica add, so one replica leaves per window. A replica does not add another.
+void consider_replica(const std::string& daemon_id, const std::shared_ptr<Ring>& ring, int cores, bool runnable) {
+  if (!port_lb_enabled() || cores < 1 || !ring) {
+    return;
+  }
+  std::string base;
+  std::int64_t replica_at = 0;
+  int members = 0;
+  {
+    std::lock_guard lock(daemons_mu);
+    const auto* daemon = find_daemon(daemon_id);
+    if (daemon == nullptr || !daemon->running || !daemon->scale.replicas || !daemon->replica_of.empty()) {
+      return;
+    }
+    if (replica_denied(daemon->daemon_id, daemon->exec_path)) {
+      return;
+    }
+    base = daemon->daemon_id;
+    replica_at = daemon->scale.replica_at_ns;
+    for (const auto& other : daemons) {
+      if (other.running && (other.daemon_id == base || other.replica_of == base)) {
+        ++members;
+      }
+    }
+  }
+  std::vector<Sample> samples;
+  for (const auto& sample : ring->recent(static_cast<std::size_t>(kScaleWindow) + 1)) {
+    if (sample.timestamp_ns > replica_at) {
+      samples.push_back(sample);
+    }
+  }
+  const auto means = window_means(samples, cores, static_cast<std::size_t>(kScaleWindow), runnable);
+  if (!means || !replica_add_test(*means, cores, runnable, members)) {
+    return;
+  }
+  const auto claimed = monotonic_ns();
+  {
+    std::lock_guard lock(daemons_mu);
+    auto* daemon = find_daemon(base);
+    if (daemon == nullptr || !daemon->running || !daemon->scale.replicas || daemon->scale.replica_at_ns != replica_at) {
+      return;
+    }
+    daemon->scale.replica_at_ns = claimed;
+  }
+  const auto response = replica_act("add_replica", base, "replica");
+  if (!response || response->find("\"ok\":true") == std::string::npos) {
+    std::lock_guard lock(daemons_mu);
+    if (auto* daemon = find_daemon(base); daemon != nullptr && daemon->scale.replica_at_ns == claimed) {
+      daemon->scale.replica_at_ns = replica_at;
+    }
+  }
 }
 
 // POST /llm/act {action, daemon_id, ...}: one placement step chosen by a model.
@@ -4203,6 +4327,7 @@ std::optional<std::string> llm_act_route(const std::string& request) {
   const auto action = json_value(body, "action");
   // Pool steps act on the capacity, not on one daemon.
   if (action && (*action == "grow_pool" || *action == "shrink_pool" || *action == "swap_domain")) {
+    const auto started = std::chrono::steady_clock::now();
     std::string detail;
     bool ok = false;
     if (*action == "grow_pool") {
@@ -4220,7 +4345,8 @@ std::optional<std::string> llm_act_route(const std::string& request) {
       return http_response(409, "Conflict", act_error(json_escaped(detail)), kJson);
     }
     note_event("", "llm", *action + ": " + detail);
-    std::cout << "llm action=" << *action << " " << detail << std::endl;
+    const auto us = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - started).count();
+    std::cout << "llm action=" << *action << " " << detail << " us=" << us << std::endl;
     return http_response(200, "OK", "{\"ok\":true,\"action\":\"" + *action + "\",\"detail\":\"" + json_escaped(detail) + "\"}",
                          kJson);
   }
@@ -4279,6 +4405,7 @@ std::optional<std::string> llm_act_route(const std::string& request) {
     // The daemon's autoscaling stays attached: it decides how many CPUs, the model where they are.
     placement = daemon->scale.placement;
   }
+  const auto started = std::chrono::steady_clock::now();
   std::lock_guard place(l3_mu);
   auto have = cpuset_of(*daemon_id);
   if (have.empty()) {
@@ -4380,8 +4507,9 @@ std::optional<std::string> llm_act_route(const std::string& request) {
     }
   }
   note_event(*daemon_id, "llm", *action + ": " + detail + ", cpus " + before + " -> " + spec);
+  const auto us = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - started).count();
   std::cout << "llm daemon_id=" << *daemon_id << " action=" << *action << " " << detail << " cpus " << before << " -> " << spec
-            << std::endl;
+            << " us=" << us << std::endl;
   std::ostringstream json;
   json << "{\"ok\":true,\"action\":\"" << *action << "\",\"daemon_id\":\"" << *daemon_id << "\",\"detail\":\"" << detail
        << "\",\"before\":\"" << before << "\",\"cpus\":\"" << spec << "\",\"cores\":" << after << "}";

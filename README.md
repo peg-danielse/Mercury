@@ -48,7 +48,7 @@ src/test/compare_systems.sh OUT hotel|social|media
 
 `REPEATS=3` runs every system three times (`OUT/<system>/r1` … `r3`). `STOP_AT="13:00 tomorrow"` starts no run that would finish after that time. `NOPOOL=1` runs without a CPU pool. The header of `src/test/compare_systems.sh` lists the other knobs (`RATE`, `PHASES`, `POOL_START`, `ROUTE`, `LLM_MODELS`).
 
-Social restores a seed snapshot (the graph and posts). Build it once, record the path, then start the comparison. Redis must be installed.
+Social restores a seed snapshot (the graph and posts), one MongoDB directory per database (`mongodb/27040` through `mongodb/27044`). Build it once, record the path, then start the comparison. Redis must be installed. A seed that is still a single data directory is split by `src/test/social_mongo_split.sh`.
 
 ```
 src/test/dsb_seed.sh social "$HOME/mercury-runs/seed-social"
@@ -56,4 +56,4 @@ echo "$HOME/mercury-runs/seed-social" > ~/.seed_social
 src/test/compare_systems.sh "$HOME/mercury-runs/social" social
 ```
 
-Media restores `~/.seed_media` (or `MEDIA_SEED`), a snapshot of MongoDB on port 27018 and `dump.rdb`. With the stack stopped, `benchmarks/deathstar-mediaMicroservices/scripts/snapshot_seed.sh OUT` writes one. Media has no frontend, so leave `degrade` out of `SYSTEMS`.
+Media restores `~/.seed_media` (or `MEDIA_SEED`): one MongoDB directory per database (`mongodb/27018` through `mongodb/27026`, skipping 27023) and `dump.rdb`. With the stack stopped, `benchmarks/deathstar-mediaMicroservices/scripts/snapshot_seed.sh OUT` writes one. A seed that is still a single data directory is split by `src/test/media_mongo_split.sh`. Media has no frontend, so leave `degrade` out of `SYSTEMS`.

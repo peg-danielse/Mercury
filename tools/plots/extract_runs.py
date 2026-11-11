@@ -13,7 +13,11 @@ timestamps share CLOCK_MONOTONIC):
   series    per route, bin_s-second bins: start time, sent, errors, histogram
   pool      [time, CPUs] steps of the pool's size (from Mercury's timestamped pool lines); swaps and degrade steps
   cpu       core-seconds allocated to and used by the application's daemons (alloc_vs_use.txt), load generator excluded
-  llm_*     the llm controller's episodes and the episodes its model API refused (llmctl.out "... API error")
+  alloc     the same allocation over time, from sample.jsonl: per bin_s bin, core-seconds held by the
+            application's daemons (load generator excluded). The timeline cumulates it
+  llm_*     the llm controller's episodes, the episodes its model API refused (llmctl.out "... API error"),
+            its tool calls by name (llm_actions; a call Mercury refused still counts: it is the model's
+            decision) and llm_span_s, the seconds from the first llmctl event to the last
 Stdlib only: it runs on the experiment host, which has no matplotlib.
 """
 
@@ -79,10 +83,9 @@ def extract(run: str, bin_s: float) -> dict:
                     alloc += float(p[1]); used += float(p[2])
                 except ValueError:
                     pass
-    episodes = api_errors = 0
-    ctl = os.path.join(run, "llmctl.jsonl")
-    if os.path.exists(ctl):
-        episodes = sum(1 for l in open(ctl) if '"event": "episode"' in l)
+    held = alloc_bins(run, t0, bin_s)
+    episodes, actions, span = llm_log(run)
+    api_errors = 0
     out = os.path.join(run, "llmctl.out")
     if os.path.exists(out):  # episodes the model API refused (429: quota): the llm system did nothing in them
         api_errors = sum(1 for l in open(out, errors="replace") if "API error" in l and "episode stopped" in l)
@@ -90,8 +93,62 @@ def extract(run: str, bin_s: float) -> dict:
     return {"path": run, "duration_s": sec(max(w["t1_ns"] for w in windows)), "routes": routes, "phases": phases,
             "series": ser, "pool": pool, "swaps": swaps, "degrade": degrade,
             "cpu": {"alloc_core_s": alloc, "used_core_s": used, "window_s": window or sec(max(w["t1_ns"] for w in windows))},
+            "alloc": held,
             "llm_episodes": episodes,
-            "llm_api_errors": api_errors}
+            "llm_api_errors": api_errors,
+            "llm_actions": actions,
+            "llm_span_s": span}
+
+
+def alloc_bins(run: str, t0: int, bin_s: float) -> list[dict]:
+    """Allocated core-seconds per bin, from the 100 ms sampler. cores is the cpuset size; the product with the
+    sample interval is what alloc_vs_use.txt integrates at 10 ms. The load generator is not part of the cost."""
+    path = os.path.join(run, "sample.jsonl")
+    if not os.path.isfile(path):
+        return []
+    bins: dict[int, float] = {}
+    for line in open(path):
+        try:
+            sample = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        t = sample.get("ts_ns")
+        if not isinstance(t, int) or t < t0:
+            continue
+        dt = sample.get("iv_ns", 0) / 1e9
+        cores = 0
+        for name, info in sample.get("daemons", {}).items():
+            if name.endswith("loadgen") or not name.startswith(("hotel-", "social-", "media-")):
+                continue
+            cores += info.get("cores") or 0
+        b = int((t - t0) / 1e9 // bin_s)
+        bins[b] = bins.get(b, 0.0) + cores * dt
+    return [{"t_s": b * bin_s, "core_s": round(v, 3)} for b, v in sorted(bins.items())]
+
+
+def llm_log(run: str) -> tuple[int, dict, float]:
+    """Tool calls, episode count, and the span of the controller log. The span is the rate's denominator:
+    actions per second are tool events over (last − first) llmctl timestamp, the same clock the log uses."""
+    path = os.path.join(run, "llmctl.jsonl")
+    actions: dict[str, int] = {}
+    episodes, ts = 0, []
+    if os.path.exists(path):
+        for line in open(path):
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            t = event.get("t")
+            if isinstance(t, (int, float)):
+                ts.append(t)
+            kind = event.get("event")
+            if kind == "episode":
+                episodes += 1
+            elif kind == "tool" and event.get("name"):
+                name = event["name"]
+                actions[name] = actions.get(name, 0) + 1
+    span = (max(ts) - min(ts)) if len(ts) >= 2 else 0.0
+    return episodes, actions, span
 
 
 def main() -> int:

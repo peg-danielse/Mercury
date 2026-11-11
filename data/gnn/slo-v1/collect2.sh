@@ -26,7 +26,7 @@ run() {  # name users svc trace
   local D=$OUT/$B/$1; guard; mkdir -p $D; echo "$(date +%T) RUN $B $1 :: $3"
   python3 $S/stamp_windows.py $D & local WP=$!
   POLICIES=saturate SVC_ARGS="$3" TRACEALL=$4 TRACE_SLOW="$SL" $M/src/test/dsb_ab.sh $B $D 1 "$2" > $D/driver.log 2>&1
-  echo "$(date +%T) END $B $1 rc=$? $(ls ~/Benchmarks/runtime/redis/6379/ | head -2)"
+  echo "$(date +%T) END $B $1 rc=$? $(ls ~/Mercury/benchmarks/runtime/redis/6379/ | head -2)"
   touch $D/.stamp_stop; wait $WP; rm -f $D/.stamp_stop
 }
 for r in 1 2 3; do run G-r$r "$UT" "$G" 10; done

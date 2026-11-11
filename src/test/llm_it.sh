@@ -144,6 +144,18 @@ out.append(m.state()['degrade'] == {'sheddable': ['x', 'y'], 'shed': ['x']})
 out.append(llmctl.run_tool(m, 'restore_route', {'route': 'x'})['ok'] and json.load(open('$DIR/d.policy'))['disabled'] == [])
 print(out)")
 [ "$SHED" = "[False, True, True, True, True]" ]; verdict_s $? "llmctl refuses a route outside --shed, sheds and restores x ($SHED)"
+SCALE=$(python3 -c "
+import sys
+sys.path.insert(0, '$ROOT/tools'); import llmctl
+m = llmctl.Mercury('http://127.0.0.1:9', 500, True)
+up = llmctl.run_tool(m, 'scale_daemon', {'daemon_id': 'social-nginx', 'cpus': 4, 'reason': 'short'})
+down = llmctl.run_tool(m, 'scale_daemon', {'daemon_id': 'social-nginx', 'cpus': -2, 'reason': 'idle'})
+bad = llmctl.run_tool(m, 'scale_daemon', {'daemon_id': 'social-nginx', 'cpus': 0, 'reason': 'no'})
+gen = llmctl.run_tool(m, 'scale_daemon', {'daemon_id': 'social-loadgen', 'cpus': 2, 'reason': 'no'})
+print(up.get('would_post'), down.get('would_post'), bad.get('ok'), gen.get('ok'))
+")
+[ "$SCALE" = "{'action': 'add_cores', 'daemon_id': 'social-nginx', 'count': 4} {'action': 'remove_cores', 'daemon_id': 'social-nginx', 'count': 2} False False" ]
+verdict_s $? "scale_daemon adds, removes, and refuses 0 and the load generator ($SCALE)"
 
 echo "--- llm events"; grep "^llm daemon_id" "$LOG" | sed 's/^/  /'
 echo "llm_it: $PASS passed, $FAIL failed"

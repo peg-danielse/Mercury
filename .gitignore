@@ -9,6 +9,21 @@ libmercury_http.a
 /CMakeFiles/
 /cmake_install.cmake
 /Makefile
+/CPackConfig.cmake
+/CPackSourceConfig.cmake
+/CTestTestfile.cmake
+/_deps/
+/bsoncompat/
+/hiredis-include/
+/libreuseport.so
+/media-compat/
+/mongocompat/
+/redis-features/
+/system-thrift/
+/yaml-cpp-inc/
+
+# Training checkpoints and round output. The trainers live in tools/learn.
+/data/learn/
 /data/mercury-runs/*
 /data/dsb/
 /data/gnn/**

@@ -3,7 +3,7 @@
 # transformer, and saturate on a 40-CPU pool. Resumable: finished runs (DONE) are skipped.
 M=$(cd "$(dirname "$0")/../../.." && pwd)
 export OPENROUTER_API_KEY="$(cat $HOME/.config/mercury/openrouter.key)"
-COMMON="RATE=100 DB=seed SEED_N=1 PHASES=12 WARMUP=30 OFF=20 ON=30 CRITICAL=hotels,reservation ROUTE=hotels,reservation,recommendations,review,restaurants,museums,cinema LLM_KEY_VARS=OPENROUTER_API_KEY"
+COMMON="RATE=100 DB=seed SEED_N=1 PHASES=12 WARMUP=30 OFF=20 ON=30 CRITICAL=hotels,reservation ROUTE=hotels,recommendations,user,review,restaurants,museums,cinema,reservation LLM_KEY_VARS=OPENROUTER_API_KEY"
 LLMS="ministral3b=mistralai/ministral-3b-2512@openrouter:low,gemma4b=google/gemma-3-4b-it@openrouter:low,qwen35=qwen/qwen3.5-9b@openrouter:low,qwen38=qwen/qwen3.8-27b@openrouter:low,qwencoder=qwen/qwen3-coder-next@openrouter:low,qwen36=qwen/qwen3.6-35b-a3b@openrouter:low,gptoss=openai/gpt-oss-120b@openrouter:low,mimo=xiaomi/mimo-v2.6-flash@openrouter:low,deepseek=deepseek/deepseek-v4.1-flash@openrouter:low,glm=z-ai/glm-5.3-flash@openrouter:low,luna=openai/gpt-6-luna@openrouter:low,haiku=anthropic/claude-haiku-5.5@openrouter:low,gemini38=google/gemini-3.8-flash@openrouter:low,gemini4=google/gemini-4-argon@openrouter:low"
 ALIASES="ministral3b gemma4b qwen35 qwen38 qwencoder qwen36 gptoss mimo deepseek glm luna haiku gemini38 gemini4"
 SYS_LLMS=$(for a in $ALIASES; do printf 'llm25-%s ' $a; done)

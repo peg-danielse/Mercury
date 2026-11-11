@@ -196,6 +196,41 @@ def state_at(T: int, window_s: float, rings_d: dict[str, Rings], rings_c: dict[i
     return out
 
 
+def from_log(run: str) -> list[dict]:
+    """Episodes from llmctl.jsonl alone, using the state record the model was shown.
+
+    Runs since 2026-10-23 log that state. Rings are not read. An episode with no state record is skipped.
+    """
+    path = os.path.join(run, "llmctl.jsonl")
+    recs = [json.loads(line) for line in open(path)]
+    episodes: list[dict] = []
+    cur: dict | None = None
+    prev: list = []
+    t0 = next((r.get("t") for r in recs if isinstance(r.get("t"), (int, float))), None)
+    for record in recs:
+        kind = record.get("event")
+        if kind == "episode":
+            if cur and cur.get("state"):
+                episodes.append(cur)
+                prev = cur["calls"]
+            t = record.get("t")
+            cur = {"run": run, "t_s": round(t - t0, 2) if isinstance(t, (int, float)) and t0 is not None else 0.0,
+                   "trigger": record.get("trigger"), "budget": 0, "shedding": False,
+                   "previous": prev, "calls": []}
+        elif kind == "state" and cur is not None:
+            cur["state"] = record["state"]
+            pool = record["state"].get("pool") or {}
+            cur["budget"] = pool.get("max", 0)
+            cur["shedding"] = bool(record["state"].get("degrade"))
+        elif kind == "tool" and cur is not None and record.get("name") != "inspect":
+            cur["calls"].append({"name": record["name"],
+                                 "input": {k: v for k, v in (record.get("input") or {}).items() if k != "reason"},
+                                 "ok": bool(record.get("ok"))})
+    if cur and cur.get("state"):
+        episodes.append(cur)
+    return episodes
+
+
 def reconstruct(run: str, window_s: float) -> list[dict]:
     recs = [json.loads(l) for l in open(os.path.join(run, "llmctl.jsonl"))]
     log = open(os.path.join(run, "mercury.log"), errors="replace").read()
@@ -253,10 +288,19 @@ def main() -> int:
     ap.add_argument("runs", nargs="+")
     ap.add_argument("-o", "--output", required=True)
     ap.add_argument("--window-s", type=float, default=1.0)
+    ap.add_argument("--log-only", action="store_true",
+                    help="use the state llmctl logged, and do not read rings")
     a = ap.parse_args()
     n = 0
     with open(a.output, "w") as out:
         for run in a.runs:
+            if a.log_only:
+                eps = from_log(run)
+                for episode in eps:
+                    out.write(json.dumps(episode) + "\n")
+                    n += 1
+                print(f"{run}: {len(eps)} episodes from the log", file=sys.stderr)
+                continue
             try:
                 eps = reconstruct(run, a.window_s)
             except Exception as error:  # one broken run must not stop the rest

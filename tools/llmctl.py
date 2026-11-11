@@ -8,13 +8,15 @@ cores to daemons that need them, and stop with a one-paragraph summary.
   inspect        GET  /llm/state      host load, every L3 domain (load, free CPUs, daemons), every daemon
   move_daemon    POST /llm/act move   a daemon's CPUs in one L3 domain -> free CPUs of another
   add_l3_domain  POST /llm/act add_l3 all free CPUs of one more L3 domain
-  add_cores      POST /llm/act add_cores
-  remove_cores   POST /llm/act remove_cores
+  scale_daemon   POST /llm/act add_cores or remove_cores   a signed CPU count for one daemon
   add_replica    POST /llm/act add_replica     one more process of a service, sharing its port (--replicas)
   remove_replica POST /llm/act remove_replica  stop the replica added last (--replicas)
 
-Division of work: the daemons' autoscaling (saturate) keeps deciding how many CPUs each daemon gets;
-the model decides where they are. Its actions leave autoscaling attached.
+Division of work: the daemons' autoscaling (saturate) still changes one CPU per window. The model
+decides the pool and where CPUs sit, and with scale_daemon it can jump a daemon's CPU count when a
+load step has moved faster than that window. Its actions leave autoscaling attached. With
+SC_LLM_OWNS=1 the sidecar has detached that autoscaler, and the prompt tells the model it is the
+only thing that changes a service's CPU count.
 
 Latency: with --latency (the load generator's loadgen.hist.jsonl) the state also carries the application's
 end-to-end latency (the last second, a healthy reference, the last 30 s), and p95 above --latency-factor
@@ -32,6 +34,10 @@ runs an episode, then waits --cooldown seconds (default two windows) before the 
 A hot domain counts only when an action could relieve it: shared by daemons, or holding one short
 of CPUs. After the model holds, the same trouble does not call it again for --rehold seconds.
 --duration ends the cycle after that many seconds (e.g. 180 for a 3-minute run).
+--llm remote asks the eval-set server (tools/learn/evalset/serve.py, default
+http://10.30.0.1:8790) for a core count every --every seconds and applies it with
+scale_daemon. --model is the checkpoint name, for example luna-20261102/gru. It does
+not wait for trouble: the model is the scaler. The first call resets that session.
 For speed an episode is one model call by default (--max-turns 1): the opening message carries the
 state, the changes since the last episode and that episode's results, the model's calls run, and
 the next check verifies them. The model may call hold when no action is warranted.
@@ -63,6 +69,10 @@ Models (--llm):
                     call's cost is logged; --thinking low/high is passed as a reasoning effort.
   distilled         a small local transformer distilled from an llm's decisions (tools/learn/distill/train.py): --model
                     MODEL.pt; needs torch; decides in milliseconds, no network.
+  rl                a checkpoint from tools/learn/rl. A scale checkpoint posts hold or scale_daemon. An action
+                    checkpoint (kind "action") posts every teacher tool: hold, scale_daemon, grow_pool,
+                    shrink_pool, swap_domain, move_daemon, add_replica, remove_replica, shed_route, restore_route.
+                    Needs torch. Every --every seconds, one call, no trouble gate and no teacher.
   mock              no network: the prompt's rules as code (for tests).
 """
 
@@ -89,8 +99,9 @@ Each daemon (service) runs in a cgroup whose cpuset decides which Linux CPUs it 
 L3 cache domains (cores sharing one last-level cache); domains sit in NUMA nodes and sockets.
 
 The application gets a pool: the L3 domains its services may use (state "pool", and "in_pool" per domain). An
-autoscaler keeps running for every service: it decides how many CPUs each one gets, but only from the pool, so
-the pool is the application's capacity. You decide the capacity and where it is:
+autoscaler keeps running for every service and changes one CPU per window, only from the pool, so the pool is
+the application's capacity. You decide the pool, where the CPUs sit, and with scale_daemon a service's size
+when a load step outruns that window:
 - grow_pool adds a whole free L3 domain to the pool. Do it only when the pool is saturated: its "pressure"
   (share of time the services' threads waited for a CPU) is high while "allocated" (pool CPUs the autoscaler has
   handed out, counted per service) exceeds "cores" (the services are doubled up), or its "busy" share is near 1.
@@ -104,8 +115,17 @@ the pool is the application's capacity. You decide the capacity and where it is:
   free domain on the same NUMA node, else the same socket.
 - move_daemon moves one service's CPUs between two domains inside the pool, to separate services that slow
   each other down on a hot domain.
+- scale_daemon changes how many CPUs one service has. "cpus" is a signed count: +4 adds four CPUs from the
+  pool, -2 removes two, and the service keeps at least one. Leave the load generator and jaeger alone.
+  The autoscaler still moves one CPU per window after you, so use this when the offered load has stepped
+  and a service is behind that window or is holding CPUs it has stopped using. A short service (occupancy
+  near 1, pressure high) gets more CPUs; an idle one (occupancy low, pressure near 0) gives them back
+  when another service needs them. If the pool has no free CPU, grow_pool first.
+  If a call times out, it may have landed. Read the cpuset in the state before repeating it.
 A swap or a move does not add capacity, and more capacity does not escape a neighbour: saturation needs
-grow_pool, a noisy neighbour needs swap_domain.
+grow_pool, a noisy neighbour needs swap_domain. The offered load rises in steps. How many CPUs a service
+needs depends on the step and on how far into that step the run is: match the size to its cpu_use and its
+waiting as the rate climbs, and give CPUs back when the rate falls.
 
 Objectives, in order:
 1. Critical requests fast and without errors (end-to-end latency near its healthy reference).
@@ -213,6 +233,25 @@ TOOLS: list[dict[str, Any]] = [
         },
         "strict": True,
     },
+    {
+        "name": "scale_daemon",
+        "description": (
+            "Give one service more CPUs or take some away. cpus is a signed count from -64 to 64, excluding 0: "
+            "positive adds that many CPUs from the pool, negative removes that many, and the service keeps at least "
+            "one. Use it when a load step has left the service short, or when it is holding CPUs it is not using."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "daemon_id": {"type": "string"},
+                "cpus": {"type": "integer", "description": "CPUs to add (positive) or remove (negative), -64..-1 or 1..64"},
+                "reason": {"type": "string"},
+            },
+            "required": ["daemon_id", "cpus", "reason"],
+            "additionalProperties": False,
+        },
+        "strict": True,
+    },
 ]
 TOOLS.append({
     "name": "hold",
@@ -225,7 +264,7 @@ TOOLS.append({
     },
     "strict": True,
 })
-ACTIONS = {"move_daemon", "grow_pool", "shrink_pool", "swap_domain", "shed_route", "restore_route",
+ACTIONS = {"move_daemon", "grow_pool", "shrink_pool", "swap_domain", "scale_daemon", "shed_route", "restore_route",
            "add_replica", "remove_replica"}
 
 REPLICA_SYSTEM = """
@@ -235,18 +274,25 @@ sends each new connection to one of them. Each process is its own daemon, with i
 sizes it the way it sizes the others. A daemon id ending in -rN (N from 2) is an added replica: "set" is the
 original id and "replica" is true. The original stays.
 - add_replica starts one more process of a service, on the pool CPU the fewest daemons hold. It starts with one
-  CPU and that service's autoscaler. Use it when the service is short and another process can take new connections.
-  A set holds at most 8 processes.
+  CPU and that service's autoscaler. Use it when the service's mean occupancy is at least 0.85 and its mean
+  pressure is at least 0.10 (without PSI, the mean runnable count is at least its CPUs plus 0.5). That is the
+  same test saturate uses to add a CPU. One replica per 640 ms window. A set holds at most 8 processes.
+  When that daemon's "replicas" is true, Mercury adds the replica itself on this test, so do not call add_replica
+  for it.
 - remove_replica stops the replica added last. It never stops the original. Use it when the extra processes are idle.
-Do not replicate the load generator, jaeger, or a data store (mongod, redis, rabbitmq, memcached). A connection a
-client already holds stays on the process that accepted it; new connections are the ones that spread."""
+Do not replicate the load generator, jaeger, or a data store (mongod, redis, rabbitmq, memcached). Hotel's services
+listen with SO_REUSEPORT, so a replica shares the port and new connections spread. The frontend keeps one gRPC
+connection to each backend, so a backend replica gets work only from a new dial. A connection a client already
+holds stays on the process that accepted it; new connections are the ones that spread."""
 
 REPLICA_TOOLS: list[dict[str, Any]] = [
     {
         "name": "add_replica",
         "description": (
             "Start one more process of a service. It shares that service's port, and the kernel balances new "
-            "connections across the set. The new process is its own daemon, on one CPU, with the service's autoscaler."
+            "connections across the set. The new process is its own daemon, on one CPU, with the service's autoscaler. "
+            "Use it when mean occupancy is at least 0.85 and mean pressure is at least 0.10, the saturate scale-up test. "
+            "Do not call it when the daemon's replicas field is true: Mercury adds that replica itself."
         ),
         "input_schema": {
             "type": "object",
@@ -274,15 +320,19 @@ REPLICA_TOOLS: list[dict[str, Any]] = [
 APPLICATIONS = {
     "media": """The application is DeathStarBench's media microservices, a movie review site: 13 C++ Thrift services
 (CastInfo, ComposeReview, MovieId, MovieInfo, MovieReview, Page, Plot, Rating, ReviewStorage, Text, UniqueId, UserReview,
-User), each in its own daemon named media-<service>. Their data is in MongoDB (media-mongod); each service has its own
-memcached (media-11300 to media-11306); redis is media-redis-server. The load generator (media-loadgen) sends three routes:
+User), each in its own daemon named media-<service>. Their data is in eight mongod daemons, one database each:
+media-mongod-27018 movie-id, media-mongod-27019 user, media-mongod-27020 review storage, media-mongod-27021 user-review,
+media-mongod-27022 movie-review, media-mongod-27024 cast-info, media-mongod-27025 plot, media-mongod-27026 movie-info
+(this one also holds social-graph). Compose-review writes review storage, user-review and movie-review at the same time,
+so a slow compose waits on those three. Each service has its own memcached (media-11300 to media-11306); redis is
+media-redis-server. The load generator (media-loadgen) sends three routes:
 - read-page (critical): PageService.ReadPage for one movie. Page calls MovieInfo, Plot, CastInfo and MovieReview.
 - compose-review (critical): one review written by four uploads (User, Text, MovieId and UniqueId services). Each hands
   its part to ComposeReview, which stores the review through ReviewStorage, MovieReview and UserReview.
 - read-movie-reviews (optional): MovieReview.ReadMovieReviews for one movie.
 There is no front end and nothing can be shed: every route is served or it is not. The end-to-end latency in the state is
 the load generator's; the critical routes' latency is what the objectives protect. Latency that does not show in the
-services' CPU use usually waits in mongod or memcached, and more CPUs for the services do not fix it.""",
+services' CPU use usually waits in one of those mongods or in memcached, and more CPUs for the services do not fix it.""",
 }
 
 SHED_SYSTEM = """
@@ -348,6 +398,8 @@ class Mercury:
                 return json.loads(error.read())
             except ValueError:
                 return {"ok": False, "error": f"HTTP {error.code}"}
+        except TimeoutError:
+            return {"ok": False, "error": "timed out; the step may have landed, read the cpuset before repeating it"}
         except (URLError, OSError, ValueError) as error:
             return {"ok": False, "error": f"mercury unreachable: {error}"}
 
@@ -457,6 +509,26 @@ class Latency:
                              "reference_p95_ms": part["reference_p95_ms"]}
         return out
 
+    def phase(self) -> dict[str, Any]:
+        """The load generator's phase index (`level`) and client count in the newest window. Not shown to a model."""
+        if not self.slices:
+            return {}
+        newest = self.slices[max(self.slices)][0]
+        return {"phase": newest.get("level"), "clients": newest.get("clients")}
+
+
+def outcome_of(state: dict[str, Any], latency_source: Latency | None = None) -> dict[str, Any]:
+    """The last second's latency (critical routes when set), the pool, and the load phase, for a per-decision reward."""
+    latency = state.get("latency") or {}
+    now = latency.get("critical") or latency.get("now") or {}
+    pool = state.get("pool") or {}
+    out = {"p95_ms": now.get("p95_ms"), "error_rate": now.get("error_rate"),
+           "req_per_s": (latency.get("now") or {}).get("req_per_s"),
+           "cores": pool.get("cores"), "max": pool.get("max"), "busy": pool.get("busy")}
+    if latency_source is not None:
+        out.update(latency_source.phase())
+    return out
+
 
 def pool_at_budget(state: dict[str, Any]) -> bool:
     """The pool cannot grow: no free domain, or the smallest free one would take it past its budget (pool.max)."""
@@ -470,6 +542,21 @@ def pool_at_budget(state: dict[str, Any]) -> bool:
     return bool(pool.get("max")) and pool.get("cores", 0) + min(free) > pool["max"]
 
 
+def scale_cpus(value: Any) -> int | None:
+    """A signed CPU count for scale_daemon: -64..-1 or 1..64. Anything else is refused."""
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        return None
+    try:
+        count = int(value)
+    except ValueError:
+        return None
+    if isinstance(value, float) and count != value:
+        return None
+    if count == 0 or abs(count) > 64:
+        return None
+    return count
+
+
 def run_tool(mercury: Mercury, name: str, args: dict[str, Any]) -> dict[str, Any]:
     """Run one tool call against Mercury. Always returns a JSON object; ok false carries a reason."""
     if name == "inspect":
@@ -477,6 +564,14 @@ def run_tool(mercury: Mercury, name: str, args: dict[str, Any]) -> dict[str, Any
         time.sleep(wait)
         return mercury.state(args.get("since_cursor") or None)
     daemon_id = str(args.get("daemon_id", ""))
+    if name == "scale_daemon":
+        count = scale_cpus(args.get("cpus"))
+        if count is None:
+            return {"ok": False, "error": "cpus must be a non-zero integer from -64 to 64"}
+        if daemon_id.endswith("loadgen") or daemon_id.endswith("jaeger"):
+            return {"ok": False, "error": f"{daemon_id} is left to its own scaling"}
+        body = {"action": "add_cores" if count > 0 else "remove_cores", "daemon_id": daemon_id, "count": abs(count)}
+        return mercury.act(body)
     if name == "add_replica":
         return mercury.act({"action": "add_replica", "daemon_id": daemon_id})
     if name == "remove_replica":
@@ -530,7 +625,8 @@ class Log:
 def opening_message(args: argparse.Namespace, trigger: str, opening: dict[str, Any]) -> str:
     previous = json.dumps(args.previous, separators=(",", ":")) if args.previous else "none"
     app = APPLICATIONS[args.app] + "\n\n" if args.app else ""
-    return (f"{app}{args.goal}\n\nWhy you were called: {trigger}\n\n"
+    elapsed = max(0, int(time.time() - getattr(args, "started", time.time())))
+    return (f"{app}{args.goal}\n\nSeconds into this run: {elapsed}.\n\nWhy you were called: {trigger}\n\n"
             f"Your previous episode's calls and their results: {previous}\n\n"
             "The machine now; \"since\" covers what happened after your previous episode (absent on the first), "
             "and \"cursor\" is the one to pass to inspect:\n" + json.dumps(opening, separators=(",", ":")))
@@ -673,6 +769,82 @@ def claude_cli_episode(args: argparse.Namespace, mercury: Mercury, log: Log, tri
 
 
 DISTILLED: dict[str, Any] = {}
+RL: dict[str, Any] = {}
+
+
+def action_turns(args: argparse.Namespace, mercury: Mercury, log: Log, opening: dict[str, Any], t0: float) -> str:
+    """Up to --max-actions calls of an action checkpoint, each on a fresh state.
+
+    A process, and each pool tool, is acted on once per episode. A hold or a
+    refused call ends the episode. The history carry advances once per episode.
+    """
+    import time as _time
+    from actions import choose
+    used: dict[str, set] = {"services": set(), "tools": set()}
+    previous = RL["previous"]
+    state = opening
+    posted = []
+    for turn in range(max(1, args.max_actions)):
+        decision, carry = choose(RL["model"], state, previous, used)
+        if turn == 0:
+            RL["previous"] = carry
+        ms = round((_time.perf_counter() - t0) * 1000, 3)
+        log.write(event="turn", turn=turn, finish="rl", model=args.model, setting=RL["label"], actor=None,
+                  training_mode=None, ms=ms, tool=decision.name, daemon_id=decision.daemon_id, cpus=decision.cpus)
+        result = execute(args, mercury, log, decision.name, decision.arguments)
+        posted.append(decision.name + (f" {decision.daemon_id} {decision.cpus:+d}" if decision.cpus else ""))
+        if decision.name == "hold" or not result.get("ok"):
+            break
+        if decision.daemon_id:
+            used["services"].add(decision.daemon_id)
+        used["tools"].add(decision.name)
+        state = mercury.state()
+        if not state.get("ok", True) or not state.get("daemons"):
+            break
+        t0 = _time.perf_counter()
+    return f"rl {RL['label']}: " + ", ".join(posted)
+
+
+def rl_episode(args: argparse.Namespace, mercury: Mercury, log: Log, trigger: str, opening: dict[str, Any]) -> str:
+    """One decision by the actor in tools/learn/rl. --model is a train.py checkpoint.
+
+    The setting stored in the file selects the actor. Exploration is off. The
+    (ids, obs) carry stays in this process. The call goes through execute.
+    """
+    import time as _time
+    t0 = _time.perf_counter()
+    if not RL:
+        import torch
+        sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "learn", "rl"))
+        torch.set_num_threads(1)
+        blob = torch.load(args.model, map_location="cpu", weights_only=False)
+        if blob.get("kind") == "action":
+            from actions import load_action_model
+            model = load_action_model(args.model, blob)
+            RL.update(kind="action", model=model, label=f"{model.actor_type}-action", previous=None)
+        else:
+            from settings import load_controller
+            actor, spec = load_controller(args.model)
+            RL.update(kind="scale", actor=actor, spec=spec, label=spec.name, previous=None)
+        t0 = _time.perf_counter()
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "learn", "rl"))
+    if RL["kind"] == "action":
+        return action_turns(args, mercury, log, opening, t0)
+    else:
+        from control import decide
+        decision, carry = decide(RL["actor"], opening, RL["previous"])
+    RL["previous"] = carry
+    ms = round((_time.perf_counter() - t0) * 1000, 3)
+    spec = RL.get("spec")
+    log.write(event="turn", turn=0, finish="rl", model=args.model, setting=RL["label"],
+              actor=None if spec is None else spec.actor_type,
+              training_mode=None if spec is None else spec.training_mode, ms=ms,
+              tool=decision.name, daemon_id=decision.daemon_id, cpus=decision.cpus)
+    execute(args, mercury, log, decision.name, decision.arguments)
+    text = f"rl {RL['label']}: {decision.name}"
+    if decision.cpus:
+        text += f" {decision.daemon_id} {decision.cpus:+d}"
+    return f"{text} ({ms} ms)"
 
 
 def distilled_episode(args: argparse.Namespace, mercury: Mercury, log: Log, trigger: str, opening: dict[str, Any]) -> str:
@@ -691,12 +863,15 @@ def distilled_episode(args: argparse.Namespace, mercury: Mercury, log: Log, trig
         ckpt = torch.load(args.model, map_location="cpu", weights_only=False)
         a = ckpt["args"]
         actions = ckpt["actions"]
-        banned = [actions.index("shed_route"), actions.index("restore_route")] if a.get("no_shed") else []
-        model = distill.Distilled(a["d"], a["layers"], a["heads"], 0.0, banned=banned)
+        banned = [actions.index(name) for name in ("shed_route", "restore_route") if name in actions] if a.get("no_shed") else []
+        glb_f = ckpt["model"]["glb_in.weight"].shape[1]
+        model = distill.Distilled(a["d"], a["layers"], a["heads"], 0.0, banned=banned, actions=actions,
+                                  arch=a.get("arch", "tf"), glb_f=glb_f)
         model.load_state_dict(ckpt["model"], strict=False)  # models trained before act_mask lack the buffer
         model.eval()
         DISTILLED.update(torch=torch, distill=distill, model=model, names=ckpt["names"], actions=actions,
-                         routes=ckpt["routes"], start=time.time())
+                         routes=ckpt["routes"], cpu_values=ckpt.get("cpu_values") or [],
+                         glb_f=glb_f, start=time.time())
         t0 = _time.perf_counter()  # the decision's time, without the one-time import and load
     torch, distill, model = DISTILLED["torch"], DISTILLED["distill"], DISTILLED["model"]
     state = opening
@@ -707,7 +882,7 @@ def distilled_episode(args: argparse.Namespace, mercury: Mercury, log: Log, trig
     episode = {"state": state, "budget": (state.get("pool") or {}).get("max", 0), "shedding": bool(mercury.sheddable),
                "t_s": time.time() - DISTILLED["start"],
                "previous": [{"name": c["tool"], "input": c["input"], "ok": c["ok"]} for c in args.previous]}
-    x = distill.encode(episode, dict(DISTILLED["names"]))  # a copy: unseen services map to new ids, not saved
+    x = distill.encode(episode, dict(DISTILLED["names"]), DISTILLED["actions"], DISTILLED["glb_f"])
     batch = {k: v[None] for k, v in x.items() if not k.startswith("y_")}
     with torch.no_grad():
         out = {k: v[0] for k, v in model(batch).items()}
@@ -724,10 +899,25 @@ def distilled_episode(args: argparse.Namespace, mercury: Mercury, log: Log, trig
 
     act_logits = out["act"].clone()
     if not mercury.sheddable:
-        act_logits[actions.index("shed_route")] = act_logits[actions.index("restore_route")] = -1e9
+        for name in ("shed_route", "restore_route"):
+            if name in actions:
+                act_logits[actions.index(name)] = -1e9
+    def replicable(name: str) -> bool:
+        low = name.lower()
+        if low.endswith(("loadgen", "jaeger")):
+            return False
+        return not any(part in low for part in ("mongod", "redis", "rabbitmq", "memcached"))
+
+    can_scale = [k for k, n in enumerate(order) if not n.endswith(("loadgen", "jaeger"))]
+    by_id = {d["daemon_id"]: d for d in state.get("daemons", [])}
+    can_add = [k for k, n in enumerate(order) if replicable(n) and not by_id.get(n, {}).get("replica")]
+    can_remove = [k for k, n in enumerate(order) if by_id.get(n, {}).get("replica")]
     for name in actions:  # actions whose targets do not exist now cannot be chosen
         if (name in ("grow_pool", "swap_domain") and not free) or (name == "shrink_pool" and not in_pool) or \
-                (name == "restore_route" and not mercury.shed):
+                (name == "restore_route" and not mercury.shed) or \
+                (name == "scale_daemon" and not can_scale) or \
+                (name in ("add_replica", "remove_replica") and not getattr(args, "replicas", False)) or \
+                (name == "add_replica" and not can_add) or (name == "remove_replica" and not can_remove):
             act_logits[actions.index(name)] = -1e9
     act = actions[int(act_logits.argmax())]
     call: dict[str, Any] = {}
@@ -749,6 +939,18 @@ def distilled_episode(args: argparse.Namespace, mercury: Mercury, log: Log, trig
             i, j = pick(out["dom1"], mine), pick(out["dom2"], dest)
             if i is not None and j is not None:
                 call = {"daemon_id": order[k], "from_l3": f"l3.{i}", "to_l3": f"l3.{j}"}
+    elif act == "scale_daemon":
+        k = pick(out["svc"], can_scale)
+        if k is not None and "cpus" in out and DISTILLED["cpu_values"]:
+            call = {"daemon_id": order[k], "cpus": DISTILLED["cpu_values"][int(out["cpus"].argmax())]}
+    elif act == "add_replica":
+        k = pick(out["svc"], can_add)
+        if k is not None:
+            call = {"daemon_id": order[k]}
+    elif act == "remove_replica":
+        k = pick(out["svc"], can_remove)
+        if k is not None:
+            call = {"daemon_id": order[k]}
     elif act in ("shed_route", "restore_route"):
         routes = DISTILLED["routes"]
         allowed = [r for r, name in enumerate(routes) if (name in mercury.sheddable and name not in mercury.shed)
@@ -1048,8 +1250,24 @@ def mock_episode(args: argparse.Namespace, mercury: Mercury, log: Log, trigger: 
                                     "reason": "shared hot domain"})
                 moved.add(daemon_id)
                 break
+    if len(done) < args.max_actions:
+        # A service alone on its domain cannot be helped by a move. Give it CPUs when it is short and the pool
+        # has room, or take them back from an idle service while another is short.
+        for daemon_id, daemon in sorted(daemons.items(), key=lambda kv: -kv[1]["occupancy"]):
+            if daemon_id.endswith("loadgen") or daemon_id.endswith("jaeger"):
+                continue
+            alone = all(len(block["daemons"]) < 2 for block in state["l3"] if daemon_id in block["daemons"])
+            spare = not pool or pool.get("allocated", 0) < pool.get("cores", 0)
+            if alone and spare and short_of_cpus(daemon, args):
+                act("scale_daemon", {"daemon_id": daemon_id, "cpus": 1, "reason": "short of CPUs"})
+                break
+            extra = len(daemon["cpus"]) - max(1, int(daemon["cpu_use"] + 0.999999))
+            others_short = any(short_of_cpus(other, args) for name, other in daemons.items() if name != daemon_id)
+            if extra > 0 and daemon["occupancy"] <= 0.35 and daemon.get("pressure", 0) < 0.05 and others_short:
+                act("scale_daemon", {"daemon_id": daemon_id, "cpus": -extra, "reason": "idle while another service is short"})
+                break
     if not done:
-        execute(args, mercury, log, "hold", {"reason": "no saturated pool, noisy neighbour or shared hot domain"})
+        execute(args, mercury, log, "hold", {"reason": "no saturated pool, noisy neighbour, shared hot domain or size to change"})
         return "hold: no change needed"
     return "; ".join(done)
 
@@ -1125,10 +1343,101 @@ def trouble(state: dict[str, Any], args: argparse.Namespace) -> dict[str, str]:
     return found
 
 
+def remote_cycle(args: argparse.Namespace, mercury: Mercury, log: Log) -> int:
+    """Every --every seconds, ask the eval-set server for a core count and apply it.
+
+    The model is the scaler, so this does not wait for trouble. Shrinks happen first, then
+    the pool grows until it can hold the sum, then daemons that need cores gain them.
+    """
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "learn", "evalset"))
+    from live import SampleTail, Tracker, post
+
+    tracker = Tracker()
+    sample_path = ""
+    if args.latency:
+        sample_path = os.path.join(os.path.dirname(args.latency), "sample.jsonl")
+    sample = SampleTail(sample_path)
+    session = f"{args.model}-{os.getpid()}"
+    first = True
+    every = args.every if args.every > 0 else 0.05
+    stop_at = time.time() + args.duration if args.duration > 0 else float("inf")
+    while time.time() < stop_at:
+        started = time.perf_counter()
+        state = mercury.state()
+        if not state.get("ok"):
+            log.write(event="check", ok=False, error=state.get("error"))
+            if args.every <= 0:
+                return 1
+            time.sleep(every)
+            continue
+        rows = tracker.rows(state.get("daemons") or [], sample.latest(), time.time_ns())
+        if not rows:
+            log.write(event="check", ok=True, daemons=0)
+            if args.every <= 0:
+                return 0
+            time.sleep(every)
+            continue
+        try:
+            reply = post(args.remote, args.model, session, rows, first)
+        except (URLError, OSError, TimeoutError, ValueError) as error:
+            log.write(event="error", kind="remote", detail=str(error))
+            print(f"remote {args.model}: {error}", flush=True)
+            if args.every <= 0:
+                return 1
+            time.sleep(every)
+            continue
+        first = False
+        wanted = {item["id"]: int(item["cores"]) for item in reply.get("daemons") or []}
+        by_id = {daemon["daemon_id"]: daemon for daemon in state.get("daemons") or []}
+
+        def held(ident: str) -> int:
+            return len((by_id.get(ident) or {}).get("cpus") or []) or 1
+
+        for ident, cores in wanted.items():
+            delta = max(cores, 1) - held(ident)
+            if delta < 0:
+                execute(args, mercury, log, "scale_daemon",
+                        {"daemon_id": ident, "cpus": delta, "reason": "remote model"})
+
+        def refresh() -> None:
+            nonlocal state, by_id
+            fresh = mercury.state()
+            if fresh.get("ok"):
+                state = fresh
+                by_id = {daemon["daemon_id"]: daemon for daemon in state.get("daemons") or []}
+
+        refresh()
+        need = sum(max(cores, 1) for cores in wanted.values())
+        for _ in range(16):
+            pool = state.get("pool") or {}
+            if not pool or pool.get("cores", 0) >= need or pool_at_budget(state):
+                break
+            result = execute(args, mercury, log, "grow_pool", {"reason": "remote model"})
+            if not result.get("ok") or result.get("dry_run"):
+                break
+            refresh()
+        for ident, cores in wanted.items():
+            delta = max(cores, 1) - held(ident)
+            if delta > 0:
+                execute(args, mercury, log, "scale_daemon",
+                        {"daemon_id": ident, "cpus": min(delta, 64), "reason": "remote model"})
+        text = ", ".join(f"{item['id'].split('-')[-1]} {item['cores']}" for item in reply.get("daemons") or [])
+        ms = reply.get("ms")
+        log.write(event="turn", turn=0, finish="remote", model=args.model, ms=ms, n=len(wanted))
+        print(f"remote {args.model}: {text} ({ms} ms)", flush=True)
+        if args.every <= 0:
+            return 0
+        time.sleep(max(0.0, every - (time.perf_counter() - started)))
+    log.write(event="stop", reason="duration")
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--url", default="http://127.0.0.1:18180", help="Mercury worker")
-    parser.add_argument("--llm", choices=("gemini", "gimini", "claude", "claude-cli", "grok", "openrouter", "distilled", "mock"), default="gemini")
+    parser.add_argument("--llm", choices=("gemini", "gimini", "claude", "claude-cli", "grok", "openrouter", "distilled", "mock", "remote", "rl"), default="gemini")
+    parser.add_argument("--remote", default=os.environ.get("EVALSET_URL", "http://10.30.0.1:8790"),
+                        help="eval-set server (serve.py) for --llm remote")
     parser.add_argument("--model", help=f"default: GEMINI_MODEL or {GEMINI_MODEL} for gemini, {MODEL} for claude, "
                                         f"Claude Code's own default for claude-cli, XAI_MODEL or {XAI_MODEL} for grok, "
                                         f"OPENROUTER_MODEL or {OPENROUTER_MODEL} for openrouter")
@@ -1164,6 +1473,8 @@ def main() -> int:
     parser.add_argument("--cooldown", type=float, default=None, help="seconds after an episode before the next (default: two windows)")
     parser.add_argument("--max-episodes", type=int, default=0, help="stop the cycle after this many episodes (0: never)")
     parser.add_argument("--rehold", type=float, default=60, help="after a hold, seconds before the same trouble calls the model again")
+    parser.add_argument("--gate", action="store_true",
+                        help="--llm rl: decide only when trouble calls an episode, as the teacher does")
     parser.add_argument("--replicas", action="store_true",
                         help="offer add_replica and remove_replica (Mercury started with MERCURY_REUSEPORT=1)")
     parser.add_argument("--shed", default="", help="optional routes the model may shed (comma-separated; empty: no shedding)")
@@ -1176,6 +1487,7 @@ def main() -> int:
     if args.cooldown is None:
         args.cooldown = 2 * args.window_ms / 1000
     args.previous, args.current = [], []
+    args.started = time.time()
     if args.llm == "gimini":
         args.llm = "gemini"
     if not args.model and args.llm == "grok":
@@ -1184,12 +1496,53 @@ def main() -> int:
         args.model = os.environ.get("OPENROUTER_MODEL", OPENROUTER_MODEL)
     elif args.llm == "distilled" and not args.model:
         parser.error("--llm distilled needs --model MODEL.pt")
-    elif not args.model and args.llm != "claude-cli":
+    elif args.llm == "remote" and not args.model:
+        parser.error("--llm remote needs --model, for example luna-20261102/gru")
+    elif args.llm == "rl" and not args.model:
+        parser.error("--llm rl needs --model CHECKPOINT.pt")
+    elif not args.model and args.llm not in ("claude-cli", "remote", "rl"):
         args.model = os.environ.get("GEMINI_MODEL", GEMINI_MODEL) if args.llm == "gemini" else MODEL
+    global SYSTEM, GEMINI_TOOLS
+    if os.environ.get("SC_LLM_OWNS") == "1":
+        # The sidecar detached saturate. The model has to set each service's CPU count itself.
+        SYSTEM = SYSTEM.replace(
+            "An\nautoscaler keeps running for every service and changes one CPU per window, only from the pool, so the pool is\n"
+            "the application's capacity. You decide the pool, where the CPUs sit, and with scale_daemon a service's size\n"
+            "when a load step outruns that window:",
+            "No autoscaler runs for the services. You are the only thing that changes a service's CPU count, with\n"
+            "scale_daemon, and you decide the pool and where the CPUs sit. The pool is the application's capacity:",
+        )
+        SYSTEM = SYSTEM.replace(
+            "More pool lets the autoscaler give services more CPUs.",
+            "More pool is capacity you then hand to services with scale_daemon.",
+        )
+        SYSTEM = SYSTEM.replace(
+            "pool CPUs the autoscaler has\n  handed out, counted per service",
+            "pool CPUs given to services, counted per service",
+        )
+        SYSTEM = SYSTEM.replace(
+            "  The autoscaler still moves one CPU per window after you, so use this when the offered load has stepped\n"
+            "  and a service is behind that window or is holding CPUs it has stopped using. A short service (occupancy\n"
+            "  near 1, pressure high) gets more CPUs; an idle one (occupancy low, pressure near 0) gives them back\n"
+            "  when another service needs them.",
+            "  Set the count the service needs at this second, not one CPU at a time. A short service (occupancy\n"
+            "  near 1, pressure high) gets as many more CPUs as its waiting shows; an idle one (occupancy low,\n"
+            "  pressure near 0) gives them back when the rate has fallen or another service needs them.",
+        )
+        for tool in TOOLS:
+            if tool["name"] == "grow_pool":
+                tool["description"] = tool["description"].replace(
+                    "more capacity for the autoscaler", "more capacity you can hand to services")
+            if tool["name"] == "scale_daemon":
+                tool["description"] = (
+                    "Give one service the CPUs it needs now, or take away the ones it has stopped using. cpus is a "
+                    "signed count from -64 to 64, excluding 0: positive adds that many CPUs from the pool, negative "
+                    "removes that many, and the service keeps at least one. You are the only scaler of the services, "
+                    "so set the count this second needs, not one CPU at a time."
+                )
     if args.max_turns == 1:
         # One turn: the opening message holds the full state and the episode ends after the calls, so an inspect can
         # only waste the episode (Gemini spent ~7% of its calls on it, the OpenRouter models most of theirs).
-        global SYSTEM, GEMINI_TOOLS
         TOOLS[:] = [t for t in TOOLS if t["name"] != "inspect"]
         SYSTEM = SYSTEM.replace("Decide from it directly; call inspect only for something it does not show.",
                                 "Decide from it directly: it is all there is to see this episode.")
@@ -1209,9 +1562,11 @@ def main() -> int:
     mercury = Mercury(args.url, args.window_ms, args.dry_run,
                       Latency(args.latency, critical if shed else None) if args.latency else None, shed, args.shed_daemons)
     log = Log(args.log)
+    if args.llm == "remote":
+        return remote_cycle(args, mercury, log)
     episode = {"gemini": gemini_episode, "claude": claude_episode, "claude-cli": claude_cli_episode,
                "grok": openai_episode, "openrouter": openai_episode, "distilled": distilled_episode,
-               "mock": mock_episode}[args.llm]
+               "mock": mock_episode, "rl": rl_episode}[args.llm]
 
     def run(trigger: str, since: str | None) -> str | None:
         """One episode opening at the state since cursor since; returns the cursor after it."""
@@ -1230,6 +1585,23 @@ def main() -> int:
         log.write(event="summary", text=summary)
         print(summary, flush=True)
         return mercury.state().get("cursor")
+
+    if args.llm == "rl" and not args.gate:
+        # The learned policy decides every period, including a hold. --gate puts it on the teacher's trouble gate.
+        if args.every <= 0:
+            run("asked to check now", None)
+            return 0
+        episodes = 0
+        stop_at = time.time() + args.duration if args.duration > 0 else float("inf")
+        while time.time() < stop_at:
+            started = time.perf_counter()
+            run("rl period", None)
+            episodes += 1
+            if args.max_episodes and episodes >= args.max_episodes:
+                return 0
+            time.sleep(max(0.0, args.every - (time.perf_counter() - started)))
+        log.write(event="stop", reason="duration", episodes=episodes)
+        return 0
 
     if args.every <= 0:
         run("asked to check now", None)
@@ -1256,7 +1628,8 @@ def main() -> int:
         streak = streak + 1 if found else 0
         since = state.get("since", {})
         log.write(event="check", host_load=state["host"]["load"], trouble=list(found.values()), streak=streak,
-                  events=[f"{e['daemon_id']} {e['kind']}: {e['detail']}" for e in since.get("events", [])])
+                  events=[f"{e['daemon_id']} {e['kind']}: {e['detail']}" for e in since.get("events", [])],
+                  outcome=outcome_of(state, mercury.latency))
         if streak >= args.confirm and time.time() >= quiet_until:
             episode_cursor = run("; ".join(found.values()), episode_cursor) or episode_cursor
             if args.previous and all(c["tool"] in ("hold", "inspect") for c in args.previous):

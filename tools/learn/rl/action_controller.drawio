@@ -1,0 +1,451 @@
+<mxfile host="app.diagrams.net">
+  <diagram id="gate" name="Trouble gate">
+    <mxGraphModel dx="1200" dy="900" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1100" pageHeight="1200" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+        <mxCell id="title" value="&lt;b&gt;llmctl.py --llm rl --gate&lt;/b&gt;: when the action model is called" style="text;html=1;fontSize=16;align=left;verticalAlign=middle;" vertex="1" parent="1">
+          <mxGeometry x="40" y="0" width="600" height="30" as="geometry" />
+        </mxCell>
+        <mxCell id="state" value="Mercury &lt;b&gt;/llm/state&lt;/b&gt;&lt;br&gt;averaged over --window-ms 1000" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" vertex="1" parent="1">
+          <mxGeometry x="60" y="40" width="220" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="check" value="&lt;b&gt;Check&lt;/b&gt; every --every 0.5 s&lt;br&gt;log check + outcome (reward input)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#666666;" vertex="1" parent="1">
+          <mxGeometry x="60" y="140" width="220" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="any" value="Any trouble?" style="rhombus;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;" vertex="1" parent="1">
+          <mxGeometry x="80" y="240" width="180" height="90" as="geometry" />
+        </mxCell>
+        <mxCell id="held" value="Same trouble the model&lt;br&gt;held on &amp;lt; 60 s ago?&lt;br&gt;(--rehold)" style="rhombus;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;" vertex="1" parent="1">
+          <mxGeometry x="70" y="380" width="200" height="110" as="geometry" />
+        </mxCell>
+        <mxCell id="streak" value="streak += 1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#666666;" vertex="1" parent="1">
+          <mxGeometry x="90" y="540" width="160" height="40" as="geometry" />
+        </mxCell>
+        <mxCell id="confirm" value="streak &amp;ge; 2 (--confirm)&lt;br&gt;and cooldown over?" style="rhombus;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;" vertex="1" parent="1">
+          <mxGeometry x="70" y="620" width="200" height="100" as="geometry" />
+        </mxCell>
+        <mxCell id="episode" value="&lt;b&gt;Episode&lt;/b&gt;&lt;br&gt;action_turns()" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;" vertex="1" parent="1">
+          <mxGeometry x="90" y="770" width="160" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="cool" value="&lt;b&gt;Cooldown 2 s&lt;/b&gt; (--cooldown)&lt;br&gt;only holds &amp;rarr; rehold 60 s on that trouble" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#666666;" vertex="1" parent="1">
+          <mxGeometry x="60" y="1010" width="220" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="list" value="&lt;div style=&quot;text-align:left&quot;&gt;&lt;b&gt;trouble()&lt;/b&gt; flags:&lt;br&gt;&amp;bull; &lt;b&gt;Hot L3 domain&lt;/b&gt;: load &amp;gt; 80% and shared, or holding a short service, or &amp;ge; 25% outside load&lt;br&gt;&amp;bull; &lt;b&gt;Service short of CPUs&lt;/b&gt;: occupancy &amp;ge; 0.9 and pressure &amp;ge; 0.10&lt;br&gt;&amp;bull; &lt;b&gt;Pool saturated&lt;/b&gt;: busy &amp;gt; 80%, or pressure &amp;ge; 0.25 with allocated &amp;gt; cores&lt;br&gt;&amp;bull; &lt;b&gt;Outside load&lt;/b&gt; in a pool domain &amp;ge; 25%&lt;br&gt;&amp;bull; &lt;b&gt;Latency&lt;/b&gt;: p95 &amp;gt; 2&amp;times; the healthy reference&lt;br&gt;&amp;bull; &lt;b&gt;Pool underused&lt;/b&gt;: above start, &amp;le; 35% busy, nothing else wrong (shrink)&lt;br&gt;&amp;bull; &lt;b&gt;Shed routes&lt;/b&gt; while critical latency is fine (restore)&lt;/div&gt;" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#d6b656;align=left;spacingLeft=8;spacingRight=8;" vertex="1" parent="1">
+          <mxGeometry x="360" y="150" width="420" height="200" as="geometry" />
+        </mxCell>
+        <mxCell id="choose" value="&lt;b&gt;choose&lt;/b&gt;(model, state, used)&lt;br&gt;legality mask applied" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;" vertex="1" parent="1">
+          <mxGeometry x="360" y="770" width="220" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="exec" value="&lt;b&gt;execute&lt;/b&gt; &amp;rarr; POST /llm/act" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;" vertex="1" parent="1">
+          <mxGeometry x="360" y="870" width="220" height="50" as="geometry" />
+        </mxCell>
+        <mxCell id="stop" value="hold, refused,&lt;br&gt;or 6 calls?&lt;br&gt;(--max-actions)" style="rhombus;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;" vertex="1" parent="1">
+          <mxGeometry x="375" y="960" width="190" height="110" as="geometry" />
+        </mxCell>
+        <mxCell id="fresh" value="read a fresh /llm/state&lt;br&gt;mark that service and pool tool used&lt;br&gt;(not offered again this episode)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#666666;" vertex="1" parent="1">
+          <mxGeometry x="650" y="860" width="240" height="70" as="geometry" />
+        </mxCell>
+        <mxCell id="e1" style="edgeStyle=orthogonalEdgeStyle;html=1;" edge="1" parent="1" source="state" target="check">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e2" style="edgeStyle=orthogonalEdgeStyle;html=1;" edge="1" parent="1" source="check" target="any">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e3" value="evaluates" style="edgeStyle=orthogonalEdgeStyle;html=1;dashed=1;" edge="1" parent="1" source="check" target="list">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e4" value="yes" style="edgeStyle=orthogonalEdgeStyle;html=1;" edge="1" parent="1" source="any" target="held">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e5" value="no" style="edgeStyle=orthogonalEdgeStyle;html=1;" edge="1" parent="1" source="held" target="streak">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e6" style="edgeStyle=orthogonalEdgeStyle;html=1;" edge="1" parent="1" source="streak" target="confirm">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e7" value="yes" style="edgeStyle=orthogonalEdgeStyle;html=1;" edge="1" parent="1" source="confirm" target="episode">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e8" value="no: streak = 0" style="edgeStyle=orthogonalEdgeStyle;html=1;exitX=0;exitY=0.5;entryX=0;entryY=0.5;strokeColor=#999999;" edge="1" parent="1" source="any" target="check">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="30" y="285" />
+              <mxPoint x="30" y="170" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e9" value="yes: ignored" style="edgeStyle=orthogonalEdgeStyle;html=1;exitX=0;exitY=0.5;entryX=0;entryY=0.5;strokeColor=#999999;" edge="1" parent="1" source="held" target="check">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="20" y="435" />
+              <mxPoint x="20" y="170" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e10" value="no: wait" style="edgeStyle=orthogonalEdgeStyle;html=1;exitX=0;exitY=0.5;entryX=0;entryY=0.5;strokeColor=#999999;" edge="1" parent="1" source="confirm" target="check">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="10" y="670" />
+              <mxPoint x="10" y="170" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e11" style="edgeStyle=orthogonalEdgeStyle;html=1;" edge="1" parent="1" source="episode" target="choose">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e12" style="edgeStyle=orthogonalEdgeStyle;html=1;" edge="1" parent="1" source="choose" target="exec">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e13" style="edgeStyle=orthogonalEdgeStyle;html=1;" edge="1" parent="1" source="exec" target="stop">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e14" value="no" style="edgeStyle=orthogonalEdgeStyle;html=1;exitX=1;exitY=0.5;entryX=0.5;entryY=1;" edge="1" parent="1" source="stop" target="fresh">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e15" style="edgeStyle=orthogonalEdgeStyle;html=1;exitX=0.5;exitY=0;entryX=1;entryY=0.5;" edge="1" parent="1" source="fresh" target="choose">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e16" value="yes" style="edgeStyle=orthogonalEdgeStyle;html=1;exitX=0;exitY=0.5;entryX=1;entryY=0.5;" edge="1" parent="1" source="stop" target="cool">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e17" value="next check" style="edgeStyle=orthogonalEdgeStyle;html=1;exitX=0;exitY=0.5;entryX=0;entryY=0.5;strokeColor=#999999;" edge="1" parent="1" source="cool" target="check">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="0" y="1040" />
+              <mxPoint x="0" y="170" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+  <diagram id="model" name="Action model">
+    <mxGraphModel dx="1400" dy="900" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1400" pageHeight="800" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+        <mxCell id="title" value="&lt;b&gt;ActionModel&lt;/b&gt; (actions.py): one decision from one Scene" style="text;html=1;fontSize=16;align=left;verticalAlign=middle;" vertex="1" parent="1">
+          <mxGeometry x="40" y="0" width="600" height="30" as="geometry" />
+        </mxCell>
+        <mxCell id="proc" value="&lt;div style=&quot;text-align:left&quot;&gt;&lt;b&gt;Process rows&lt;/b&gt; N &amp;times; 10 (local_features)&lt;br&gt;cpu_use, occupancy, pressure,&lt;br&gt;CPUs/16, in_pool, replica, throttled,&lt;br&gt;cpu_wait, IPC/3, log LLC traffic&lt;/div&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;align=left;spacingLeft=6;" vertex="1" parent="1">
+          <mxGeometry x="40" y="60" width="260" height="90" as="geometry" />
+        </mxCell>
+        <mxCell id="hist" value="&lt;b&gt;History&lt;/b&gt; N &amp;times; 10&lt;br&gt;same rows at the previous decision" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" vertex="1" parent="1">
+          <mxGeometry x="40" y="170" width="260" height="50" as="geometry" />
+        </mxCell>
+        <mxCell id="topo" value="&lt;b&gt;Topology&lt;/b&gt; N &amp;times; N&lt;br&gt;linked when cpusets share an L3 domain" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" vertex="1" parent="1">
+          <mxGeometry x="40" y="240" width="260" height="50" as="geometry" />
+        </mxCell>
+        <mxCell id="dom" value="&lt;div style=&quot;text-align:left&quot;&gt;&lt;b&gt;Domain rows&lt;/b&gt; D &amp;times; 9 (domain_features)&lt;br&gt;in_pool, load, free share, services/8,&lt;br&gt;outside load, IPC/3, LLC traffic,&lt;br&gt;cpu_wait, free to grow into&lt;/div&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;align=left;spacingLeft=6;" vertex="1" parent="1">
+          <mxGeometry x="40" y="390" width="260" height="90" as="geometry" />
+        </mxCell>
+        <mxCell id="glob" value="&lt;div style=&quot;text-align:left&quot;&gt;&lt;b&gt;Context&lt;/b&gt; (global_features)&lt;br&gt;pool cores, max, busy, pressure, allocated,&lt;br&gt;log p95, error rate, log req/s&lt;br&gt;+ pool start, budget left, log(p95 / healthy p95)&lt;br&gt;(context_features, 11)&lt;/div&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;align=left;spacingLeft=6;" vertex="1" parent="1">
+          <mxGeometry x="40" y="540" width="260" height="90" as="geometry" />
+        </mxCell>
+        <mxCell id="enc" value="&lt;b&gt;Process encoder&lt;/b&gt;&lt;br&gt;MLP | GNN | Transformer&lt;br&gt;hidden 32" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;" vertex="1" parent="1">
+          <mxGeometry x="370" y="140" width="190" height="80" as="geometry" />
+        </mxCell>
+        <mxCell id="denc" value="&lt;b&gt;domain_enc&lt;/b&gt; MLP&lt;br&gt;9 &amp;rarr; 32" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;" vertex="1" parent="1">
+          <mxGeometry x="370" y="405" width="190" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="pe" value="Process embeddings&lt;br&gt;N &amp;times; 32" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#666666;" vertex="1" parent="1">
+          <mxGeometry x="620" y="150" width="170" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="pool" value="&lt;b&gt;Summary&lt;/b&gt; 32: mean process +&lt;br&gt;mean domain + context_enc" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#666666;" vertex="1" parent="1">
+          <mxGeometry x="620" y="50" width="170" height="50" as="geometry" />
+        </mxCell>
+        <mxCell id="de" value="Domain embeddings&lt;br&gt;D &amp;times; 32" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#666666;" vertex="1" parent="1">
+          <mxGeometry x="620" y="405" width="170" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="heads" value="&lt;b&gt;ActionHeads&lt;/b&gt;" style="rounded=0;whiteSpace=wrap;html=1;fillColor=none;strokeColor=#82b366;dashed=1;verticalAlign=top;align=left;spacingLeft=6;" vertex="1" parent="1">
+          <mxGeometry x="840" y="20" width="240" height="480" as="geometry" />
+        </mxCell>
+        <mxCell id="htool" value="&lt;b&gt;tool&lt;/b&gt; &amp;rarr; 10 tools" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;" vertex="1" parent="1">
+          <mxGeometry x="860" y="45" width="200" height="35" as="geometry" />
+        </mxCell>
+        <mxCell id="hauto" value="&lt;b&gt;auto&lt;/b&gt; domain score" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;" vertex="1" parent="1">
+          <mxGeometry x="860" y="90" width="200" height="35" as="geometry" />
+        </mxCell>
+        <mxCell id="hroute" value="&lt;b&gt;route&lt;/b&gt; &amp;rarr; shed / restore" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;" vertex="1" parent="1">
+          <mxGeometry x="860" y="135" width="200" height="35" as="geometry" />
+        </mxCell>
+        <mxCell id="hsvc" value="&lt;b&gt;service&lt;/b&gt; &amp;rarr; pointer over N" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;" vertex="1" parent="1">
+          <mxGeometry x="860" y="195" width="200" height="35" as="geometry" />
+        </mxCell>
+        <mxCell id="hcpu" value="&lt;b&gt;cpu&lt;/b&gt; &amp;rarr; N &amp;times; 128 steps (&amp;minus;64..&amp;minus;1, 1..64)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;" vertex="1" parent="1">
+          <mxGeometry x="860" y="240" width="200" height="45" as="geometry" />
+        </mxCell>
+        <mxCell id="hdom" value="&lt;b&gt;domain&lt;/b&gt; &amp;rarr; pointer over D" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;" vertex="1" parent="1">
+          <mxGeometry x="860" y="400" width="200" height="35" as="geometry" />
+        </mxCell>
+        <mxCell id="hdomto" value="&lt;b&gt;domain_to&lt;/b&gt; &amp;rarr; target domain" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;" vertex="1" parent="1">
+          <mxGeometry x="860" y="445" width="200" height="35" as="geometry" />
+        </mxCell>
+        <mxCell id="mask" value="&lt;div style=&quot;text-align:left&quot;&gt;&lt;b&gt;Legality mask&lt;/b&gt; (Scene)&lt;br&gt;legal_tools, legal_cpus, growable /&lt;br&gt;shrinkable domains, from pool cores,&lt;br&gt;start, max and each service's CPUs&lt;/div&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;align=left;spacingLeft=6;" vertex="1" parent="1">
+          <mxGeometry x="840" y="540" width="240" height="90" as="geometry" />
+        </mxCell>
+        <mxCell id="decode" value="&lt;b&gt;decode_choice&lt;/b&gt;&lt;br&gt;one call (hold if nothing legal)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;" vertex="1" parent="1">
+          <mxGeometry x="1140" y="230" width="200" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="post" value="&lt;b&gt;execute&lt;/b&gt; &amp;rarr; POST /llm/act" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" vertex="1" parent="1">
+          <mxGeometry x="1140" y="340" width="200" height="50" as="geometry" />
+        </mxCell>
+        <mxCell id="note" value="The tool, auto and route heads read the summary, so the tool choice sees latency, the pool size and budget, and the domains. A checkpoint without context (before 2026-11-08 evening) reads only the mean process row." style="shape=note;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;size=14;align=left;spacingLeft=6;" vertex="1" parent="1">
+          <mxGeometry x="370" y="540" width="420" height="90" as="geometry" />
+        </mxCell>
+        <mxCell id="a1" style="edgeStyle=orthogonalEdgeStyle;html=1;" edge="1" parent="1" source="proc" target="enc">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="a2" style="edgeStyle=orthogonalEdgeStyle;html=1;" edge="1" parent="1" source="hist" target="enc">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="a3" value="GNN, TF only" style="edgeStyle=orthogonalEdgeStyle;html=1;" edge="1" parent="1" source="topo" target="enc">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="a4" style="edgeStyle=orthogonalEdgeStyle;html=1;" edge="1" parent="1" source="dom" target="denc">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="a5" style="edgeStyle=orthogonalEdgeStyle;html=1;" edge="1" parent="1" source="enc" target="pe">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="a6" style="edgeStyle=orthogonalEdgeStyle;html=1;" edge="1" parent="1" source="pe" target="pool">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="a7" style="edgeStyle=orthogonalEdgeStyle;html=1;" edge="1" parent="1" source="denc" target="de">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="a8" style="edgeStyle=orthogonalEdgeStyle;html=1;" edge="1" parent="1" source="pool" target="htool">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="a9" style="edgeStyle=orthogonalEdgeStyle;html=1;" edge="1" parent="1" source="pool" target="hauto">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="a10" style="edgeStyle=orthogonalEdgeStyle;html=1;" edge="1" parent="1" source="pool" target="hroute">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="a11" style="edgeStyle=orthogonalEdgeStyle;html=1;" edge="1" parent="1" source="pe" target="hsvc">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="a12" style="edgeStyle=orthogonalEdgeStyle;html=1;" edge="1" parent="1" source="pe" target="hcpu">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="a19" value="mean" style="edgeStyle=orthogonalEdgeStyle;html=1;exitX=0;exitY=0;entryX=0;entryY=0.5;" edge="1" parent="1" source="de" target="pool">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="600" y="405" />
+              <mxPoint x="600" y="75" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="a13" style="edgeStyle=orthogonalEdgeStyle;html=1;" edge="1" parent="1" source="de" target="hdom">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="a14" style="edgeStyle=orthogonalEdgeStyle;html=1;" edge="1" parent="1" source="de" target="hdomto">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="a15" style="edgeStyle=orthogonalEdgeStyle;html=1;exitX=1;exitY=0.5;" edge="1" parent="1" source="heads" target="decode">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="a16" value="&amp;minus;inf on illegal" style="edgeStyle=orthogonalEdgeStyle;html=1;dashed=1;strokeColor=#d79b00;exitX=1;exitY=0.5;entryX=0;entryY=0.8;" edge="1" parent="1" source="mask" target="decode">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="1110" y="585" />
+              <mxPoint x="1110" y="278" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="a17" style="edgeStyle=orthogonalEdgeStyle;html=1;" edge="1" parent="1" source="decode" target="post">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="a18" value="context_enc" style="edgeStyle=orthogonalEdgeStyle;html=1;exitX=0.5;exitY=1;entryX=0.5;entryY=1;" edge="1" parent="1" source="glob" target="pool">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="170" y="660" />
+              <mxPoint x="810" y="660" />
+              <mxPoint x="810" y="120" />
+              <mxPoint x="705" y="120" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+  <diagram id="learning" name="Teacher, student and RL">
+    <mxGraphModel dx="1400" dy="1100" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1340" pageHeight="1100" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+        <mxCell id="laneA" value="&lt;b&gt;1. Teacher &amp;rarr; student: offline imitation&lt;/b&gt; (train.py)" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#f9f9f9;strokeColor=#999999;verticalAlign=top;align=left;spacingLeft=8;fontSize=14;" vertex="1" parent="1">
+          <mxGeometry x="30" y="30" width="1280" height="270" as="geometry" />
+        </mxCell>
+        <mxCell id="laneB" value="&lt;b&gt;2. RL fine-tuning on Mercury: advantage-weighted cloning&lt;/b&gt; (cycle.py, action_cycle.sh)" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#f9f9f9;strokeColor=#999999;verticalAlign=top;align=left;spacingLeft=8;fontSize=14;" vertex="1" parent="1">
+          <mxGeometry x="30" y="320" width="1280" height="420" as="geometry" />
+        </mxCell>
+        <mxCell id="laneC" value="&lt;b&gt;3. Scale-actor RL (TD3): separate path, simulated plant only, not in the live cycle&lt;/b&gt; (student.py, td3.py, curve.py)" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#f9f9f9;strokeColor=#999999;verticalAlign=top;align=left;spacingLeft=8;fontSize=14;" vertex="1" parent="1">
+          <mxGeometry x="30" y="760" width="1280" height="290" as="geometry" />
+        </mxCell>
+        <mxCell id="A1" value="&lt;b&gt;Luna teacher&lt;/b&gt;&lt;br&gt;LLM via llmctl, trouble-gated&lt;br&gt;48 runs: hotel, social, media&lt;br&gt;repeats r1 and r2" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;" vertex="1" parent="1">
+          <mxGeometry x="60" y="80" width="200" height="90" as="geometry" />
+        </mxCell>
+        <mxCell id="A2" value="&lt;b&gt;llmctl.jsonl&lt;/b&gt;&lt;br&gt;state at each episode&lt;br&gt;+ tool calls (accepted / refused)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" vertex="1" parent="1">
+          <mxGeometry x="300" y="80" width="200" height="90" as="geometry" />
+        </mxCell>
+        <mxCell id="A3" value="&lt;b&gt;episodes_from &amp;rarr; examples_from&lt;/b&gt;&lt;br&gt;each accepted call = (state at turn start, call)&lt;br&gt;refused skipped; no call = hold&lt;br&gt;r1: 4,055 labels (70% scale)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#666666;" vertex="1" parent="1">
+          <mxGeometry x="540" y="80" width="240" height="90" as="geometry" />
+        </mxCell>
+        <mxCell id="A4" value="&lt;b&gt;fit_action&lt;/b&gt; (cross-entropy)&lt;br&gt;tool + the arguments it uses&lt;br&gt;legality mask, tool-balanced sampling&lt;br&gt;2,500 steps" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;" vertex="1" parent="1">
+          <mxGeometry x="820" y="80" width="230" height="90" as="geometry" />
+        </mxCell>
+        <mxCell id="A5" value="&lt;b&gt;tf-action.pt&lt;/b&gt;&lt;br&gt;luna-action-context-20261108" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;" vertex="1" parent="1">
+          <mxGeometry x="1090" y="80" width="190" height="90" as="geometry" />
+        </mxCell>
+        <mxCell id="A6" value="&lt;b&gt;Held-out r2&lt;/b&gt;: 82.3% tool,&lt;br&gt;4.1% full call, 0 would-refuse" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#666666;dashed=1;" vertex="1" parent="1">
+          <mxGeometry x="1090" y="200" width="190" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="B1" value="&lt;b&gt;round-N.pt&lt;/b&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;" vertex="1" parent="1">
+          <mxGeometry x="60" y="380" width="180" height="70" as="geometry" />
+        </mxCell>
+        <mxCell id="B2" value="&lt;b&gt;Mercury run&lt;/b&gt; (compare_systems.sh llm40-cycle)&lt;br&gt;hotel at 1500 / 3100 / 5300 req/s&lt;br&gt;llmctl --llm rl --gate, 0.5 s check, 1000 ms window" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" vertex="1" parent="1">
+          <mxGeometry x="290" y="370" width="260" height="90" as="geometry" />
+        </mxCell>
+        <mxCell id="B3" value="&lt;b&gt;Logs&lt;/b&gt;&lt;br&gt;llmctl.jsonl: checks with outcome,&lt;br&gt;episodes, calls&lt;br&gt;loadgen.hist.jsonl" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" vertex="1" parent="1">
+          <mxGeometry x="600" y="370" width="220" height="90" as="geometry" />
+        </mxCell>
+        <mxCell id="B4" value="&lt;b&gt;score_run&lt;/b&gt;&lt;br&gt;critical-route error %, p95,&lt;br&gt;split by load level&lt;br&gt;best so far &amp;rarr; best.pt" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#666666;" vertex="1" parent="1">
+          <mxGeometry x="870" y="370" width="200" height="90" as="geometry" />
+        </mxCell>
+        <mxCell id="B5" value="p95 &amp;le; 100 ms&lt;br&gt;and error &amp;le; 1%?" style="rhombus;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;" vertex="1" parent="1">
+          <mxGeometry x="1110" y="360" width="170" height="110" as="geometry" />
+        </mxCell>
+        <mxCell id="B10" value="&lt;b&gt;winner.pt&lt;/b&gt;, stop&lt;br&gt;(or after 8 rounds)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;" vertex="1" parent="1">
+          <mxGeometry x="1110" y="500" width="170" height="50" as="geometry" />
+        </mxCell>
+        <mxCell id="B6" value="&lt;b&gt;reward_series&lt;/b&gt;&lt;br&gt;step_reward at each check:&lt;br&gt;goodput &amp;minus; latency &amp;minus; errors&lt;br&gt;+ utilization &amp;minus; resources" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#666666;" vertex="1" parent="1">
+          <mxGeometry x="600" y="500" width="220" height="90" as="geometry" />
+        </mxCell>
+        <mxCell id="B7" value="&lt;b&gt;decision_rows&lt;/b&gt;&lt;br&gt;advantage = reward 1&amp;ndash;6 s after &amp;minus; 5 s before,&lt;br&gt;minus the same load phase's mean&lt;br&gt;z &amp;gt; 0.25: clone (weight z, at most 3)&lt;br&gt;z &amp;lt; &amp;minus;0.25: avoid; refused: avoid" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#666666;" vertex="1" parent="1">
+          <mxGeometry x="600" y="620" width="220" height="100" as="geometry" />
+        </mxCell>
+        <mxCell id="B8" value="&lt;b&gt;mix_probs&lt;/b&gt;&lt;br&gt;50% of draws: teacher r1 rows&lt;br&gt;50%: student rows of the last 3 rounds,&lt;br&gt;even across tools" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#666666;" vertex="1" parent="1">
+          <mxGeometry x="300" y="625" width="240" height="90" as="geometry" />
+        </mxCell>
+        <mxCell id="B9" value="&lt;b&gt;fit_action&lt;/b&gt;, 200 steps&lt;br&gt;from the best round's weights&lt;br&gt;clone: &amp;minus;w log p(call)&lt;br&gt;avoid: &amp;minus;w log(1 &amp;minus; p(call))" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;" vertex="1" parent="1">
+          <mxGeometry x="60" y="625" width="190" height="90" as="geometry" />
+        </mxCell>
+        <mxCell id="C1" value="&lt;b&gt;Settings&lt;/b&gt; gnn-rl, tf-rl,&lt;br&gt;gnn-imitation-rl, tf-imitation-rl&lt;br&gt;scale actors: one continuous value&lt;br&gt;per process (CPUs / 4)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#666666;" vertex="1" parent="1">
+          <mxGeometry x="60" y="810" width="220" height="90" as="geometry" />
+        </mxCell>
+        <mxCell id="C2" value="&lt;b&gt;Replay&lt;/b&gt; (save_replay)&lt;br&gt;obs, action, executed action,&lt;br&gt;reward, next state" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" vertex="1" parent="1">
+          <mxGeometry x="320" y="810" width="200" height="90" as="geometry" />
+        </mxCell>
+        <mxCell id="C3" value="&lt;b&gt;TD3Trainer.update&lt;/b&gt;&lt;br&gt;TwinCritic fit on the executed action&lt;br&gt;actor follows the critic's gradient" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;" vertex="1" parent="1">
+          <mxGeometry x="560" y="810" width="230" height="90" as="geometry" />
+        </mxCell>
+        <mxCell id="C4" value="&lt;b&gt;StudentTrainer.update&lt;/b&gt;&lt;br&gt;TD3 step, then clone_step on teacher rows&lt;br&gt;(squared error; weight 1, no decay&lt;br&gt;for the *-imitation-rl settings)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;" vertex="1" parent="1">
+          <mxGeometry x="830" y="810" width="240" height="90" as="geometry" />
+        </mxCell>
+        <mxCell id="C5" value="&lt;b&gt;curve.py&lt;/b&gt;&lt;br&gt;learning curve on a&lt;br&gt;two-process plant&lt;br&gt;(no Mercury)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;" vertex="1" parent="1">
+          <mxGeometry x="1110" y="810" width="170" height="90" as="geometry" />
+        </mxCell>
+        <mxCell id="C6" value="&lt;b&gt;Status&lt;/b&gt;: the imitation scale actors collapse (tf holds 98%, gnn always scales), and test_audit.py has 4 open failures in this path. The live controller uses the action models of lanes 1 and 2." style="shape=note;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;size=14;align=left;spacingLeft=6;" vertex="1" parent="1">
+          <mxGeometry x="320" y="940" width="750" height="70" as="geometry" />
+        </mxCell>
+        <mxCell id="f1" style="edgeStyle=orthogonalEdgeStyle;html=1;" edge="1" parent="1" source="A1" target="A2">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="f2" style="edgeStyle=orthogonalEdgeStyle;html=1;" edge="1" parent="1" source="A2" target="A3">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="f3" value="r1" style="edgeStyle=orthogonalEdgeStyle;html=1;" edge="1" parent="1" source="A3" target="A4">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="f4" style="edgeStyle=orthogonalEdgeStyle;html=1;" edge="1" parent="1" source="A4" target="A5">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="f5" style="edgeStyle=orthogonalEdgeStyle;html=1;dashed=1;" edge="1" parent="1" source="A5" target="A6">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="f6" value="INIT (round 1)" style="edgeStyle=orthogonalEdgeStyle;html=1;strokeColor=#82b366;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" edge="1" parent="1" source="A5" target="B1">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="1060" y="190" />
+              <mxPoint x="1060" y="280" />
+              <mxPoint x="150" y="280" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="f7" value="teacher rows (fixed; the teacher is not asked again)" style="edgeStyle=orthogonalEdgeStyle;html=1;dashed=1;strokeColor=#d6b656;exitX=0;exitY=1;entryX=0.5;entryY=0;" edge="1" parent="1" source="A3" target="B8">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="540" y="230" />
+              <mxPoint x="420" y="230" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="g1" style="edgeStyle=orthogonalEdgeStyle;html=1;" edge="1" parent="1" source="B1" target="B2">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="g2" style="edgeStyle=orthogonalEdgeStyle;html=1;" edge="1" parent="1" source="B2" target="B3">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="g3" style="edgeStyle=orthogonalEdgeStyle;html=1;" edge="1" parent="1" source="B3" target="B4">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="g4" style="edgeStyle=orthogonalEdgeStyle;html=1;" edge="1" parent="1" source="B4" target="B5">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="g5" value="yes" style="edgeStyle=orthogonalEdgeStyle;html=1;" edge="1" parent="1" source="B5" target="B10">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="g6" style="edgeStyle=orthogonalEdgeStyle;html=1;" edge="1" parent="1" source="B3" target="B6">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="g7" style="edgeStyle=orthogonalEdgeStyle;html=1;" edge="1" parent="1" source="B6" target="B7">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="g8" value="student rows" style="edgeStyle=orthogonalEdgeStyle;html=1;" edge="1" parent="1" source="B7" target="B8">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="g9" style="edgeStyle=orthogonalEdgeStyle;html=1;" edge="1" parent="1" source="B8" target="B9">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="g10" value="round N+1" style="edgeStyle=orthogonalEdgeStyle;html=1;strokeColor=#82b366;" edge="1" parent="1" source="B9" target="B1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="g11" value="no: train" style="edgeStyle=orthogonalEdgeStyle;html=1;exitX=0.5;exitY=1;entryX=1;entryY=0.5;" edge="1" parent="1" source="B5" target="B8">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="1195" y="480" />
+              <mxPoint x="1090" y="480" />
+              <mxPoint x="1090" y="730" />
+              <mxPoint x="560" y="730" />
+              <mxPoint x="560" y="670" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="h1" style="edgeStyle=orthogonalEdgeStyle;html=1;" edge="1" parent="1" source="C1" target="C2">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="h2" style="edgeStyle=orthogonalEdgeStyle;html=1;" edge="1" parent="1" source="C2" target="C3">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="h3" style="edgeStyle=orthogonalEdgeStyle;html=1;" edge="1" parent="1" source="C3" target="C4">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="h4" style="edgeStyle=orthogonalEdgeStyle;html=1;dashed=1;" edge="1" parent="1" source="C4" target="C5">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="h5" value="parse_llmctl_jsonl: first call per episode, labels only hold / scale" style="edgeStyle=orthogonalEdgeStyle;html=1;dashed=1;strokeColor=#d6b656;exitX=0;exitY=0.5;entryX=0.5;entryY=0;" edge="1" parent="1" source="A2" target="C4">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="280" y="125" />
+              <mxPoint x="280" y="750" />
+              <mxPoint x="950" y="750" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

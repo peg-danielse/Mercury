@@ -15,6 +15,8 @@ least_loaded), until SIGTERM.
   l3shift   nothing here: the pool grows (l3) and swaps domains away from neighbours (MERCURY_POOL l3,swap=1)
   llm       tools/llmctl.py in its checking cycle (Gemini by default; GEMINI_API_KEY from the environment), with
             the run's end-to-end latency (loadgen.hist.jsonl) and Mercury's per-CPU counters as context.
+            SC_LLM_OWNS=1 detaches the operator's autoscaler (POST /scale policy none) so the model is the
+            only thing that changes a service's CPU count. The load generator and jaeger are left on theirs.
             SC_REPLICAS=1 adds llmctl --replicas (add_replica / remove_replica). Mercury must be started with
             MERCURY_REUSEPORT=1 so those processes share the service port.
 
@@ -127,6 +129,16 @@ def main() -> int:
                 emit(event="attach", daemon=front, system="degrade", ok=reply.get("ok"), reply=reply)
                 if reply.get("ok"):
                     attached.add("degrade")
+        if a.system == "llm" and env("SC_LLM_OWNS") == "1":
+            state = call(a.port, "/llm/state")
+            for daemon in state.get("daemons", []):
+                name = daemon["daemon_id"]
+                if not name.startswith(a.prefix) or name.startswith(skip) or name in attached:
+                    continue
+                reply = call(a.port, "/scale", {"daemon_id": name, "policy": "none"})
+                emit(event="detach", daemon=name, system="none", ok=reply.get("ok"), reply=reply)
+                if reply.get("ok"):
+                    attached.add(name)
         per_daemon = ("throttle",) if env("SC_POOL_SHIFT") == "1" else ("shift", "throttle")
         if a.system in per_daemon:
             state = call(a.port, "/llm/state")

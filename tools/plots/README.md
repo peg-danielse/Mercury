@@ -14,8 +14,14 @@ compare_systems.sh OUT/            one directory per system, OUT/<system>/r<n>/D
 ```
 
 - `extract_runs.py` reduces the raw results to one JSON: per-route latency histograms, antagonist phases, 5 s bins, pool size, and core-seconds.
-- `plot_runs.py` writes vector PDFs: `summary.pdf`, `cost.pdf`, `phases.pdf`, `timeline.pdf`. Percentiles come from the merged histograms. Failed requests are excluded unless `--errors-as-ms` is given.
+- `plot_runs.py` writes vector PDFs: `summary.pdf`, `cost.pdf`, `phases.pdf`, `timeline.pdf`, and, when a run called llm tools, `actions.pdf` and `action-mix.pdf`. `--only speedup` writes `speedup.pdf`: one line per system, speedup over `--baseline`, workloads ordered by `--focus` from worst to best, with a line at 1. `--only` writes a subset. `paper.mplstyle` is the shared theme. Summary marks are a median point, the repeats, and a min–max line. `save` also writes the other of PDF and 300 dpi PNG. `--square` draws `actions` on a square canvas. Percentiles come from the merged histograms. Failed requests are excluded unless `--errors-as-ms` is given. `actions` is tool calls per second of the controller log (each repeat a dot, the mean a dash, the min–max a whisker). `action-mix` is each tool's share of a system's calls, pooled over the repeats kept by `--max-api-errors`. A call Mercury refused still counts.
 - `plot_runs.py` needs matplotlib. Run it on a workstation, not on the experiment host.
+- `plot_timelines.py` draws every repeat, not the median one: one column per system, one row per repeat, antagonist-on windows shaded, critical p95 on a shared logarithmic scale (`timelines-all.png` and `.pdf`). It reads a compare OUT directory itself, or a `runs.json` from `extract_runs.py`, with the same `:system=newname` suffix. The social-cycle grid and the distilled-transformer repeats use it:
+
+```
+plot_timelines.py social-cycle-gemini-20261028 social-cycle-gemini-20261028-p60:saturate=fixed60 -d figs/
+plot_timelines.py social-cycle-distill-20261029 -d social-cycle-distill-20261029/figs
+```
 
 ## Other plotting scripts
 

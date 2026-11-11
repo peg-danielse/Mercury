@@ -26,8 +26,15 @@ case $SYS in
   social) WD=$B/deathstar-socialNetwork; OP=$WD/goperate/bin/goperate; PFX=social-; TR="social-ComposePostService social-HomeTimelineService social-UserTimelineService social-PostStorageService social-SocialGraphService";;
   media) WD=$B/deathstar-mediaMicroservices; OP=$WD/goperate/bin/mediaoperate; PFX=media-; TR="media-PageService media-ComposeReviewService media-MovieReviewService media-MovieInfoService media-ReviewStorageService";;
 esac
+# Media runs one mongod per database, on the docker-compose host ports. A split seed has mongodb/<port>/ for each.
+# 27023 is unused upstream. movie-info (27026) also holds the social-graph database.
+MEDIA_MONGO_PORTS="27018 27019 27020 27021 27022 27024 27025 27026"
+# Social runs one mongod per database, clear of hotel (27017) and media (27018-27026):
+# social-graph 27040, user 27041, user-timeline 27042, post-storage 27043, url-shorten 27044.
+SOCIAL_MONGO_PORTS="27040 27041 27042 27043 27044"
 case $SYS in
-  media) MONGO_DIR=$B/runtime/mongodb/27018/db; REDIS_DUMP=$WD/run/data/redis/dump.rdb;;
+  media) REDIS_DUMP=$WD/run/data/redis/dump.rdb;;
+  social) REDIS_DUMP=$B/runtime/redis/6379/dump.rdb;;
   *) MONGO_DIR=$B/runtime/mongodb/27017/db; REDIS_DUMP=$B/runtime/redis/6379/dump.rdb;;
 esac
 OUT=$(realpath -m $OUT); RUN=$OUT/$(date +%Y%m%d-%H%M%S); mkdir -p $RUN
@@ -56,6 +63,7 @@ fi
 # SIDECAR="cmd args": started once the services are up (the load generator's cgroup exists) with --run-dir D
 #   --prefix PFX --port PORT appended, on SAMPLE_CPU, output in D/sidecar.log; SIGTERM when the operator exits.
 # MERCURY_REUSEPORT=1: passed into Mercury so several processes of one service can share its port (SPEC.md "LLM interface").
+# MERCURY_HORIZ=1: the original daemon adds a replica on saturate's scale-up test (SPEC.md "Horizontal scaling").
 # POOL_POLICY="l3,start=8,..." : Mercury's l3 pool from its start (MERCURY_POOL, SPEC.md "l3 pool"); autoscaling
 #   hands out CPUs only from the pool, which gains whole L3 domains when it is busy.
 # FRESH_DB=1: before every run, delete MongoDB's data directory ($B/runtime/mongodb/27017/db) and redis's dump.rdb, so
@@ -63,7 +71,8 @@ fi
 #   (the operator also drops the hotel databases once mongod is up). Refuses while a mongod runs; overrides SEED.
 #   Only for a Benchmarks tree of these experiments (DSB_ROOT), never one whose data matters.
 # SEED=DIR: before every run, restore a dsb_seed.sh snapshot (MongoDB's data directory and redis's dump.rdb), so every
-#   run starts from the same filled state. Refuses while a mongod runs.
+#   run starts from the same filled state. Media and social seeds are one directory per mongod (mongodb/<port>/); a
+#   combined snapshot is split by media_mongo_split.sh or social_mongo_split.sh. Refuses while a mongod runs.
 for r in $(seq 1 $REPS); do for pol in ${POLICIES:-saturate gnn}; do
   MODEL=""; NAME=$pol
   case $pol in *@*) MODEL=${pol#*@}; pol=${pol%%@*}; NAME=$pol-$(basename $MODEL .json);; esac
@@ -71,15 +80,52 @@ for r in $(seq 1 $REPS); do for pol in ${POLICIES:-saturate gnn}; do
   D=$RUN/$r-$NAME; mkdir -p $D
   if [ -n "${FRESH_DB:-}" ]; then
     pgrep -x mongod >/dev/null && { echo "mongod is running: cannot start from an empty database"; exit 1; }
-    sudo -n rm -rf $MONGO_DIR
+    if [ "$SYS" = media ]; then
+      for p in $MEDIA_MONGO_PORTS; do
+        sudo -n rm -rf $B/runtime/mongodb/$p/db
+        mkdir -p $B/runtime/mongodb/$p/db
+      done
+      echo "fresh: empty media mongod ports $MEDIA_MONGO_PORTS $(date -Is)" > $D/seed.txt
+    elif [ "$SYS" = social ]; then
+      for p in $SOCIAL_MONGO_PORTS; do
+        sudo -n rm -rf $B/runtime/mongodb/$p/db
+        mkdir -p $B/runtime/mongodb/$p/db
+      done
+      echo "fresh: empty social mongod ports $SOCIAL_MONGO_PORTS $(date -Is)" > $D/seed.txt
+    else
+      sudo -n rm -rf $MONGO_DIR
+      mkdir -p $MONGO_DIR
+      echo "fresh: empty database $MONGO_DIR $(date -Is)" > $D/seed.txt
+    fi
     sudo -n rm -f $REDIS_DUMP
-    mkdir -p $MONGO_DIR
-    echo "fresh: empty database $MONGO_DIR $(date -Is)" > $D/seed.txt
   elif [ -n "${SEED:-}" ]; then
     pgrep -x mongod >/dev/null && { echo "mongod is running: cannot restore SEED"; exit 1; }
-    [ -d "$SEED/mongodb" ] || { echo "SEED $SEED has no mongodb/"; exit 1; }
-    sudo -n mkdir -p $MONGO_DIR $(dirname $REDIS_DUMP)
-    sudo -n rsync -a --delete "$SEED/mongodb/" $MONGO_DIR/
+    if [ "$SYS" = media ]; then
+      # A seed from before the split is one dbpath. media_mongo_split.sh turns it into mongodb/<port>/.
+      if [ ! -d "$SEED/mongodb/27018" ]; then
+        "$M/src/test/media_mongo_split.sh" "$SEED"
+      fi
+      for p in $MEDIA_MONGO_PORTS; do
+        [ -d "$SEED/mongodb/$p" ] || { echo "SEED $SEED has no mongodb/$p"; exit 1; }
+        sudo -n mkdir -p $B/runtime/mongodb/$p/db
+        sudo -n rsync -a --delete "$SEED/mongodb/$p/" $B/runtime/mongodb/$p/db/
+      done
+    elif [ "$SYS" = social ]; then
+      # A seed from before the split is one dbpath. social_mongo_split.sh turns it into mongodb/<port>/.
+      if [ ! -d "$SEED/mongodb/27040" ]; then
+        "$M/src/test/social_mongo_split.sh" "$SEED"
+      fi
+      for p in $SOCIAL_MONGO_PORTS; do
+        [ -d "$SEED/mongodb/$p" ] || { echo "SEED $SEED has no mongodb/$p"; exit 1; }
+        sudo -n mkdir -p $B/runtime/mongodb/$p/db
+        sudo -n rsync -a --delete "$SEED/mongodb/$p/" $B/runtime/mongodb/$p/db/
+      done
+    else
+      [ -d "$SEED/mongodb" ] || { echo "SEED $SEED has no mongodb/"; exit 1; }
+      sudo -n mkdir -p $MONGO_DIR
+      sudo -n rsync -a --delete "$SEED/mongodb/" $MONGO_DIR/
+    fi
+    sudo -n mkdir -p $(dirname $REDIS_DUMP)
     if [ -f "$SEED/redis/dump.rdb" ]; then sudo -n cp -p "$SEED/redis/dump.rdb" $REDIS_DUMP
     else sudo -n rm -f $REDIS_DUMP; fi
     echo "seed $SEED restored $(date -Is)" > $D/seed.txt
@@ -88,7 +134,7 @@ for r in $(seq 1 $REPS); do for pol in ${POLICIES:-saturate gnn}; do
     echo "external mercury pid $XPID port $PORT from $(date +%T); its log is its own output" > $D/mercury.log
   else
     ss -ltnH | grep -q ":$PORT " && { echo "port $PORT busy"; exit 1; }
-    (cd $WD && exec sudo -n env MERCURY_RINGS=$D/rings ${MODEL:+MERCURY_GNN_MODEL=$MODEL} ${POOL_POLICY:+MERCURY_POOL=$POOL_POLICY} ${MERCURY_REUSEPORT:+MERCURY_REUSEPORT=$MERCURY_REUSEPORT} ${CPUSTAT:+MERCURY_CPUSTAT=$CPUSTAT MERCURY_CPUSTAT_MS=${CPUSTAT_MS:-50} MERCURY_CPUSTAT_CPU=${CPUSTAT_CPU:-$SAMPLE_CPU}} $M/build/mercury $PORT 0 $POOL) > $D/mercury.log 2>&1 &
+    (cd $WD && exec sudo -n env MERCURY_RINGS=$D/rings ${MODEL:+MERCURY_GNN_MODEL=$MODEL} ${POOL_POLICY:+MERCURY_POOL=$POOL_POLICY} ${MERCURY_REUSEPORT:+MERCURY_REUSEPORT=$MERCURY_REUSEPORT} ${MERCURY_HORIZ:+MERCURY_HORIZ=$MERCURY_HORIZ} ${CPUSTAT:+MERCURY_CPUSTAT=$CPUSTAT MERCURY_CPUSTAT_MS=${CPUSTAT_MS:-50} MERCURY_CPUSTAT_CPU=${CPUSTAT_CPU:-$SAMPLE_CPU}} $M/build/mercury $PORT 0 $POOL) > $D/mercury.log 2>&1 &
     sleep 1; MPID=$(pgrep -f "^$M/build/mercury $PORT 0" | head -1)
     for i in $(seq 50); do curl -s -m 1 127.0.0.1:$PORT/ping >/dev/null && break; sleep 0.2; done
   fi

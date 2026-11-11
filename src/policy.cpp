@@ -32,6 +32,13 @@ bool saturate_add_test(const WindowMeans& means, int cores, bool runnable) {
   return runnable ? means.pressure >= static_cast<double>(cores) + kRunnableAddMargin : means.pressure >= kAddPressure;
 }
 
+bool replica_add_test(const WindowMeans& means, int cores, bool runnable, int members) {
+  if (members < 1 || members >= kMaxReplicaSet) {
+    return false;
+  }
+  return saturate_add_test(means, cores, runnable);
+}
+
 bool saturate_remove_test(const WindowMeans& means, int cores, bool runnable) {
   if (cores < 2) {
     return false;

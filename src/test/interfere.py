@@ -29,6 +29,13 @@ Copied on 2026-10-21 from gnn-example/mercury/slo/interfere.py for compare_syste
                            on its busiest CPU at onset (lowest CPU on a tie), with no random draws; kinds and
                            levels still come from the --seed cycle. A victim that is not running (or uses
                            under --min-use cores) skips its phase but keeps the timing.
+  --baseline SEC           after --warmup, stay off for SEC and log event=baseline state=on then state=off.
+                           The load during that window is the clean measurement; the later off gaps are not.
+  --sequential             walk --kinds in the order given and --levels low to high, without shuffling.
+                           Phase i is pair i of that list, and the list repeats when --phases is longer.
+  --pin-busiest            once, at the end of the baseline (or before the first phase), lock the victim to the
+                           daemon using the most CPU and keep it for every phase. Its busiest CPU is still
+                           chosen at each onset. --victims-cycle is ignored while a victim is pinned.
 """
 import argparse, itertools, json, os, random, signal, subprocess, sys, time, urllib.request
 
@@ -128,10 +135,14 @@ class Driver:
         self.log = open(os.path.join(a.run_dir, "antagonists.jsonl"), "a")
         self.procs = []
         self.restore = None  # (daemon, cpus) to put back at the end of the phase
-        self.kinds = [k for k in a.kinds.split(",")]
-        # Actions rotate strictly (every 3 phases see all three); kind and level come from their own shuffled cycle.
+        self.kinds = [k for k in a.kinds.split(",") if k]
+        self.levels = tuple(a.levels)
+        # Actions rotate strictly. The default schedule shuffles kind and level. --sequential keeps the
+        # listed order so a sensitivity run can compare one kind at a time against an earlier baseline.
         self.actions = itertools.cycle(tuple(a.actions.split(",")))
-        self.hits = self._cycle([(k, lv) for k in self.kinds for lv in (1, 2)])
+        pairs = [(k, lv) for k in self.kinds for lv in self.levels]
+        self.hits = itertools.cycle(pairs) if a.sequential else self._cycle(pairs)
+        self.pinned = None
 
     def _cycle(self, items):
         while True:
@@ -201,11 +212,25 @@ class Driver:
             self.restore = None
 
     def clean_cpu(self, avoid, sets, node):
-        """Free pool CPU with the fewest daemons, in the victim's NUMA node when one is free there (a cpuset that leaves
-        its node makes Mercury rewrite cpuset.mems, which can migrate the daemon's pages and take seconds)."""
+        """Free pool CPU with the fewest daemons, in the victim's NUMA node when one is free there (leaving the node
+        widens cpuset.mems; staying on it keeps the write to cpuset.cpus)."""
         on = self.daemons_on(sets)
         cand = [x for x in self.pool if x not in avoid]
         return min(cand, key=lambda x: (self.topo.node.get(x) != node, on.get(x, 0), x)) if cand else None
+
+    def pin_busiest(self):
+        """Lock every later phase to the daemon using the most CPU right now."""
+        sets = cpusets()
+        use, _ = usage(self.a.prefix, 2.0)
+        names = [d for d in sets if d.startswith(self.a.prefix) and not any(x in d for x in ("loadgen", "jaeger"))]
+        victims = [d for d in names if use.get(d, 0) >= self.a.min_use]
+        if not victims:
+            self.emit(event="pin", victim=None, reason=f"no daemon using >= {self.a.min_use} cores")
+            return
+        victim = max(victims, key=lambda d: (use[d], d))
+        self.pinned = victim
+        self.emit(event="pin", victim=victim, victim_use=round(use[victim], 3),
+                  candidates={d: round(use[d], 3) for d in victims})
 
     def scale(self, factor):
         path = os.path.join(self.a.run_dir, "loadgen.scale")
@@ -229,7 +254,14 @@ class Driver:
             return self.load_phase(i, level, action)
         sets = cpusets()
         use, busy = usage(self.a.prefix, 2.0)
-        if self.a.victims_cycle:
+        if self.pinned:
+            victim = self.pinned
+            if victim not in sets:
+                self.emit(event="skip", phase=i, victim=victim, reason="pinned victim not running")
+                time.sleep(self.a.on)
+                return
+            c = max(sets[victim], key=lambda x: (busy.get(x, 0), -x))
+        elif self.a.victims_cycle:
             # Identical scenarios: a fixed victim per phase, on its busiest CPU, no random draws.
             cycle = self.a.victims_cycle.split(",")
             victim = self.a.prefix + cycle[i % len(cycle)]
@@ -255,7 +287,7 @@ class Driver:
         self.start(kind, level, ant)
         on = self.daemons_on(sets)
         self.emit(event="on", phase=i, kind=kind, level=level, victim=victim, victim_cpu=c, victim_cpus=sets[victim],
-                  victim_use=round(use[victim], 3), victim_cpu_busy=round(busy.get(c, 0), 3),
+                  victim_use=round(use.get(victim, 0), 3), victim_cpu_busy=round(busy.get(c, 0), 3),
                   antagonist_cpus=ant, daemons_on_antagonist={str(x): on.get(x, 0) for x in ant}, planned_action=action)
         time.sleep(self.a.react)
         if action == "move_victim":
@@ -286,6 +318,15 @@ class Driver:
     def run(self):
         self.emit(event="start", args=vars(self.a), pool=self.pool, stress_ng=stress_ng())
         time.sleep(self.a.warmup)
+        if self.a.baseline > 0:
+            # The clean window. Off gaps between later phases are recovery, not this baseline.
+            self.emit(event="baseline", state="on")
+            time.sleep(self.a.baseline)
+            if self.a.pin_busiest:
+                self.pin_busiest()
+            self.emit(event="baseline", state="off")
+        elif self.a.pin_busiest:
+            self.pin_busiest()
         for i in itertools.count() if self.a.phases == 0 else range(self.a.phases):
             time.sleep(self.a.off)
             try:
@@ -306,6 +347,14 @@ def main():
     ap.add_argument("--kinds", default="same,smt,l3,membw", help="add load for application-load phases")
     ap.add_argument("--load-scale", type=lambda v: [float(x) for x in v.split(",")], default=[1.5, 2.0],
                     help="load kind: the load generator's rate factor at level 1 and level 2")
+    ap.add_argument("--levels", type=lambda v: [int(x) for x in v.split(",") if x], default=[1, 2],
+                    help="intensities of each kind; the default schedule shuffles them, --sequential does not")
+    ap.add_argument("--baseline", type=float, default=0,
+                    help="seconds with no antagonist after warmup, logged as event=baseline")
+    ap.add_argument("--sequential", action="store_true",
+                    help="one phase per kind and level, in --kinds order, levels low to high, no shuffle")
+    ap.add_argument("--pin-busiest", action="store_true",
+                    help="after the baseline, pin every phase to the daemon that was using the most CPU")
     ap.add_argument("--pool", default="1-60")
     ap.add_argument("--warmup", type=float, default=30); ap.add_argument("--off", type=float, default=20)
     ap.add_argument("--on", type=float, default=30); ap.add_argument("--react", type=float, default=5)
